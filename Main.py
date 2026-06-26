@@ -271,13 +271,13 @@ class PaintApp:
         tk.Button(top, text="Settings",   command=self.open_settings).pack(side="right", padx=2, pady=2)
 
         # ── Main area: tools | canvas | layers ────────────────────────────
-        main = tk.PanedWindow(self.root, sashrelief="raised")
-        main.pack(fill="both", expand=True, side="top")
+        main = tk.Frame(self.root)
+        main.pack(fill="both", expand=True)
 
         # ── Left panel: tools ─────────────────────────────────────────────
         left = tk.Frame(main, width=110, bd=1, relief="sunken")
-        left.pack_propagate(False)  # B: hold the requested width
-        main.add(left, minsize=80)
+        left.pack(side="left", fill="y")
+        left.pack_propagate(False)
 
         tk.Label(left, text="Tools", font=("TkDefaultFont", 9, "bold")).pack(pady=(6, 2))
 
@@ -309,7 +309,7 @@ class PaintApp:
 
         # ── Centre: canvas ────────────────────────────────────────────────
         self.canvas = tk.Canvas(main, bg="gray25")
-        main.add(self.canvas)
+        self.canvas.pack(side="left", fill="both", expand=True)
 
         self.canvas.bind("<Button-1>",        self.on_mouse_down)
         self.canvas.bind("<B1-Motion>",       self.on_mouse_move)
@@ -322,9 +322,9 @@ class PaintApp:
         self.canvas.bind("<MouseWheel>",      self.zoom_mouse)
 
         # ── Right panel: layers ───────────────────────────────────────────
-        right = tk.Frame(main, width=200, bd=1, relief="sunken")
-        right.pack_propagate(False)  # B: hold the requested width
-        main.add(right, minsize=140)
+        right = tk.Frame(main, width=250, bd=1, relief="sunken")
+        right.pack(side="right", fill="y")
+        right.pack_propagate(False)
 
         tk.Label(right, text="Layers", font=("TkDefaultFont", 9, "bold")).pack(pady=(6, 2))
 
