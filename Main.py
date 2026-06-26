@@ -1,10 +1,10 @@
 import tkinter as tk
 from tkinter import filedialog, colorchooser, messagebox
+from tkinter import ttk
 from PIL import Image, ImageDraw, ImageTk
 import math
 import copy
 import io
-import pickle
 import base64
 import json
 
@@ -26,6 +26,7 @@ class VectorObject:
     @classmethod
     def from_dict(cls, data):
         """Create object from dictionary"""
+        data = dict(data)  # avoid mutating the original
         obj_type = data.pop('type')
         if obj_type == 'Line':
             return Line.from_dict(data)
@@ -246,81 +247,170 @@ class PaintApp:
         self.drag_start_index = None
         self.drag_start_y = None
 
+        # UI scale (1.5 = launch default)
+        self.ui_scale = 1.5
+
         self.build_ui()
+        self.apply_ui_scale(self.ui_scale)  # A: apply 1.5× on launch
         self.refresh_layers()
         self.redraw()
         self.update_title()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def build_ui(self):
-        top = tk.Frame(self.root)
-        top.pack(fill="x")
+        # ── Top bar: file & edit actions ──────────────────────────────────
+        top = tk.Frame(self.root, bd=1, relief="raised")
+        top.pack(fill="x", side="top")
 
-        # File menu buttons
-        tk.Button(top, text="New", command=self.new_project).pack(side="left")
-        tk.Button(top, text="Open", command=self.open_project).pack(side="left")
-        tk.Button(top, text="Save", command=self.save_project).pack(side="left")
-        tk.Button(top, text="Save As", command=self.save_project_as).pack(side="left")
-        
-        tk.Button(top, text="Export PNG", command=self.save_image).pack(side="left")
-        tk.Button(top, text="Color", command=self.choose_color).pack(side="left")
-        
-        # Tool buttons
-        tk.Button(top, text="Brush", command=lambda: self.set_tool("brush")).pack(side="left")
-        tk.Button(top, text="Eraser", command=lambda: self.set_tool("eraser")).pack(side="left")
-        tk.Button(top, text="Select", command=lambda: self.set_tool("select")).pack(side="left")
-        tk.Button(top, text="Line", command=lambda: self.set_tool("line")).pack(side="left")
-        tk.Button(top, text="Rect", command=lambda: self.set_tool("rect")).pack(side="left")
-        tk.Button(top, text="Ellipse", command=lambda: self.set_tool("ellipse")).pack(side="left")
-        
-        tk.Button(top, text="Undo", command=self.undo).pack(side="left")
+        tk.Button(top, text="New",        command=self.new_project).pack(side="left", padx=2, pady=2)
+        tk.Button(top, text="Open",       command=self.open_project).pack(side="left", padx=2, pady=2)
+        tk.Button(top, text="Save",       command=self.save_project).pack(side="left", padx=2, pady=2)
+        tk.Button(top, text="Save As",    command=self.save_project_as).pack(side="left", padx=2, pady=2)
+        tk.Button(top, text="Export PNG", command=self.save_image).pack(side="left", padx=2, pady=2)
+        tk.Button(top, text="Undo",       command=self.undo).pack(side="left", padx=2, pady=2)
+        tk.Button(top, text="Settings",   command=self.open_settings).pack(side="right", padx=2, pady=2)
 
-        self.size_slider = tk.Scale(top, from_=1, to=100, orient="horizontal", label="Size")
-        self.size_slider.set(20)
-        self.size_slider.pack(side="left")
-
+        # ── Main area: tools | canvas | layers ────────────────────────────
         main = tk.PanedWindow(self.root, sashrelief="raised")
-        main.pack(fill="both", expand=True)
+        main.pack(fill="both", expand=True, side="top")
 
-        left = tk.Frame(main, width=200)
-        main.add(left)
+        # ── Left panel: tools ─────────────────────────────────────────────
+        left = tk.Frame(main, width=110, bd=1, relief="sunken")
+        left.pack_propagate(False)  # B: hold the requested width
+        main.add(left, minsize=80)
 
-        tk.Label(left, text="Layers").pack()
+        tk.Label(left, text="Tools", font=("TkDefaultFont", 9, "bold")).pack(pady=(6, 2))
 
-        self.layer_list = tk.Listbox(left)
-        self.layer_list.pack(fill="both", expand=True)
-        self.layer_list.bind("<<ListboxSelect>>", self.select_layer)
-        
-        # Drag and drop bindings
-        self.layer_list.bind("<Button-1>", self.on_layer_drag_start)
-        self.layer_list.bind("<B1-Motion>", self.on_layer_drag)
-        self.layer_list.bind("<ButtonRelease-1>", self.on_layer_drag_end)
+        tool_frame = tk.Frame(left)
+        tool_frame.pack(fill="x", padx=4)
 
-        layer_buttons = tk.Frame(left)
-        layer_buttons.pack(fill="x")
-        
-        tk.Button(layer_buttons, text="Add Raster", command=lambda: self.add_layer("raster")).pack(side="left", fill="x", expand=True)
-        tk.Button(layer_buttons, text="Add Vector", command=lambda: self.add_layer("vector")).pack(side="left", fill="x", expand=True)
-        
-        tk.Button(left, text="Delete Layer", command=self.delete_layer).pack(fill="x")
-        tk.Button(left, text="Toggle Visible", command=self.toggle_visibility).pack(fill="x")
-        tk.Button(left, text="Move Up", command=self.move_layer_up).pack(fill="x")
-        tk.Button(left, text="Move Down", command=self.move_layer_down).pack(fill="x")
+        tools = [
+            ("Brush",   "brush"),
+            ("Eraser",  "eraser"),
+            ("Select",  "select"),
+            ("Line",    "line"),
+            ("Rect",    "rect"),
+            ("Ellipse", "ellipse"),
+        ]
+        for label, tool in tools:
+            tk.Button(tool_frame, text=label, width=8,
+                      command=lambda t=tool: self.set_tool(t)).pack(pady=1)
 
+        ttk.Separator(left, orient="horizontal").pack(fill="x", padx=4, pady=6)
+
+        tk.Label(left, text="Color", font=("TkDefaultFont", 9, "bold")).pack()
+        tk.Button(left, text="Choose…", command=self.choose_color).pack(padx=4, pady=2)
+
+        ttk.Separator(left, orient="horizontal").pack(fill="x", padx=4, pady=6)
+
+        self.size_slider = tk.Scale(left, from_=1, to=100, orient="vertical", label="Size")
+        self.size_slider.set(20)
+        self.size_slider.pack(padx=4, pady=2)
+
+        # ── Centre: canvas ────────────────────────────────────────────────
         self.canvas = tk.Canvas(main, bg="gray25")
         main.add(self.canvas)
 
-        self.canvas.bind("<Button-1>", self.on_mouse_down)
-        self.canvas.bind("<B1-Motion>", self.on_mouse_move)
+        self.canvas.bind("<Button-1>",        self.on_mouse_down)
+        self.canvas.bind("<B1-Motion>",       self.on_mouse_move)
         self.canvas.bind("<ButtonRelease-1>", self.on_mouse_up)
+        self.canvas.bind("<Motion>",          self.mouse_move)
+        self.canvas.bind("<Button-2>",        self.start_pan)
+        self.canvas.bind("<B2-Motion>",       self.pan)
+        self.canvas.bind("<Button-3>",        self.start_pan)
+        self.canvas.bind("<B3-Motion>",       self.pan)
+        self.canvas.bind("<MouseWheel>",      self.zoom_mouse)
 
-        self.canvas.bind("<Motion>", self.mouse_move)
+        # ── Right panel: layers ───────────────────────────────────────────
+        right = tk.Frame(main, width=200, bd=1, relief="sunken")
+        right.pack_propagate(False)  # B: hold the requested width
+        main.add(right, minsize=140)
 
-        self.canvas.bind("<Button-2>", self.start_pan)
-        self.canvas.bind("<B2-Motion>", self.pan)
-        self.canvas.bind("<Button-3>", self.start_pan)
-        self.canvas.bind("<B3-Motion>", self.pan)
+        tk.Label(right, text="Layers", font=("TkDefaultFont", 9, "bold")).pack(pady=(6, 2))
 
-        self.canvas.bind("<MouseWheel>", self.zoom_mouse)
+        self.layer_list = tk.Listbox(right)
+        self.layer_list.pack(fill="both", expand=True, padx=4)
+        self.layer_list.bind("<<ListboxSelect>>",  self.select_layer)
+        self.layer_list.bind("<Button-1>",         self.on_layer_drag_start)
+        self.layer_list.bind("<B1-Motion>",        self.on_layer_drag)
+        self.layer_list.bind("<ButtonRelease-1>",  self.on_layer_drag_end)
+
+        add_frame = tk.Frame(right)
+        add_frame.pack(fill="x", padx=4, pady=(2, 0))
+        tk.Button(add_frame, text="+ Raster", command=lambda: self.add_layer("raster")).pack(side="left", fill="x", expand=True)
+        tk.Button(add_frame, text="+ Vector", command=lambda: self.add_layer("vector")).pack(side="left", fill="x", expand=True)
+
+        for label, cmd in [
+            ("Delete Layer",   self.delete_layer),
+            ("Toggle Visible", self.toggle_visibility),
+            ("Move Up",        self.move_layer_up),
+            ("Move Down",      self.move_layer_down),
+        ]:
+            tk.Button(right, text=label, command=cmd).pack(fill="x", padx=4, pady=1)
+
+    def open_settings(self):
+        win = tk.Toplevel(self.root)
+        win.title("Settings")
+        win.resizable(False, False)
+        win.grab_set()  # modal
+
+        tk.Label(win, text="UI Scale", font=("TkDefaultFont", 9, "bold")).pack(pady=(12, 2))
+        tk.Label(win, text="Adjusts the size of all text and widgets.\nTakes effect immediately.",
+                 justify="center").pack(padx=16)
+
+        scale_var = tk.DoubleVar(value=self.ui_scale)
+        slider = tk.Scale(win, variable=scale_var, from_=0.5, to=2.5,
+                          resolution=0.05, orient="horizontal", length=260,
+                          label="Scale factor")
+        slider.pack(padx=16, pady=8)
+
+        preview_label = tk.Label(win, text="1.00×")
+        preview_label.pack()
+
+        def on_change(val):
+            preview_label.config(text=f"{float(val):.2f}×")
+
+        slider.config(command=on_change)
+
+        btn_row = tk.Frame(win)
+        btn_row.pack(pady=(4, 12))
+
+        def apply():
+            self.apply_ui_scale(scale_var.get())
+
+        def ok():
+            apply()
+            win.destroy()
+
+        tk.Button(btn_row, text="Apply",  command=apply).pack(side="left", padx=4)
+        tk.Button(btn_row, text="OK",     command=ok).pack(side="left", padx=4)
+        tk.Button(btn_row, text="Cancel", command=win.destroy).pack(side="left", padx=4)
+
+    def apply_ui_scale(self, scale):
+        self.ui_scale = scale
+        # Compute an absolute font size from the scale (base size = 9pt)
+        size = max(7, round(9 * scale))
+        bold_size = max(7, round(9 * scale))
+
+        # Update the named fonts tkinter uses by default
+        import tkinter.font as tkfont
+        for font_name in tkfont.names():
+            try:
+                f = tkfont.nametofont(font_name)
+                # Scale relative to 9pt base; preserve sign (negative = pixels)
+                f.configure(size=size)
+            except Exception:
+                pass
+
+        # Force a geometry update so widgets reflow to their new sizes
+        self.root.update_idletasks()
+
+    def on_close(self):
+        if self.undo_stack:
+            if not messagebox.askyesno("Unsaved Changes",
+                                       "You have unsaved changes. Quit anyway?"):
+                return
+        self.root.destroy()
 
     def update_title(self):
         if self.current_file:
@@ -415,8 +505,8 @@ class PaintApp:
                 'active_layer': self.active_layer
             }
             
-            with open(filename, 'wb') as f:
-                pickle.dump(project_data, f)
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(project_data, f)
             
             self.undo_stack = []
             
@@ -436,8 +526,8 @@ class PaintApp:
             return
         
         try:
-            with open(filename, 'rb') as f:
-                project_data = pickle.load(f)
+            with open(filename, 'r', encoding='utf-8') as f:
+                project_data = json.load(f)
             
             if 'version' not in project_data or 'layers' not in project_data:
                 raise ValueError("Invalid project file format")
@@ -554,6 +644,7 @@ class PaintApp:
     def on_layer_drag_start(self, event):
         self.drag_start_index = self.layer_list.nearest(event.y)
         self.drag_start_y = event.y
+        self.snapshot()  # snapshot once at the start of the drag
 
     def on_layer_drag(self, event):
         if self.drag_start_index is None:
@@ -567,7 +658,6 @@ class PaintApp:
         from_idx = len(self.layers) - 1 - self.drag_start_index
         to_idx = len(self.layers) - 1 - current_index
         
-        self.snapshot()
         layer = self.layers.pop(from_idx)
         self.layers.insert(to_idx, layer)
         self.active_layer = to_idx
@@ -687,27 +777,6 @@ class PaintApp:
         
         # Display preview
         self.display_image(preview_img)
-
-    def on_mouse_up(self, event):
-        x, y = self.image_coords(event.x, event.y)
-        current_layer = self.layers[self.active_layer]
-        
-        if current_layer.layer_type == "raster":
-            self.last_x = None
-            self.last_y = None
-        else:  # vector layer
-            if self.is_dragging_point:
-                # Done dragging point
-                self.is_dragging_point = False
-                self.selected_vector_obj = None
-                self.selected_point_index = None
-            elif self.tool in ["line", "rect", "ellipse"] and self.vector_start_x is not None:
-                # Finalize the vector object
-                self.create_vector_object(self.vector_start_x, self.vector_start_y, x, y)
-                self.vector_start_x = None
-                self.vector_start_y = None
-                self.layers[self.active_layer].render_vector()
-                self.redraw()
 
     def create_vector_object(self, x1, y1, x2, y2):
         """Create a vector object and add it to the current layer"""
@@ -873,6 +942,10 @@ class PaintApp:
 
 if __name__ == "__main__":
     root = tk.Tk()
-    root.geometry("1400x900")
+    root.state("zoomed")   # maximized on Windows/macOS
+    try:
+        root.attributes("-zoomed", True)  # maximized on Linux
+    except tk.TclError:
+        pass
     PaintApp(root)
     root.mainloop()
