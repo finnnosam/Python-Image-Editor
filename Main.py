@@ -226,7 +226,16 @@ class PaintApp:
 
         self.tool = "brush"
         self.color = "#000000"
-        self.bg_color = (255, 255, 255, 255)
+        self.bg_color = (255, 255, 255, 0)
+
+        # Checkerboard "absent pixel" backdrop (lives behind the canvas content,
+        # does not pan/zoom with it - rendered once per canvas size).
+        self.checker_size = 9
+        self.checker_light = (235, 235, 235, 255)
+        self.checker_dark = (210, 210, 210, 255)
+        self._checker_pil = None        # cached full-viewport tiled PIL image
+        self._checker_pil_dims = None   # (cw, ch) it was built for
+        self._checker_tkimg = None      # cached cropped PhotoImage for the doc rect
 
         self.last_x = None
         self.last_y = None
@@ -863,11 +872,45 @@ class PaintApp:
                 result.alpha_composite(layer.image)
         return result
 
+    def get_checker_backdrop_pil(self, cw, ch):
+        """Build (and cache) the full-viewport repeating 9x9 checkerboard PIL
+        image. This is the expensive part (tiling) and only happens when the
+        canvas viewport size changes - never on pan/zoom."""
+        if self._checker_pil is not None and self._checker_pil_dims == (cw, ch):
+            return self._checker_pil
+
+        s = self.checker_size
+        tile = Image.new("RGBA", (s * 2, s * 2), self.checker_light)
+        tdraw = ImageDraw.Draw(tile)
+        tdraw.rectangle((s, 0, s * 2, s), fill=self.checker_dark)
+        tdraw.rectangle((0, s, s, s * 2), fill=self.checker_dark)
+
+        backdrop = Image.new("RGBA", (cw, ch))
+        for y in range(0, ch, s * 2):
+            for x in range(0, cw, s * 2):
+                backdrop.paste(tile, (x, y))
+
+        self._checker_pil = backdrop
+        self._checker_pil_dims = (cw, ch)
+        return backdrop
+
+    def get_checker_backdrop_crop(self, cw, ch, rect):
+        """Cheaply crop the cached full-viewport checker pattern down to the
+        document's on-screen rect (left, top, w, h) - no re-tiling, just a
+        crop, so this is fine to call every redraw."""
+        pil_backdrop = self.get_checker_backdrop_pil(cw, ch)
+        x, y, w, h = rect
+        crop = pil_backdrop.crop((x, y, x + w, y + h))
+        self._checker_tkimg = ImageTk.PhotoImage(crop)
+        return self._checker_tkimg
+
     def display_image(self, img):
         """Display an image on the canvas"""
         cw = max(1, self.canvas.winfo_width())
         ch = max(1, self.canvas.winfo_height())
-        
+
+        self.canvas.delete("all")
+
         left = max(0, (-self.offset_x) / self.zoom)
         top = max(0, (-self.offset_y) / self.zoom)
         right = min(self.doc_w, (cw - self.offset_x) / self.zoom)
@@ -875,7 +918,17 @@ class PaintApp:
         
         if right <= left or bottom <= top:
             return
-            
+
+        # Static checkerboard backdrop - only behind the document's on-screen
+        # footprint (so the canvas's own blank-area color still shows through
+        # everywhere else), and it never pans/zooms with the content.
+        doc_sx = max(0, int(self.offset_x + left * self.zoom))
+        doc_sy = max(0, int(self.offset_y + top * self.zoom))
+        doc_sw = max(1, int((right - left) * self.zoom))
+        doc_sh = max(1, int((bottom - top) * self.zoom))
+        checker = self.get_checker_backdrop_crop(cw, ch, (doc_sx, doc_sy, doc_sw, doc_sh))
+        self.canvas.create_image(doc_sx, doc_sy, image=checker, anchor="nw")
+
         crop = img.crop((int(left), int(top), int(right), int(bottom)))
         sw = max(1, int((right - left) * self.zoom))
         sh = max(1, int((bottom - top) * self.zoom))
@@ -883,7 +936,6 @@ class PaintApp:
         
         self.tkimg = ImageTk.PhotoImage(crop)
         
-        self.canvas.delete("all")
         sx = self.offset_x + left * self.zoom
         sy = self.offset_y + top * self.zoom
         self.canvas.create_image(sx, sy, image=self.tkimg, anchor="nw")
@@ -908,6 +960,16 @@ class PaintApp:
 
         if right <= left or bottom <= top:
             return
+
+        # Static checkerboard backdrop - only behind the document's on-screen
+        # footprint, leaving the canvas's own blank-area color visible
+        # elsewhere. Never pans/zooms with the content.
+        doc_sx = max(0, int(self.offset_x + left * self.zoom))
+        doc_sy = max(0, int(self.offset_y + top * self.zoom))
+        doc_sw = max(1, int((right - left) * self.zoom))
+        doc_sh = max(1, int((bottom - top) * self.zoom))
+        checker = self.get_checker_backdrop_crop(cw, ch, (doc_sx, doc_sy, doc_sw, doc_sh))
+        self.canvas.create_image(doc_sx, doc_sy, image=checker, anchor="nw")
 
         img = self.composite_image()
         crop = img.crop((int(left), int(top), int(right), int(bottom)))
