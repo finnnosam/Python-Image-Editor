@@ -230,7 +230,7 @@ class PaintApp:
 
         # Checkerboard "absent pixel" backdrop (lives behind the canvas content,
         # does not pan/zoom with it - rendered once per canvas size).
-        self.checker_size = 9
+        self.checker_size = 18
         self.checker_light = (235, 235, 235, 255)
         self.checker_dark = (210, 210, 210, 255)
         self._checker_pil = None        # cached full-viewport tiled PIL image
@@ -873,7 +873,7 @@ class PaintApp:
         return result
 
     def get_checker_backdrop_pil(self, cw, ch):
-        """Build (and cache) the full-viewport repeating 9x9 checkerboard PIL
+        """Build (and cache) the full-viewport repeating checkerboard PIL
         image. This is the expensive part (tiling) and only happens when the
         canvas viewport size changes - never on pan/zoom."""
         if self._checker_pil is not None and self._checker_pil_dims == (cw, ch):
@@ -968,8 +968,10 @@ class PaintApp:
         doc_sy = max(0, int(self.offset_y + top * self.zoom))
         doc_sw = max(1, int((right - left) * self.zoom))
         doc_sh = max(1, int((bottom - top) * self.zoom))
-        checker = self.get_checker_backdrop_crop(cw, ch, (doc_sx, doc_sy, doc_sw, doc_sh))
-        self.canvas.create_image(doc_sx, doc_sy, image=checker, anchor="nw")
+        # Build a PIL checkerboard crop so we can flatten the document to RGB
+        checker_pil = self.get_checker_backdrop_pil(cw, ch).crop(
+            (doc_sx, doc_sy, doc_sx + doc_sw, doc_sy + doc_sh)
+        )
 
         img = self.composite_image()
         crop = img.crop((int(left), int(top), int(right), int(bottom)))
@@ -977,7 +979,14 @@ class PaintApp:
         sh = max(1, int((bottom - top) * self.zoom))
         crop = crop.resize((sw, sh), Image.Resampling.NEAREST)
 
-        self.tkimg = ImageTk.PhotoImage(crop)
+        if checker_pil.size != (sw, sh):
+            checker_pil = checker_pil.resize((sw, sh), Image.Resampling.NEAREST)
+
+        display = checker_pil.copy()
+        display.alpha_composite(crop)
+        display = display.convert("RGB")
+
+        self.tkimg = ImageTk.PhotoImage(display)
 
         sx = self.offset_x + left * self.zoom
         sy = self.offset_y + top * self.zoom
