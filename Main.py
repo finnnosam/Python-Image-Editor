@@ -225,8 +225,11 @@ class PaintApp:
         self.offset_y = 20
 
         self.tool = "brush"
-        self.color = "#000000"
+        self.primary_color = "#000000"
+        self.secondary_color = "#ffffff"
+        self.color = self.primary_color  # Keep for compatibility
         self.bg_color = (255, 255, 255, 0)
+        self.last_button = 1  # Track which mouse button was pressed
 
         # Checkerboard "absent pixel" backdrop (lives behind the canvas content,
         # does not pan/zoom with it - rendered once per canvas size).
@@ -296,7 +299,7 @@ class PaintApp:
         tools = [
             ("Brush",   "brush"),
             ("Eraser",  "eraser"),
-            ("Select",  "select"),
+            ("Vector Edit",  "vector edit"),
             ("Line",    "line"),
             ("Rect",    "rect"),
             ("Ellipse", "ellipse"),
@@ -307,14 +310,51 @@ class PaintApp:
 
         ttk.Separator(left, orient="horizontal").pack(fill="x", padx=4, pady=6)
 
-        tk.Label(left, text="Color", font=("TkDefaultFont", 9, "bold")).pack()
-        tk.Button(left, text="Choose…", command=self.choose_color).pack(padx=4, pady=2)
+        # ── Color Selector ─────────────────────────────────────────────
+        tk.Label(left, text="Colors", font=("TkDefaultFont", 9, "bold")).pack(pady=(6, 2))
+
+        color_frame = tk.Frame(left)
+        color_frame.pack(pady=4)
+
+        # Primary color square (left)
+        self.primary_square = tk.Canvas(color_frame, width=30, height=30, bg=self.primary_color, highlightthickness=1, highlightbackground="black")
+        self.primary_square.pack(side="left", padx=2)
+        self.primary_square.bind("<Button-1>", lambda e: self.choose_primary_color())
+
+        # Secondary color square (right)
+        self.secondary_square = tk.Canvas(color_frame, width=30, height=30, bg=self.secondary_color, highlightthickness=1, highlightbackground="black")
+        self.secondary_square.pack(side="left", padx=2)
+        self.secondary_square.bind("<Button-1>", lambda e: self.choose_secondary_color())
+
+        # Swap colors button
+        tk.Button(left, text="↔", width=3, command=self.swap_colors).pack(pady=2)
 
         ttk.Separator(left, orient="horizontal").pack(fill="x", padx=4, pady=6)
 
-        self.size_slider = tk.Scale(left, from_=1, to=100, orient="vertical", label="Size")
-        self.size_slider.set(20)
-        self.size_slider.pack(padx=4, pady=2)
+        # Size control
+        size_frame = tk.Frame(left)
+        size_frame.pack(padx=4, pady=2)
+
+        tk.Label(size_frame, text="Size:").pack(side="left")
+
+        self.size_var = tk.StringVar(value="20")
+        self.size_entry = tk.Entry(size_frame, width=6, textvariable=self.size_var)
+        self.size_entry.pack(side="left", padx=4)
+
+        # Update size when Enter is pressed or focus is lost
+        def update_size(event=None):
+            try:
+                val = int(self.size_var.get())
+                if val < 1:
+                    val = 1
+                elif val > 100:
+                    val = 100
+                self.size_var.set(str(val))
+            except ValueError:
+                self.size_var.set("20")  # revert to default on invalid input
+
+        self.size_entry.bind("<Return>", update_size)
+        self.size_entry.bind("<FocusOut>", update_size)
 
         # ── Centre: canvas ────────────────────────────────────────────────
         self.canvas = tk.Canvas(main, bg="gray25")
@@ -326,8 +366,8 @@ class PaintApp:
         self.canvas.bind("<Motion>",          self.mouse_move)
         self.canvas.bind("<Button-2>",        self.start_pan)
         self.canvas.bind("<B2-Motion>",       self.pan)
-        self.canvas.bind("<Button-3>",        self.start_pan)
-        self.canvas.bind("<B3-Motion>",       self.pan)
+        self.canvas.bind("<Button-3>",        self.on_mouse_down)
+        self.canvas.bind("<B3-Motion>",       self.on_mouse_move)
         self.canvas.bind("<MouseWheel>",      self.zoom_mouse)
 
         # ── Right panel: layers ───────────────────────────────────────────
@@ -356,6 +396,27 @@ class PaintApp:
             ("Move Down",      self.move_layer_down),
         ]:
             tk.Button(right, text=label, command=cmd).pack(fill="x", padx=4, pady=1)
+
+    def choose_primary_color(self):
+        c = colorchooser.askcolor(self.primary_color)[1]
+        if c:
+            self.primary_color = c
+            self.color = c  # Update current color for compatibility
+            self.primary_square.config(bg=c)
+            self.redraw()
+
+    def choose_secondary_color(self):
+        c = colorchooser.askcolor(self.secondary_color)[1]
+        if c:
+            self.secondary_color = c
+            self.secondary_square.config(bg=c)
+
+    def swap_colors(self):
+        self.primary_color, self.secondary_color = self.secondary_color, self.primary_color
+        self.color = self.primary_color
+        self.primary_square.config(bg=self.primary_color)
+        self.secondary_square.config(bg=self.secondary_color)
+        self.redraw()
 
     def open_settings(self):
         win = tk.Toplevel(self.root)
@@ -585,11 +646,6 @@ class PaintApp:
         self.vector_start_y = None
         self.current_vector_obj = None
 
-    def choose_color(self):
-        c = colorchooser.askcolor()[1]
-        if c:
-            self.color = c
-
     def add_layer(self, layer_type="raster"):
         self.snapshot()
         name = f"{layer_type.capitalize()} Layer {len([l for l in self.layers if l.layer_type == layer_type]) + 1}"
@@ -687,6 +743,7 @@ class PaintApp:
                 iy * self.zoom + self.offset_y)
 
     def on_mouse_down(self, event):
+        self.last_button = event.num  # Track which button (1=left, 3=right)
         x, y = self.image_coords(event.x, event.y)
         current_layer = self.layers[self.active_layer]
         
@@ -700,8 +757,8 @@ class PaintApp:
         self.last_x, self.last_y = self.image_coords(event.x, event.y)
 
     def start_vector_operation(self, event, x, y):
-        if self.tool == "select":
-            # Try to select an object
+        if self.tool == "vector edit":
+            # Try to edit a vector object
             if self.layers[self.active_layer].vector_data:
                 obj, point_idx = self.layers[self.active_layer].vector_data.get_object_at(x, y)
                 if obj:
@@ -729,9 +786,14 @@ class PaintApp:
 
     def raster_paint(self, event):
         x, y = self.image_coords(event.x, event.y)
-        radius = self.size_slider.get() / 2
+        radius = int(self.size_var.get()) / 2
 
-        color = (0, 0, 0, 0) if self.tool == "eraser" else self.color
+        # Use primary for left click, secondary for right click (eraser uses transparent)
+        if self.tool == "eraser":
+            color = (0, 0, 0, 0)
+        else:
+            # Use primary for left click (Button-1), secondary for right click (Button-3)
+            color = self.primary_color if self.last_button == 1 else self.secondary_color
 
         dx = x - self.last_x
         dy = y - self.last_y
@@ -770,21 +832,18 @@ class PaintApp:
 
     def draw_vector_preview(self, x1, y1, x2, y2):
         """Draw a temporary preview of the vector object being created"""
-        # Get current layer
         layer = self.layers[self.active_layer]
         
-        # Create a temporary image for preview
         preview_img = layer.image.copy()
         preview_draw = ImageDraw.Draw(preview_img)
         
         if self.tool == "line":
-            preview_draw.line([(x1, y1), (x2, y2)], fill=self.color, width=2)
+            preview_draw.line([(x1, y1), (x2, y2)], fill=self.primary_color, width=2)
         elif self.tool == "rect":
-            preview_draw.rectangle([(x1, y1), (x2, y2)], outline=self.color, width=2)
+            preview_draw.rectangle([(x1, y1), (x2, y2)], outline=self.primary_color, width=2)
         elif self.tool == "ellipse":
-            preview_draw.ellipse([(x1, y1), (x2, y2)], outline=self.color, width=2)
+            preview_draw.ellipse([(x1, y1), (x2, y2)], outline=self.primary_color, width=2)
         
-        # Display preview
         self.display_image(preview_img)
 
     def create_vector_object(self, x1, y1, x2, y2):
@@ -793,14 +852,15 @@ class PaintApp:
         if layer.layer_type != "vector":
             return
         
+        # Use primary color for vector objects
         obj = None
         if self.tool == "line":
-            obj = Line(x1, y1, x2, y2, self.color, 2)
+            obj = Line(x1, y1, x2, y2, self.primary_color, 2)
         elif self.tool == "rect":
-            obj = Rectangle(x1, y1, abs(x2 - x1), abs(y2 - y1), self.color, 2)
+            obj = Rectangle(x1, y1, abs(x2 - x1), abs(y2 - y1), self.primary_color, 2)
         elif self.tool == "ellipse":
             obj = Ellipse((x1 + x2) / 2, (y1 + y2) / 2, 
-                         abs(x2 - x1) / 2, abs(y2 - y1) / 2, self.color, 2)
+                         abs(x2 - x1) / 2, abs(y2 - y1) / 2, self.primary_color, 2)
         
         if obj:
             layer.vector_data.add_object(obj)
@@ -996,13 +1056,13 @@ class PaintApp:
         # Draw brush cursor for raster layers
         current_layer = self.layers[self.active_layer]
         if current_layer.layer_type == "raster" and 0 <= self.mouse_x < cw and 0 <= self.mouse_y < ch:
-            r = self.size_slider.get() * self.zoom / 2
+            r = int(self.size_var.get()) * self.zoom / 2
             self.canvas.create_oval(self.mouse_x - r, self.mouse_y - r,
                                     self.mouse_x + r, self.mouse_y + r,
                                     outline="white", width=1)
         
-        # Draw vector selection handles if in select mode and on vector layer
-        if self.tool == "select" and current_layer.layer_type == "vector" and current_layer.vector_data:
+        # Draw vector handles if in proper mode and on vector layer
+        if self.tool == "vector edit" and current_layer.layer_type == "vector" and current_layer.vector_data:
             for obj in current_layer.vector_data.objects:
                 points = obj.get_points()
                 for px, py in points:
