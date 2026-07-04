@@ -368,7 +368,19 @@ class PaintApp:
         self.canvas.bind("<B2-Motion>",       self.pan)
         self.canvas.bind("<Button-3>",        self.on_mouse_down)
         self.canvas.bind("<B3-Motion>",       self.on_mouse_move)
-        self.canvas.bind("<MouseWheel>",      self.zoom_mouse)
+        self.canvas.bind("<MouseWheel>",      self.on_mousewheel)  # Plain scroll for panning
+        self.canvas.bind("<Control-MouseWheel>", self.zoom_mouse)  # Ctrl+scroll for zoom
+        # Hotkeys
+        self.canvas.bind("b", lambda e: self.set_tool("brush"))
+        self.canvas.bind("e", lambda e: self.set_tool("eraser"))
+        self.canvas.bind("v", lambda e: self.set_tool("vector edit"))
+        self.canvas.bind("l", lambda e: self.set_tool("line"))
+        self.canvas.bind("r", lambda e: self.set_tool("rect"))
+        self.canvas.bind("o", lambda e: self.set_tool("ellipse"))
+        self.canvas.bind("<Control-z>", lambda e: self.undo())
+        self.canvas.bind("<Control-s>", lambda e: self.save_project())
+        self.canvas.bind("<Control-n>", lambda e: self.new_project())
+        self.canvas.focus_set()
 
         # ── Right panel: layers ───────────────────────────────────────────
         right = tk.Frame(main, width=250, bd=1, relief="sunken")
@@ -783,6 +795,33 @@ class PaintApp:
             self.raster_paint(event)
         else:  # vector layer
             self.vector_operation(event, x, y)
+
+    def on_mousewheel(self, event):
+        """Handle plain scroll wheel for panning up/down and shift+scroll for left/right"""
+        # Get scroll amount (cross-platform)
+        if hasattr(event, 'delta'):
+            delta = event.delta
+        elif hasattr(event, 'num'):
+            # Linux mouse wheel
+            if event.num == 4:
+                delta = 120  # scroll up
+            elif event.num == 5:
+                delta = -120 # scroll down
+            else:
+                return
+        else:
+            return
+        
+        pan_amount = delta * 0.5
+        
+        if event.state & 0x1:  # Shift key is pressed
+            # Pan left/right
+            self.offset_x += pan_amount
+        else:
+            # Pan up/down
+            self.offset_y += pan_amount
+        
+        self.redraw()
 
     def raster_paint(self, event):
         x, y = self.image_coords(event.x, event.y)
