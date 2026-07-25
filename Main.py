@@ -7,6 +7,7 @@ import copy
 import io
 import base64
 import json
+import time
 
 class VectorObject:
     """Base class for vector objects"""
@@ -216,6 +217,10 @@ class PaintApp:
         self.doc_h = 800
         self.current_file = None
 
+        self.redraw_pending = False
+        self.last_redraw = 0.0
+        self.target_frame_time = 1 / 60.0    # 60 FPS
+
         self.layers = [Layer(self.doc_w, self.doc_h, "Background", "raster")]
         self.active_layer = 0
         self.undo_stack = []
@@ -228,7 +233,7 @@ class PaintApp:
         self.primary_color = "#000000"
         self.secondary_color = "#ffffff"
         self.color = self.primary_color  # Keep for compatibility
-        self.bg_color = (255, 255, 255, 0)
+        self.bg_color = (255, 255, 255, 255)
         self.last_button = 1  # Track which mouse button was pressed
 
         # Checkerboard "absent pixel" backdrop (lives behind the canvas content,
@@ -280,6 +285,7 @@ class PaintApp:
         tk.Button(top, text="Save As",    command=self.save_project_as).pack(side="left", padx=2, pady=2)
         tk.Button(top, text="Export PNG", command=self.save_image).pack(side="left", padx=2, pady=2)
         tk.Button(top, text="Undo",       command=self.undo).pack(side="left", padx=2, pady=2)
+        tk.Button(top, text="Globe",      command=self.open_globe_view).pack(side="left", padx=2, pady=2)
         tk.Button(top, text="Settings",   command=self.open_settings).pack(side="right", padx=2, pady=2)
 
         # ── Main area: tools | canvas | layers ────────────────────────────
@@ -409,13 +415,27 @@ class PaintApp:
         ]:
             tk.Button(right, text=label, command=cmd).pack(fill="x", padx=4, pady=1)
 
+    def request_redraw(self):
+        now = time.perf_counter()
+
+        if now - self.last_redraw < 1/60:
+            return
+
+        self.last_redraw = now
+        self.redraw()
+
+    def _scheduled_redraw(self):
+        self.redraw_pending = False
+        self.last_redraw_time = time.perf_counter()
+        self.request_redraw()
+
     def choose_primary_color(self):
         c = colorchooser.askcolor(self.primary_color)[1]
         if c:
             self.primary_color = c
             self.color = c  # Update current color for compatibility
             self.primary_square.config(bg=c)
-            self.redraw()
+            self.request_redraw()
 
     def choose_secondary_color(self):
         c = colorchooser.askcolor(self.secondary_color)[1]
@@ -428,7 +448,7 @@ class PaintApp:
         self.color = self.primary_color
         self.primary_square.config(bg=self.primary_color)
         self.secondary_square.config(bg=self.secondary_color)
-        self.redraw()
+        self.request_redraw()
 
     def open_settings(self):
         win = tk.Toplevel(self.root)
@@ -468,6 +488,26 @@ class PaintApp:
         tk.Button(btn_row, text="OK",     command=ok).pack(side="left", padx=4)
         tk.Button(btn_row, text="Cancel", command=win.destroy).pack(side="left", padx=4)
 
+    def open_globe_view(self):
+
+        #
+        # Already open?
+        #
+
+        if hasattr(self, "globe_window"):
+
+            try:
+                if self.globe_window.winfo_exists():
+                    self.globe_window.lift()
+                    self.globe_window.focus_force()
+                    return
+            except Exception:
+                pass
+
+        from globe_view import GlobeWindow
+
+        self.globe_window = GlobeWindow(self)
+
     def apply_ui_scale(self, scale):
         self.ui_scale = scale
         # Compute an absolute font size from the scale (base size = 9pt)
@@ -500,6 +540,24 @@ class PaintApp:
         else:
             self.root.title("PyPaint - Untitled")
 
+    def notify_globe_document_changed(self):
+        """Refresh an open globe view after document content changes."""
+        globe = getattr(self, "globe_window", None)
+        if globe is None:
+            return
+        try:
+            if globe.winfo_exists():
+                globe.notify_document_changed()
+        except tk.TclError:
+            self.globe_window = None
+
+    def can_paint_from_globe(self):
+        """Globe input currently supports raster brush and eraser tools only."""
+        return (
+            self.layers[self.active_layer].layer_type == "raster"
+            and self.tool in ("brush", "eraser")
+        )
+
     def snapshot(self):
         snap = []
         for l in self.layers:
@@ -523,7 +581,8 @@ class PaintApp:
         for l in self.layers:
             l.draw = ImageDraw.Draw(l.image)
         self.refresh_layers()
-        self.redraw()
+        self.request_redraw()
+        self.notify_globe_document_changed()
 
     def new_project(self):
         if self.undo_stack:
@@ -538,6 +597,7 @@ class PaintApp:
         self.refresh_layers()
         self.redraw()
         self.update_title()
+        self.notify_globe_document_changed()
 
     def save_project(self):
         if self.current_file:
@@ -646,6 +706,7 @@ class PaintApp:
             self.refresh_layers()
             self.redraw()
             self.update_title()
+            self.notify_globe_document_changed()
             messagebox.showinfo("Success", f"Project loaded from {filename}")
             
         except Exception as e:
@@ -664,7 +725,8 @@ class PaintApp:
         self.layers.append(Layer(self.doc_w, self.doc_h, name, layer_type))
         self.active_layer = len(self.layers) - 1
         self.refresh_layers()
-        self.redraw()
+        self.request_redraw()
+        self.notify_globe_document_changed()
 
     def delete_layer(self):
         if len(self.layers) == 1:
@@ -673,12 +735,14 @@ class PaintApp:
         del self.layers[self.active_layer]
         self.active_layer = max(0, self.active_layer - 1)
         self.refresh_layers()
-        self.redraw()
+        self.request_redraw()
+        self.notify_globe_document_changed()
 
     def toggle_visibility(self):
         self.layers[self.active_layer].visible = not self.layers[self.active_layer].visible
         self.refresh_layers()
-        self.redraw()
+        self.request_redraw()
+        self.notify_globe_document_changed()
 
     def move_layer_up(self):
         if self.active_layer >= len(self.layers) - 1:
@@ -688,7 +752,8 @@ class PaintApp:
             self.layers[self.active_layer + 1], self.layers[self.active_layer]
         self.active_layer += 1
         self.refresh_layers()
-        self.redraw()
+        self.request_redraw()
+        self.notify_globe_document_changed()
 
     def move_layer_down(self):
         if self.active_layer <= 0:
@@ -698,13 +763,14 @@ class PaintApp:
             self.layers[self.active_layer - 1], self.layers[self.active_layer]
         self.active_layer -= 1
         self.refresh_layers()
-        self.redraw()
+        self.request_redraw()
+        self.notify_globe_document_changed()
 
     def select_layer(self, event=None):
         sel = self.layer_list.curselection()
         if sel:
             self.active_layer = len(self.layers) - 1 - sel[0]
-            self.redraw()
+            self.request_redraw()
 
     def refresh_layers(self):
         self.layer_list.delete(0, tk.END)
@@ -740,7 +806,8 @@ class PaintApp:
         self.active_layer = to_idx
         self.drag_start_index = current_index
         self.refresh_layers()
-        self.redraw()
+        self.request_redraw()
+        self.notify_globe_document_changed()
 
     def on_layer_drag_end(self, event):
         self.drag_start_index = None
@@ -821,35 +888,116 @@ class PaintApp:
             # Pan up/down
             self.offset_y += pan_amount
         
-        self.redraw()
+        self.request_redraw()
 
-    def raster_paint(self, event):
-        x, y = self.image_coords(event.x, event.y)
+    def begin_external_raster_draw(self, x, y, button=1):
+        """
+        Begin a brush stroke from an external input source
+        (such as the globe window).
+        """
+        self.snapshot()
+        self.last_x = x
+        self.last_y = y
+        self.last_button = button
+
+
+    def end_external_raster_draw(self):
+        """
+        Finish an externally-driven brush stroke.
+        """
+        self.last_x = None
+        self.last_y = None
+
+
+    def raster_paint_image(self, x, y):
+        """
+        Paint using image coordinates instead of a Tk mouse event.
+        """
+
+        if self.last_x is None or self.last_y is None:
+            self.last_x = x
+            self.last_y = y
+
         radius = int(self.size_var.get()) / 2
 
-        # Use primary for left click, secondary for right click (eraser uses transparent)
         if self.tool == "eraser":
             color = (0, 0, 0, 0)
         else:
-            # Use primary for left click (Button-1), secondary for right click (Button-3)
-            color = self.primary_color if self.last_button == 1 else self.secondary_color
+            color = (
+                self.primary_color
+                if self.last_button == 1
+                else self.secondary_color
+            )
 
         dx = x - self.last_x
         dy = y - self.last_y
+
         dist = math.hypot(dx, dy)
 
         spacing = max(1, radius * 0.25)
         steps = max(1, int(dist / spacing))
 
         for i in range(steps + 1):
+
             t = i / steps
+
             px = self.last_x + dx * t
             py = self.last_y + dy * t
-            self.draw_circle(px, py, radius, color)
+
+            self.draw_circle(
+                px,
+                py,
+                radius,
+                color
+            )
 
         self.last_x = x
         self.last_y = y
-        self.redraw()
+
+        self.request_redraw()
+        self.notify_globe_document_changed()
+
+    def stamp_external_raster(self, x, y):
+        """Stamp one globe brush sample, wrapping it at the map seam."""
+        if not self.can_paint_from_globe():
+            return
+
+        radius = int(self.size_var.get()) / 2
+        color = (0, 0, 0, 0) if self.tool == "eraser" else (
+            self.primary_color if self.last_button == 1 else self.secondary_color
+        )
+        self.draw_circle(x, y, radius, color)
+        self.draw_circle(x - self.doc_w, y, radius, color)
+        self.draw_circle(x + self.doc_w, y, radius, color)
+        self.last_x, self.last_y = x, y
+        self.request_redraw()
+        self.notify_globe_document_changed()
+
+    def raster_paint(self, event):
+
+        x, y = self.image_coords(
+            event.x,
+            event.y
+        )
+
+        self.raster_paint_image(
+            x,
+            y
+        )
+
+    def open_globe_view(self):
+
+        if getattr(self, "globe_window", None):
+
+            try:
+                self.globe_window.lift()
+                return
+            except:
+                pass
+
+        from globe_view import GlobeWindow
+
+        self.globe_window = GlobeWindow(self)
 
     def draw_circle(self, x, y, radius, color):
         layer = self.layers[self.active_layer]
@@ -861,11 +1009,12 @@ class PaintApp:
             # Update the point position
             self.selected_vector_obj.update_point(self.selected_point_index, x, y)
             self.layers[self.active_layer].render_vector()
-            self.redraw()
+            self.request_redraw()
+            self.notify_globe_document_changed()
         elif self.tool in ["line", "rect", "ellipse"] and self.vector_start_x is not None:
             # Preview the shape (by redrawing)
             self.layers[self.active_layer].render_vector()
-            self.redraw()
+            self.request_redraw()
             # Draw temporary preview
             self.draw_vector_preview(self.vector_start_x, self.vector_start_y, x, y)
 
@@ -923,7 +1072,8 @@ class PaintApp:
                 self.vector_start_x = None
                 self.vector_start_y = None
                 self.layers[self.active_layer].render_vector()
-                self.redraw()
+                self.request_redraw()
+                self.notify_globe_document_changed()
 
     def start_pan(self, event):
         self.pan_x = event.x
@@ -934,7 +1084,7 @@ class PaintApp:
         self.offset_y += event.y - self.pan_y
         self.pan_x = event.x
         self.pan_y = event.y
-        self.redraw()
+        self.request_redraw()
 
     def zoom_mouse(self, event):
         old = self.zoom
@@ -946,12 +1096,12 @@ class PaintApp:
 
         self.offset_x = event.x - ix * self.zoom
         self.offset_y = event.y - iy * self.zoom
-        self.redraw()
+        self.request_redraw()
 
     def mouse_move(self, event):
         self.mouse_x = event.x
         self.mouse_y = event.y
-        self.redraw()
+        self.request_redraw()
 
     def save_image(self):
         name = filedialog.asksaveasfilename(defaultextension=".png",

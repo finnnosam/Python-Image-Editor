@@ -1,6 +1,9 @@
 #Folders
 __pycache__/
+.cwtools-ai/
+.agents/
 #Files
 Debug_Version.py
+Debug_Version_old.py
 Performance_Reports.txt
 wishlist.txt
