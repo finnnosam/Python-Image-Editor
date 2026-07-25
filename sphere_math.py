@@ -527,8 +527,11 @@ def sample_arc(
     if angle < EPSILON:
         return [start]
 
+    # One segment is enough when the endpoints are already closer than the
+    # requested brush spacing.  Callers commonly retain the previous endpoint,
+    # so forcing two segments merely produces a redundant midpoint stamp.
     count = max(
-        2,
+        1,
         int(math.ceil(angle / step_radians))
     )
 

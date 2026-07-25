@@ -213,8 +213,8 @@ class PaintApp:
         self.root = root
         self.root.title("PyPaint")
 
-        self.doc_w = 1200
-        self.doc_h = 800
+        self.doc_w = 1024
+        self.doc_h = 512
         self.current_file = None
 
         self.redraw_pending = False
@@ -957,8 +957,12 @@ class PaintApp:
         self.request_redraw()
         self.notify_globe_document_changed()
 
-    def stamp_external_raster(self, x, y):
-        """Stamp one globe brush sample, wrapping it at the map seam."""
+    def stamp_external_raster(self, x, y, refresh=True):
+        """Stamp one globe brush sample, wrapping it at the map seam.
+
+        Globe strokes can contain several samples for one mouse event.  Callers
+        can defer the display refresh until the whole group has been stamped.
+        """
         if not self.can_paint_from_globe():
             return
 
@@ -970,8 +974,39 @@ class PaintApp:
         self.draw_circle(x - self.doc_w, y, radius, color)
         self.draw_circle(x + self.doc_w, y, radius, color)
         self.last_x, self.last_y = x, y
-        self.request_redraw()
-        self.notify_globe_document_changed()
+        if refresh:
+            self.request_redraw()
+            self.notify_globe_document_changed()
+
+    def stamp_external_spherical_raster(self, footprint_uv, center_x, center_y,
+                                        refresh=True):
+        """Fill a globe-relative brush footprint on the equirectangular map.
+
+        ``footprint_uv`` is the spherical brush boundary expressed in texture
+        coordinates.  Its U values may extend beyond the map edges so the same
+        shape can be drawn cleanly across the longitude seam.
+        """
+        if not self.can_paint_from_globe() or not footprint_uv:
+            return
+
+        color = (0, 0, 0, 0) if self.tool == "eraser" else (
+            self.primary_color if self.last_button == 1 else self.secondary_color
+        )
+        polygon = [(u * self.doc_w, v * self.doc_h) for u, v in footprint_uv]
+
+        # Repeat the unwrapped polygon on both sides of the texture.  PIL clips
+        # each copy to the image, preserving a brush that straddles the seam.
+        layer = self.layers[self.active_layer]
+        for offset in (-self.doc_w, 0, self.doc_w):
+            layer.draw.polygon(
+                [(x + offset, y) for x, y in polygon],
+                fill=color,
+            )
+
+        self.last_x, self.last_y = center_x, center_y
+        if refresh:
+            self.request_redraw()
+            self.notify_globe_document_changed()
 
     def raster_paint(self, event):
 
@@ -994,6 +1029,15 @@ class PaintApp:
                 return
             except:
                 pass
+
+        if self.doc_w != self.doc_h * 2:
+            should_continue = messagebox.askyesno(
+                "Globe View Aspect Ratio",
+                "Globe View is designed for 2:1 equirectangular documents.\n\n"
+                f"This document is {self.doc_w} x {self.doc_h}. Continue anyway?",
+            )
+            if not should_continue:
+                return
 
         from globe_view import GlobeWindow
 

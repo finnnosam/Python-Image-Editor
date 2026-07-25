@@ -35,6 +35,8 @@ from sphere_math import (
     make_camera_ray,
     ray_sphere_intersection,
     vec_to_uv,
+    uv_to_vec,
+    spherical_brush_uv,
     apply_globe_rotation,
     remove_globe_rotation,
 )
@@ -285,7 +287,9 @@ class GlobeWindow(tk.Toplevel):
             dtype=np.uint8
         )
 
-        normals = self.lookup_normals.copy()
+        # This array is only read below.  Copying the full screen-sized normal
+        # map for every frame was a substantial allocation during painting.
+        normals = self.lookup_normals
 
         #
         # Rotate globe
@@ -622,6 +626,42 @@ class GlobeWindow(tk.Toplevel):
 
     # --------------------------------------------------
 
+    def stamp_spherical_brush(self, uv, refresh=False):
+        """Paint a geodesic circular brush footprint at a texture UV point."""
+        if self.texture is None:
+            return
+
+        radius = max(0.5, int(self.app.size_var.get()) / 2)
+        angular_radius = (2 * np.pi * radius) / self.texture.width
+
+        # sphere_math uses the physical longitude direction; the displayed
+        # texture is mirrored horizontally, just as it is in render_numpy().
+        center = uv_to_vec((1.0 - uv[0]) % 1.0, uv[1])
+        boundary = spherical_brush_uv(
+            center,
+            angular_radius,
+            rings=1,
+            segments=32,
+        )[1:]
+
+        # Keep the boundary continuous around the brush centre.  Coordinates
+        # are deliberately allowed outside [0, 1] for seam-safe rasterizing.
+        footprint_uv = []
+        for point_u, point_v in boundary:
+            texture_u = (1.0 - point_u) % 1.0
+            texture_u = uv[0] + ((texture_u - uv[0] + 0.5) % 1.0 - 0.5)
+            footprint_uv.append((texture_u, point_v))
+
+        center_x, center_y = self.uv_to_image(*uv)
+        self.app.stamp_external_spherical_raster(
+            footprint_uv,
+            center_x,
+            center_y,
+            refresh=refresh,
+        )
+
+    # --------------------------------------------------
+
     def paint_from_mouse(
         self,
         x,
@@ -652,8 +692,9 @@ class GlobeWindow(tk.Toplevel):
 
         if first or self.last_uv is None:
             self.app.begin_external_raster_draw(ix, iy, self.paint_button)
-            self.app.stamp_external_raster(ix, iy)
+            self.stamp_spherical_brush(uv, refresh=False)
             self.last_uv = uv
+            self.app.request_redraw()
             self.request_document_refresh()
             return
 
@@ -661,34 +702,30 @@ class GlobeWindow(tk.Toplevel):
         # Continue the stroke along the sphere.
         #
 
-        from sphere_math import (
-            uv_to_vec,
-            arc_to_uv
-        )
+        from sphere_math import arc_to_uv
 
         # last_uv / uv are texture coordinates, whose U axis is mirrored
         # relative to sphere_math's physical longitude coordinate.
         start = uv_to_vec((1.0 - self.last_uv[0]) % 1.0, self.last_uv[1])
         end = uv_to_vec((1.0 - uv[0]) % 1.0, uv[1])
 
-        samples = arc_to_uv(
-            start,
-            end
-        )
+        # Match the sampling distance to the current brush.  The previous
+        # fixed quarter-degree step oversampled ordinary brushes heavily,
+        # creating many redundant PIL stamps for a single mouse event.
+        radius = max(0.5, int(self.app.size_var.get()) / 2)
+        step_radians = (2 * np.pi * (radius * 0.25)) / self.texture.width
+        samples = arc_to_uv(start, end, step_radians=step_radians)
 
-        for su, sv in samples:
+        # The first sample is the previous event's endpoint, which has already
+        # been painted.  Skipping it avoids an extra seam-wrapped stamp.
+        for su, sv in samples[1:]:
 
             su = (1.0 - su) % 1.0
-
-            ix, iy = self.uv_to_image(
-                su,
-                sv
-            )
 
             # Stamp each spherical sample independently.  Connecting their
             # flat-map X coordinates would draw a line across the entire map
             # when the stroke crosses the longitude seam.
-            self.app.stamp_external_raster(ix, iy)
+            self.stamp_spherical_brush((su, sv), refresh=False)
 
         self.last_uv = uv
 
@@ -697,4 +734,7 @@ class GlobeWindow(tk.Toplevel):
         # the document.
         #
 
+        # Refresh each view once after all stamps from this mouse event have
+        # been applied, rather than once per spherical sample.
+        self.app.request_redraw()
         self.request_document_refresh()
