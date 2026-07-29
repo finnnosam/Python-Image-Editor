@@ -213,13 +213,13 @@ class PaintApp:
         self.root = root
         self.root.title("PyPaint")
 
-        self.doc_w = 1024
+        self.doc_w = 1024   #this is what it launches with
         self.doc_h = 512
         self.current_file = None
 
         self.redraw_pending = False
         self.last_redraw = 0.0
-        self.target_frame_time = 1 / 60.0    # 60 FPS
+        self.target_frame_time = 1 / 60.0    #FPS
 
         self.layers = [Layer(self.doc_w, self.doc_h, "Background", "raster")]
         self.active_layer = 0
