@@ -104,6 +104,7 @@ class GlobeWindow(tk.Toplevel):
 
         self.last_mouse = None
         self.last_uv = None
+        self.vector_start_screen = None
         self.document_refresh_pending = False
 
         #
@@ -511,10 +512,10 @@ class GlobeWindow(tk.Toplevel):
 
         if self.painting:
 
-            self.paint_from_mouse(
-                event.x,
-                event.y
-            )
+            if self.vector_start_screen is not None:
+                self.last_mouse = (event.x, event.y)
+            else:
+                self.paint_from_mouse(event.x, event.y)
 
     def on_left_release(self, event):
         self.end_paint()
@@ -524,7 +525,10 @@ class GlobeWindow(tk.Toplevel):
 
     def on_right_drag(self, event):
         if self.painting:
-            self.paint_from_mouse(event.x, event.y)
+            if self.vector_start_screen is not None:
+                self.last_mouse = (event.x, event.y)
+            else:
+                self.paint_from_mouse(event.x, event.y)
 
     def on_right_release(self, event):
         self.end_paint()
@@ -533,15 +537,51 @@ class GlobeWindow(tk.Toplevel):
         if not self.app.can_paint_from_globe():
             self.bell()
             return
+        if self.app.can_draw_vector_from_globe():
+            if self.screen_to_uv(event.x, event.y) is None:
+                return
+            self.vector_start_screen = (event.x, event.y)
+            self.painting = True
+            self.paint_button = button
+            self.last_mouse = self.vector_start_screen
+            return
         self.painting = True
         self.paint_button = button
         self.paint_from_mouse(event.x, event.y, first=True)
 
     def end_paint(self):
+        if self.vector_start_screen is not None:
+            self.finish_globe_vector(self.vector_start_screen,
+                                     self.last_mouse or self.vector_start_screen)
+            self.vector_start_screen = None
+            self.painting = False
+            self.last_mouse = None
+            return
         if self.painting:
             self.app.end_external_raster_draw()
         self.painting = False
         self.last_uv = None
+
+    def finish_globe_vector(self, start, end):
+        """Store a globe gesture as sphere-relative line primitives."""
+        x1, y1 = start
+        x2, y2 = end
+        if self.app.tool == "line":
+            samples = [start, end]
+        elif self.app.tool == "rect":
+            samples = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+        else:
+            cx, cy = (x1+x2)/2, (y1+y2)/2
+            rx, ry = abs(x2-x1)/2, abs(y2-y1)/2
+            samples = [(cx + rx*np.cos(t), cy + ry*np.sin(t))
+                       for t in np.linspace(0, 2*np.pi, 32, endpoint=False)]
+        image_points = []
+        for sx, sy in samples:
+            uv = self.screen_to_uv(int(sx), int(sy))
+            if uv is None:
+                return
+            image_points.append(self.uv_to_image(*uv))
+        self.app.create_globe_vector(self.app.tool, image_points)
 
     def on_middle_press(self, event):
 

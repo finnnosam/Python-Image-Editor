@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import filedialog, colorchooser, messagebox
 from tkinter import ttk
 from PIL import Image, ImageDraw, ImageTk
+import numpy as np
 import math
 import copy
 import io
@@ -31,19 +32,24 @@ class VectorObject:
         obj_type = data.pop('type')
         if obj_type == 'Line':
             return Line.from_dict(data)
+        elif obj_type == 'Shape':
+            return Shape.from_dict(data)
         elif obj_type == 'Rectangle':
-            return Rectangle.from_dict(data)
+            return Shape.from_legacy_rectangle(data)
         elif obj_type == 'Ellipse':
-            return Ellipse.from_dict(data)
+            return Shape.from_legacy_ellipse(data)
         return None
 
 class Line(VectorObject):
-    def __init__(self, x1=0, y1=0, x2=100, y2=100, color="#000000", width=2):
+    def __init__(self, x1=0, y1=0, x2=100, y2=100, color="#000000", width=2,
+                 curve=None, space="flat"):
         super().__init__(color, width)
         self.x1 = x1
         self.y1 = y1
         self.x2 = x2
         self.y2 = y2
+        self.curve = curve
+        self.space = space
         
     def to_dict(self):
         data = super().to_dict()
@@ -51,16 +57,55 @@ class Line(VectorObject):
             'x1': self.x1,
             'y1': self.y1,
             'x2': self.x2,
-            'y2': self.y2
+            'y2': self.y2,
+            'curve': self.curve,
+            'space': self.space,
         })
         return data
     
     @classmethod
     def from_dict(cls, data):
-        return cls(data['x1'], data['y1'], data['x2'], data['y2'], data['color'], data['width'])
+        return cls(data['x1'], data['y1'], data['x2'], data['y2'],
+                   data['color'], data['width'], data.get('curve'),
+                   data.get('space', 'flat'))
     
-    def draw(self, draw):
-        draw.line([(self.x1, self.y1), (self.x2, self.y2)], fill=self.color, width=self.width)
+    def sampled_points(self, document_width=1024, document_height=512, steps=32):
+        """Return map points. Globe lines follow the shortest great-circle arc."""
+        if self.space == "globe":
+            from sphere_math import uv_to_vec, arc_to_uv
+            a = uv_to_vec((1.0 - self.x1 / document_width) % 1.0,
+                          self.y1 / document_height)
+            b = uv_to_vec((1.0 - self.x2 / document_width) % 1.0,
+                          self.y2 / document_height)
+            points = arc_to_uv(a, b, step_radians=math.pi / max(8, steps))
+            mapped = [((1.0 - u) % 1.0 * document_width, v * document_height)
+                      for u, v in points]
+            # Unwrap longitude so PIL draws across the seam, not across the map.
+            for i in range(1, len(mapped)):
+                px = mapped[i - 1][0]
+                x, y = mapped[i]
+                while x - px > document_width / 2: x -= document_width
+                while px - x > document_width / 2: x += document_width
+                mapped[i] = (x, y)
+            return mapped
+        if not self.curve:
+            return [(self.x1, self.y1), (self.x2, self.y2)]
+        controls = self.curve
+        if len(controls) == 2:
+            cx, cy = controls[0], controls[1]
+            return [((1-t)**2*self.x1 + 2*(1-t)*t*cx + t*t*self.x2,
+                     (1-t)**2*self.y1 + 2*(1-t)*t*cy + t*t*self.y2)
+                    for t in (i / steps for i in range(steps + 1))]
+        c1x, c1y, c2x, c2y = controls
+        return [((1-t)**3*self.x1 + 3*(1-t)**2*t*c1x + 3*(1-t)*t*t*c2x + t**3*self.x2,
+                 (1-t)**3*self.y1 + 3*(1-t)**2*t*c1y + 3*(1-t)*t*t*c2y + t**3*self.y2)
+                for t in (i / steps for i in range(steps + 1))]
+
+    def draw(self, draw, document_width=1024, document_height=512):
+        points = self.sampled_points(document_width, document_height)
+        offsets = (-document_width, 0, document_width) if self.space == "globe" else (0,)
+        for offset in offsets:
+            draw.line([(x + offset, y) for x, y in points], fill=self.color, width=self.width)
         
     def get_points(self):
         return [(self.x1, self.y1), (self.x2, self.y2)]
@@ -70,6 +115,158 @@ class Line(VectorObject):
             self.x1, self.y1 = x, y
         elif index == 1:
             self.x2, self.y2 = x, y
+
+
+class Shape(VectorObject):
+    """A closed/open preset made exclusively from Line primitives."""
+    def __init__(self, lines=None, color="#000000", width=2, fill=None,
+                 filled_side="inside", preset="custom"):
+        super().__init__(color, width)
+        self.lines = lines or []
+        self.fill = fill
+        self.filled_side = filled_side
+        self.preset = preset
+        self._spherical_fill_cache = None
+        for line in self.lines:
+            line.color, line.width = color, width
+
+    def to_dict(self):
+        data = super().to_dict()
+        data.update(lines=[line.to_dict() for line in self.lines], fill=self.fill,
+                    filled_side=self.filled_side, preset=self.preset)
+        return data
+
+    @classmethod
+    def from_dict(cls, data):
+        lines = [Line.from_dict({k: v for k, v in item.items() if k != 'type'})
+                 for item in data.get('lines', [])]
+        return cls(lines, data['color'], data['width'], data.get('fill'),
+                   data.get('filled_side', 'inside'), data.get('preset', 'custom'))
+
+    @classmethod
+    def from_legacy_rectangle(cls, data):
+        x, y, w, h = data['x'], data['y'], data['w'], data['h']
+        vertices = [(x, y), (x+w, y), (x+w, y+h), (x, y+h)]
+        lines = [Line(*vertices[i], *vertices[(i+1) % 4], data['color'], data['width'])
+                 for i in range(4)]
+        return cls(lines, data['color'], data['width'], data.get('fill'), preset='rect')
+
+    @classmethod
+    def from_legacy_ellipse(cls, data):
+        cx, cy, rx, ry = data['x'], data['y'], data['rx'], data['ry']
+        k = 0.5522847498
+        vertices = [(cx+rx,cy),(cx,cy+ry),(cx-rx,cy),(cx,cy-ry)]
+        controls = [(cx+rx,cy+k*ry,cx+k*rx,cy+ry),
+                    (cx-k*rx,cy+ry,cx-rx,cy+k*ry),
+                    (cx-rx,cy-k*ry,cx-k*rx,cy-ry),
+                    (cx+k*rx,cy-ry,cx+rx,cy-k*ry)]
+        lines = [Line(*vertices[i], *vertices[(i+1) % 4], data['color'],
+                      data['width'], curve=controls[i]) for i in range(4)]
+        return cls(lines, data['color'], data['width'], data.get('fill'), preset='ellipse')
+
+    def _outline(self, width, height):
+        points = []
+        for line in self.lines:
+            segment = line.sampled_points(width, height)
+            if points and segment:
+                shift = round((points[-1][0] - segment[0][0]) / width) * width
+                segment = [(x + shift, y) for x, y in segment]
+            points.extend(segment if not points else segment[1:])
+        return points
+
+    def _spherical_fill_mask(self, width, height):
+        """Rasterize the smaller spherical interior, including across a pole."""
+        vertices_xy = [(line.x1, line.y1) for line in self.lines]
+        cache_key = (width, height, tuple(vertices_xy))
+        if self._spherical_fill_cache and self._spherical_fill_cache[0] == cache_key:
+            return self._spherical_fill_cache[1]
+
+        # Physical sphere coordinates use the opposite longitude direction to
+        # the displayed texture, matching globe_view's texture transform.
+        uv = np.asarray([((1.0 - x / width) % 1.0, y / height)
+                         for x, y in vertices_xy], dtype=np.float64)
+        lon = uv[:, 0] * (2 * np.pi) - np.pi
+        lat = (0.5 - uv[:, 1]) * np.pi
+        vertices = np.column_stack((np.cos(lat) * np.cos(lon),
+                                    np.sin(lat),
+                                    np.cos(lat) * np.sin(lon)))
+
+        # A spherical winding has an antipodal counterpart with the opposite
+        # direction.  Determine which direction belongs to the shape at its
+        # own centre so the far side is not filled as a second copy.
+        centre = np.sum(vertices, axis=0)
+        centre_length = np.linalg.norm(centre)
+        if centre_length < 1e-12:
+            centre = vertices[0]
+        else:
+            centre /= centre_length
+        centre_tangents = []
+        for vertex in vertices:
+            tangent = vertex - np.dot(centre, vertex) * centre
+            tangent /= max(np.linalg.norm(tangent), 1e-12)
+            centre_tangents.append(tangent)
+        centre_winding = 0.0
+        for i, tangent in enumerate(centre_tangents):
+            following = centre_tangents[(i + 1) % len(centre_tangents)]
+            centre_winding += np.arctan2(
+                np.dot(centre, np.cross(tangent, following)),
+                np.dot(tangent, following))
+        inside_direction = 1.0 if centre_winding >= 0.0 else -1.0
+
+        mask = np.zeros((height, width), dtype=np.uint8)
+        pixel_lon = (1.0 - (np.arange(width) + 0.5) / width) * (2*np.pi) - np.pi
+        cos_lon, sin_lon = np.cos(pixel_lon), np.sin(pixel_lon)
+
+        # Work in strips to keep temporary tangent arrays bounded for ellipses.
+        for y0 in range(0, height, 32):
+            y1 = min(height, y0 + 32)
+            pixel_lat = (0.5 - (np.arange(y0, y1) + 0.5) / height) * np.pi
+            cos_lat = np.cos(pixel_lat)[:, None]
+            points = np.stack(np.broadcast_arrays(
+                cos_lat * cos_lon[None, :],
+                np.sin(pixel_lat)[:, None],
+                cos_lat * sin_lon[None, :]), axis=-1)
+            winding = np.zeros(points.shape[:2], dtype=np.float64)
+            tangents = []
+            for vertex in vertices:
+                tangent = vertex - np.sum(points * vertex, axis=-1)[..., None] * points
+                tangent /= np.maximum(np.linalg.norm(tangent, axis=-1)[..., None], 1e-12)
+                tangents.append(tangent)
+            for i, tangent in enumerate(tangents):
+                following = tangents[(i + 1) % len(tangents)]
+                sine = np.sum(points * np.cross(tangent, following), axis=-1)
+                cosine = np.sum(tangent * following, axis=-1)
+                winding += np.arctan2(sine, cosine)
+            mask[y0:y1] = (winding * inside_direction > np.pi).astype(np.uint8) * 255
+
+        result = Image.fromarray(mask, mode="L")
+        self._spherical_fill_cache = (cache_key, result)
+        return result
+
+    def draw(self, draw, document_width=1024, document_height=512):
+        points = self._outline(document_width, document_height)
+        globe = any(line.space == "globe" for line in self.lines)
+        offsets = (-document_width, 0, document_width) if globe else (0,)
+        if self.fill and len(points) >= 3 and self.filled_side == "inside":
+            if globe:
+                draw.bitmap((0, 0), self._spherical_fill_mask(
+                    document_width, document_height), fill=self.fill)
+            else:
+                draw.polygon(points, fill=self.fill)
+        for line in self.lines:
+            line.draw(draw, document_width, document_height)
+
+    def get_points(self):
+        return [(line.x1, line.y1) for line in self.lines]
+
+    def update_point(self, index, x, y):
+        if not (0 <= index < len(self.lines)):
+            return
+        old = (self.lines[index].x1, self.lines[index].y1)
+        self._spherical_fill_cache = None
+        for line in self.lines:
+            if (line.x1, line.y1) == old: line.x1, line.y1 = x, y
+            if (line.x2, line.y2) == old: line.x2, line.y2 = x, y
 
 class Rectangle(VectorObject):
     def __init__(self, x=0, y=0, w=100, h=100, color="#000000", width=2, fill=None):
@@ -95,7 +292,7 @@ class Rectangle(VectorObject):
     def from_dict(cls, data):
         return cls(data['x'], data['y'], data['w'], data['h'], data['color'], data['width'], data['fill'])
     
-    def draw(self, draw):
+    def draw(self, draw, document_width=1024, document_height=512):
         draw.rectangle([(self.x, self.y), (self.x + self.w, self.y + self.h)], 
                        outline=self.color, fill=self.fill, width=self.width)
         
@@ -127,7 +324,7 @@ class Ellipse(VectorObject):
     def from_dict(cls, data):
         return cls(data['x'], data['y'], data['rx'], data['ry'], data['color'], data['width'], data['fill'])
     
-    def draw(self, draw):
+    def draw(self, draw, document_width=1024, document_height=512):
         draw.ellipse([(self.x - self.rx, self.y - self.ry), (self.x + self.rx, self.y + self.ry)], 
                      outline=self.color, fill=self.fill, width=self.width)
         
@@ -154,7 +351,7 @@ class VectorLayer:
             
     def render(self, draw):
         for obj in self.objects:
-            obj.draw(draw)
+            obj.draw(draw, self.width, self.height)
             
     def get_object_at(self, x, y, tolerance=10):
         """Find object at position (for selection)"""
@@ -552,11 +749,13 @@ class PaintApp:
             self.globe_window = None
 
     def can_paint_from_globe(self):
-        """Globe input currently supports raster brush and eraser tools only."""
-        return (
-            self.layers[self.active_layer].layer_type == "raster"
-            and self.tool in ("brush", "eraser")
-        )
+        layer = self.layers[self.active_layer]
+        return ((layer.layer_type == "raster" and self.tool in ("brush", "eraser")) or
+                (layer.layer_type == "vector" and self.tool in ("line", "rect", "ellipse")))
+
+    def can_draw_vector_from_globe(self):
+        return (self.layers[self.active_layer].layer_type == "vector" and
+                self.tool in ("line", "rect", "ellipse"))
 
     def snapshot(self):
         snap = []
@@ -1088,14 +1287,56 @@ class PaintApp:
         obj = None
         if self.tool == "line":
             obj = Line(x1, y1, x2, y2, self.primary_color, 2)
-        elif self.tool == "rect":
-            obj = Rectangle(x1, y1, abs(x2 - x1), abs(y2 - y1), self.primary_color, 2)
-        elif self.tool == "ellipse":
-            obj = Ellipse((x1 + x2) / 2, (y1 + y2) / 2, 
-                         abs(x2 - x1) / 2, abs(y2 - y1) / 2, self.primary_color, 2)
+        elif self.tool in ("rect", "ellipse"):
+            obj = self.make_shape_preset(self.tool, [(x1, y1), (x2, y2)], "flat")
         
         if obj:
             layer.vector_data.add_object(obj)
+
+    def make_shape_preset(self, preset, points, space="flat"):
+        """Turn a UI shape preset into lines; presets are never special render objects."""
+        color, width = self.primary_color, 2
+        if preset == "rect":
+            if len(points) == 2:
+                (x1, y1), (x2, y2) = points
+                vertices = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+            else:
+                vertices = points[:4]
+            lines = [Line(*vertices[i], *vertices[(i + 1) % 4], color, width, space=space)
+                     for i in range(4)]
+        else:
+            if space == "flat":
+                (x1, y1), (x2, y2) = points
+                cx, cy = (x1+x2)/2, (y1+y2)/2
+                rx, ry = abs(x2-x1)/2, abs(y2-y1)/2
+                k = 0.5522847498
+                verts = [(cx+rx,cy),(cx,cy+ry),(cx-rx,cy),(cx,cy-ry)]
+                controls = [(cx+rx,cy+k*ry,cx+k*rx,cy+ry),
+                            (cx-k*rx,cy+ry,cx-rx,cy+k*ry),
+                            (cx-rx,cy-k*ry,cx-k*rx,cy-ry),
+                            (cx+k*rx,cy-ry,cx+rx,cy-k*ry)]
+                lines = [Line(*verts[i], *verts[(i+1)%4], color, width,
+                              curve=controls[i], space=space) for i in range(4)]
+            else:
+                vertices = points
+                lines = [Line(*vertices[i], *vertices[(i+1)%len(vertices)], color,
+                              width, space=space) for i in range(len(vertices))]
+        # The secondary colour represents the shape's filled (inside) side.
+        return Shape(lines, color, width, self.secondary_color, "inside", preset)
+
+    def create_globe_vector(self, preset, image_points):
+        if not self.can_draw_vector_from_globe() or len(image_points) < 2:
+            return
+        self.snapshot()
+        if preset == "line":
+            obj = Line(*image_points[0], *image_points[-1], self.primary_color, 2,
+                       space="globe")
+        else:
+            obj = self.make_shape_preset(preset, image_points, "globe")
+        self.layers[self.active_layer].vector_data.add_object(obj)
+        self.layers[self.active_layer].render_vector()
+        self.request_redraw()
+        self.notify_globe_document_changed()
 
     def on_mouse_up(self, event):
         x, y = self.image_coords(event.x, event.y)
