@@ -296,7 +296,8 @@ class GlobeView(tk.Frame):
     def _begin_interactive_render(self, settle_delay=140, rebuild=False):
         """Render responsively now, then replace it with native resolution."""
         self.interactive_render = True
-        desired = min(self.display_size if hasattr(self, "display_size") else
+        desired = min(max(self.render_display_size)
+                      if hasattr(self, "render_display_size") else
                       self.INTERACTIVE_RENDER_SIZE,
                       self.INTERACTIVE_RENDER_SIZE)
         if rebuild or self.current_render_size != desired:
@@ -344,9 +345,9 @@ class GlobeView(tk.Frame):
         rgb = self.render_numpy()
 
         image = Image.fromarray(rgb)
-        if image.size != (self.display_size, self.display_size):
+        if image.size != self.render_display_size:
             image = image.resize(
-                (self.display_size, self.display_size),
+                self.render_display_size,
                 Image.Resampling.BILINEAR,
             )
 
@@ -511,24 +512,39 @@ class GlobeView(tk.Frame):
         cx = w * 0.5
         cy = h * 0.5
         radius = min(w, h) * self.display_scale
-        display_size = max(2, int(radius * 2))
-        render_size = (min(display_size, self.INTERACTIVE_RENDER_SIZE)
-                       if self.interactive_render else display_size)
+
+        # Only render the visible intersection of the sphere and canvas.  At
+        # deep zoom levels most of the globe is off-screen, so allocating the
+        # full sphere would waste both time and memory.
+        left = max(0, int(np.floor(cx - radius)))
+        top = max(0, int(np.floor(cy - radius)))
+        right = min(w, int(np.ceil(cx + radius)))
+        bottom = min(h, int(np.ceil(cy + radius)))
+        display_w = max(2, right - left)
+        display_h = max(2, bottom - top)
+
+        if self.interactive_render:
+            scale = min(1.0, self.INTERACTIVE_RENDER_SIZE /
+                        max(display_w, display_h))
+        else:
+            scale = 1.0
+        render_w = max(2, int(display_w * scale))
+        render_h = max(2, int(display_h * scale))
 
         self.display_center = (cx, cy)
         self.display_radius = radius
-        self.display_size = display_size
-        self.current_render_size = render_size
-        self.render_origin = (int(cx - display_size / 2),
-                              int(cy - display_size / 2))
+        self.render_display_size = (display_w, display_h)
+        self.current_render_size = max(render_w, render_h)
+        self.render_origin = (left, top)
 
         # Render into a bounded square rather than running trigonometry over
         # every pixel of the whole application workspace.  The result is
         # scaled to the requested on-screen globe size in _render_now().
-        yy, xx = np.mgrid[0:render_size, 0:render_size]
-        render_radius = render_size * 0.5
-        dx = (xx + 0.5 - render_radius) / render_radius
-        dy = (yy + 0.5 - render_radius) / render_radius
+        yy, xx = np.mgrid[0:render_h, 0:render_w]
+        screen_x = left + (xx + 0.5) * (display_w / render_w)
+        screen_y = top + (yy + 0.5) * (display_h / render_h)
+        dx = (screen_x - cx) / radius
+        dy = (screen_y - cy) / radius
 
         r2 = dx * dx + dy * dy
 
@@ -543,7 +559,7 @@ class GlobeView(tk.Frame):
         # Unit sphere normals
         #
 
-        normals = np.zeros((render_size, render_size, 3), dtype=np.float32)
+        normals = np.zeros((render_h, render_w, 3), dtype=np.float32)
 
         normals[..., 0] = dx
         normals[..., 1] = -dy
@@ -679,9 +695,13 @@ class GlobeView(tk.Frame):
         # Rotation speed
         #
 
-        self.yaw += dx * 0.01
+        # Keep the texture's on-screen travel approximately constant across
+        # zoom levels.  A fixed angular step becomes extremely sensitive when
+        # the sphere radius is much larger than the viewport.
+        rotation_speed = 0.01 * (0.45 / self.display_scale)
+        self.yaw += dx * rotation_speed
 
-        self.pitch += dy * 0.01
+        self.pitch += dy * rotation_speed
 
         #
         # Prevent flipping
@@ -704,11 +724,11 @@ class GlobeView(tk.Frame):
         self.full_quality_after_id = self.after(40, self._render_full_quality)
 
     def zoom_in(self, event=None):
-        self.display_scale = min(0.49, self.display_scale * 1.08)
+        self.display_scale = min(10.0, self.display_scale * 1.12)
         self._begin_interactive_render(rebuild=True)
 
     def zoom_out(self, event=None):
-        self.display_scale = max(0.15, self.display_scale / 1.08)
+        self.display_scale = max(0.15, self.display_scale / 1.12)
         self._begin_interactive_render(rebuild=True)
 
     def on_mousewheel(self, event):
