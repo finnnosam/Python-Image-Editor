@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import filedialog, colorchooser, messagebox
 from tkinter import ttk
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageDraw, ImageTk, ImageOps
 import numpy as np
 import math
 import copy
@@ -9,6 +9,7 @@ import io
 import base64
 import json
 import time
+from pathlib import Path
 
 class VectorObject:
     """Base class for vector objects"""
@@ -482,7 +483,7 @@ class PaintApp:
         tk.Button(top, text="Save As",    command=self.save_project_as).pack(side="left", padx=2, pady=2)
         tk.Button(top, text="Export PNG", command=self.save_image).pack(side="left", padx=2, pady=2)
         tk.Button(top, text="Undo",       command=self.undo).pack(side="left", padx=2, pady=2)
-        tk.Button(top, text="Globe",      command=self.open_globe_view).pack(side="left", padx=2, pady=2)
+        tk.Button(top, text="Globe View", command=self.open_globe_view).pack(side="left", padx=2, pady=2)
         tk.Button(top, text="Settings",   command=self.open_settings).pack(side="right", padx=2, pady=2)
 
         # ── Main area: tools | canvas | layers ────────────────────────────
@@ -559,9 +560,24 @@ class PaintApp:
         self.size_entry.bind("<Return>", update_size)
         self.size_entry.bind("<FocusOut>", update_size)
 
-        # ── Centre: canvas ────────────────────────────────────────────────
-        self.canvas = tk.Canvas(main, bg="gray25")
-        self.canvas.pack(side="left", fill="both", expand=True)
+        # ── Centre: reusable view workspace ──────────────────────────────
+        # Tools and layers live outside this frame, so every view shares them.
+        self.view_workspace = tk.Frame(main)
+        self.view_workspace.pack(side="left", fill="both", expand=True)
+
+        self.view_tabs = tk.Frame(self.view_workspace, bd=1, relief="raised")
+        self.view_tabs.pack(side="top", fill="x")
+        self.view_host = tk.Frame(self.view_workspace)
+        self.view_host.pack(side="top", fill="both", expand=True)
+
+        self.views = {}
+        self.view_tab_widgets = {}
+        self.active_view = None
+
+        flat_view = tk.Frame(self.view_host)
+        self.canvas = tk.Canvas(flat_view, bg="gray25")
+        self.canvas.pack(fill="both", expand=True)
+        self.register_view("main", "Main", flat_view, closable=False)
 
         self.canvas.bind("<Button-1>",        self.on_mouse_down)
         self.canvas.bind("<B1-Motion>",       self.on_mouse_move)
@@ -584,6 +600,7 @@ class PaintApp:
         self.canvas.bind("<Control-s>", lambda e: self.save_project())
         self.canvas.bind("<Control-n>", lambda e: self.new_project())
         self.canvas.focus_set()
+        self.switch_view("main")
 
         # ── Right panel: layers ───────────────────────────────────────────
         right = tk.Frame(main, width=250, bd=1, relief="sunken")
@@ -685,25 +702,42 @@ class PaintApp:
         tk.Button(btn_row, text="OK",     command=ok).pack(side="left", padx=4)
         tk.Button(btn_row, text="Cancel", command=win.destroy).pack(side="left", padx=4)
 
-    def open_globe_view(self):
+    def register_view(self, view_id, label, widget, closable=True):
+        """Add an embedded workspace view and its compact tab."""
+        self.views[view_id] = widget
+        tab = tk.Frame(self.view_tabs)
+        tk.Button(tab, text=label, bd=0,
+                  command=lambda key=view_id: self.switch_view(key)).pack(side="left")
+        if closable:
+            tk.Button(tab, text="×", bd=0, padx=4,
+                      command=lambda key=view_id: self.close_view(key)).pack(side="left")
+        tab.pack(side="left", padx=2, pady=2)
+        self.view_tab_widgets[view_id] = tab
 
-        #
-        # Already open?
-        #
+    def switch_view(self, view_id):
+        """Show one view without disturbing the shared tools or layers."""
+        if view_id not in self.views:
+            return
+        if self.active_view in self.views:
+            self.views[self.active_view].pack_forget()
+        self.active_view = view_id
+        self.views[view_id].pack(fill="both", expand=True)
+        if view_id == "main":
+            self.canvas.focus_set()
 
-        if hasattr(self, "globe_window"):
-
-            try:
-                if self.globe_window.winfo_exists():
-                    self.globe_window.lift()
-                    self.globe_window.focus_force()
-                    return
-            except Exception:
-                pass
-
-        from globe_view import GlobeWindow
-
-        self.globe_window = GlobeWindow(self)
+    def close_view(self, view_id):
+        """Remove an optional view and return to the main canvas."""
+        if view_id == "main" or view_id not in self.views:
+            return
+        widget = self.views.pop(view_id)
+        tab = self.view_tab_widgets.pop(view_id)
+        if self.active_view == view_id:
+            self.active_view = None
+            self.switch_view("main")
+        tab.destroy()
+        widget.destroy()
+        if view_id == "globe":
+            self.globe_window = None
 
     def apply_ui_scale(self, scale):
         self.ui_scale = scale
@@ -861,55 +895,91 @@ class PaintApp:
                 return
         
         filename = filedialog.askopenfilename(
-            filetypes=[("PyPaint files", "*.pypaint"), ("All files", "*.*")]
+            filetypes=[
+                ("All files", "*.*"),
+                ("PyPaint projects", "*.pypaint"),
+                ("Images", "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp"),
+            ]
         )
         if not filename:
             return
         
         try:
-            with open(filename, 'r', encoding='utf-8') as f:
-                project_data = json.load(f)
-            
-            if 'version' not in project_data or 'layers' not in project_data:
-                raise ValueError("Invalid project file format")
-            
-            self.layers = []
-            
-            for layer_info in project_data['layers']:
-                img_bytes = base64.b64decode(layer_info['image_data'])
-                img = Image.open(io.BytesIO(img_bytes))
-                
-                layer = Layer(project_data['document_width'], 
-                             project_data['document_height'], 
-                             layer_info['name'],
-                             layer_info.get('layer_type', 'raster'))
-                layer.image = img
-                layer.visible = layer_info['visible']
-                layer.draw = ImageDraw.Draw(layer.image)
-                
-                if layer.layer_type == "vector" and 'vector_data' in layer_info:
-                    layer.vector_data = VectorLayer.from_dict(
-                        layer_info['vector_data'],
-                        project_data['document_width'],
-                        project_data['document_height']
-                    )
-                
-                self.layers.append(layer)
-            
-            self.active_layer = project_data.get('active_layer', 0)
-            if self.active_layer >= len(self.layers):
-                self.active_layer = len(self.layers) - 1
-            
-            self.current_file = filename
-            self.undo_stack = []
-            self.refresh_layers()
-            self.redraw()
-            self.update_title()
-            self.notify_globe_document_changed()
-            messagebox.showinfo("Success", f"Project loaded from {filename}")
-            
+            if Path(filename).suffix.lower() == ".pypaint":
+                self._open_pypaint_file(filename)
+                messagebox.showinfo("Success", f"Project loaded from {filename}")
+            else:
+                self._open_image_file(filename)
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to open project: {e}")
+            messagebox.showerror("Error", f"Failed to open file: {e}")
+
+    def _open_pypaint_file(self, filename):
+        """Load a native, editable PyPaint project."""
+        with open(filename, 'r', encoding='utf-8') as f:
+            project_data = json.load(f)
+
+        if 'version' not in project_data or 'layers' not in project_data:
+            raise ValueError("Invalid project file format")
+
+        loaded_layers = []
+
+        for layer_info in project_data['layers']:
+            img_bytes = base64.b64decode(layer_info['image_data'])
+            with Image.open(io.BytesIO(img_bytes)) as source:
+                img = source.convert("RGBA")
+
+            layer = Layer(project_data['document_width'],
+                          project_data['document_height'],
+                          layer_info['name'],
+                          layer_info.get('layer_type', 'raster'))
+            layer.image = img
+            layer.visible = layer_info['visible']
+            layer.draw = ImageDraw.Draw(layer.image)
+
+            if layer.layer_type == "vector" and 'vector_data' in layer_info:
+                layer.vector_data = VectorLayer.from_dict(
+                    layer_info['vector_data'],
+                    project_data['document_width'],
+                    project_data['document_height']
+                )
+
+            loaded_layers.append(layer)
+
+        if not loaded_layers:
+            raise ValueError("Project contains no layers")
+
+        self.doc_w = project_data['document_width']
+        self.doc_h = project_data['document_height']
+        self.layers = loaded_layers
+        self.active_layer = min(project_data.get('active_layer', 0),
+                                len(self.layers) - 1)
+        self.current_file = filename
+        self._finish_open()
+
+    def _open_image_file(self, filename):
+        """Import an ordinary image as a new, unsaved raster document."""
+        with Image.open(filename) as source:
+            image = ImageOps.exif_transpose(source).convert("RGBA")
+
+        self.doc_w, self.doc_h = image.size
+        layer = Layer(self.doc_w, self.doc_h, Path(filename).stem, "raster")
+        layer.image = image
+        layer.draw = ImageDraw.Draw(layer.image)
+        self.layers = [layer]
+        self.active_layer = 0
+
+        # An imported image is not a native project yet.  This ensures Save
+        # opens Save As instead of replacing (for example) a PNG with JSON.
+        self.current_file = None
+        self._finish_open()
+
+    def _finish_open(self):
+        """Refresh shared UI state after either kind of file is opened."""
+        self.undo_stack = []
+        self.refresh_layers()
+        self.redraw()
+        self.update_title()
+        self.notify_globe_document_changed()
 
     def set_tool(self, tool):
         self.tool = tool
@@ -1220,14 +1290,9 @@ class PaintApp:
         )
 
     def open_globe_view(self):
-
-        if getattr(self, "globe_window", None):
-
-            try:
-                self.globe_window.lift()
-                return
-            except:
-                pass
+        if "globe" in self.views:
+            self.switch_view("globe")
+            return
 
         if self.doc_w != self.doc_h * 2:
             should_continue = messagebox.askyesno(
@@ -1238,9 +1303,11 @@ class PaintApp:
             if not should_continue:
                 return
 
-        from globe_view import GlobeWindow
+        from globe_view import GlobeView
 
-        self.globe_window = GlobeWindow(self)
+        self.globe_window = GlobeView(self.view_host, self)
+        self.register_view("globe", "Globe", self.globe_window)
+        self.switch_view("globe")
 
     def draw_circle(self, x, y, radius, color):
         layer = self.layers[self.active_layer]

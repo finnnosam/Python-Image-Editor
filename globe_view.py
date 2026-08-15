@@ -42,25 +42,15 @@ from sphere_math import (
 )
 
 
-class GlobeWindow(tk.Toplevel):
+class GlobeView(tk.Frame):
 
     DEFAULT_SIZE = 700
 
-    def __init__(self, app):
+    def __init__(self, parent, app):
 
-        super().__init__(app.root)
+        super().__init__(parent, bg="#303030")
 
         self.app = app
-
-        self.title("Globe View")
-        self.geometry(
-            f"{self.DEFAULT_SIZE}x{self.DEFAULT_SIZE}"
-        )
-
-        self.protocol(
-            "WM_DELETE_WINDOW",
-            self.on_close
-        )
 
         #
         # Camera
@@ -207,9 +197,7 @@ class GlobeWindow(tk.Toplevel):
     # --------------------------------------------------
 
     def on_close(self):
-        if getattr(self.app, "globe_window", None) is self:
-            self.app.globe_window = None
-        self.destroy()
+        self.app.close_view("globe")
 
     # --------------------------------------------------
 
