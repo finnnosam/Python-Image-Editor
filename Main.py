@@ -417,6 +417,7 @@ class PaintApp:
 
         self.redraw_pending = False
         self.last_redraw = 0.0
+        self.main_view_dirty = False
         self.target_frame_time = 1 / 60.0    #FPS
 
         self.layers = [Layer(self.doc_w, self.doc_h, "Background", "raster")]
@@ -630,6 +631,10 @@ class PaintApp:
             tk.Button(right, text=label, command=cmd).pack(fill="x", padx=4, pady=1)
 
     def request_redraw(self):
+        if hasattr(self, "active_view") and self.active_view != "main":
+            self.main_view_dirty = True
+            return
+
         now = time.perf_counter()
 
         if now - self.last_redraw < 1/60:
@@ -719,10 +724,19 @@ class PaintApp:
         if view_id not in self.views:
             return
         if self.active_view in self.views:
-            self.views[self.active_view].pack_forget()
+            old_view = self.views[self.active_view]
+            if hasattr(old_view, "on_hidden"):
+                old_view.on_hidden()
+            old_view.pack_forget()
         self.active_view = view_id
-        self.views[view_id].pack(fill="both", expand=True)
+        new_view = self.views[view_id]
+        new_view.pack(fill="both", expand=True)
+        if hasattr(new_view, "on_shown"):
+            new_view.on_shown()
         if view_id == "main":
+            if self.main_view_dirty:
+                self.main_view_dirty = False
+                self.redraw()
             self.canvas.focus_set()
 
     def close_view(self, view_id):
@@ -1542,7 +1556,11 @@ class PaintApp:
         self.canvas.create_image(sx, sy, image=self.tkimg, anchor="nw")
 
     def redraw(self):
-        self.canvas.update_idletasks()
+        # Keep inactive views lazy.  In particular, globe painting used to
+        # render this hidden canvas as well as the visible globe every frame.
+        if hasattr(self, "active_view") and self.active_view != "main":
+            self.main_view_dirty = True
+            return
         
         # Ensure vector layers are rendered
         for layer in self.layers:

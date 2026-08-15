@@ -45,6 +45,7 @@ from sphere_math import (
 class GlobeView(tk.Frame):
 
     DEFAULT_SIZE = 700
+    INTERACTIVE_RENDER_SIZE = 512
 
     def __init__(self, parent, app):
 
@@ -96,6 +97,14 @@ class GlobeView(tk.Frame):
         self.last_uv = None
         self.vector_start_screen = None
         self.document_refresh_pending = False
+        self.document_dirty = False
+        self.redraw_after_id = None
+        self.projection_key = None
+        self.projected_tx = None
+        self.projected_ty = None
+        self.interactive_render = False
+        self.full_quality_after_id = None
+        self.current_render_size = None
 
         #
         # Build widgets
@@ -221,10 +230,15 @@ class GlobeView(tk.Frame):
         changes.
         """
 
-        self.request_document_refresh()
+        self.document_dirty = True
+        if self.app.active_view == "globe":
+            self.request_document_refresh()
 
     def request_document_refresh(self):
         """Coalesce document updates so painting does not redraw twice per mouse event."""
+        if self.app.active_view != "globe":
+            self.document_dirty = True
+            return
         if self.document_refresh_pending:
             return
         self.document_refresh_pending = True
@@ -232,13 +246,92 @@ class GlobeView(tk.Frame):
 
     def _refresh_document(self):
         self.document_refresh_pending = False
-        if self.winfo_exists():
+        if self.winfo_exists() and self.app.active_view == "globe":
             self.update_texture()
+            self.document_dirty = False
             self.redraw()
+
+    def on_hidden(self):
+        """Stop work and release viewport-sized buffers while hidden.
+
+        A maximized globe keeps several full-canvas float and integer arrays.
+        Retaining those arrays caused memory pressure (and allocation stalls)
+        in the otherwise unrelated main canvas until the globe was closed.
+        """
+        if self.redraw_after_id is not None:
+            try:
+                self.after_cancel(self.redraw_after_id)
+            except tk.TclError:
+                pass
+            self.redraw_after_id = None
+        if self.full_quality_after_id is not None:
+            try:
+                self.after_cancel(self.full_quality_after_id)
+            except tk.TclError:
+                pass
+            self.full_quality_after_id = None
+
+        self.canvas.delete("all")
+        self.photo = None
+        self.render_image = None
+        self.texture = None
+        self.texture_array = None
+        self.projected_tx = None
+        self.projected_ty = None
+        self.projection_key = None
+        self.current_render_size = None
+        for name in ("lookup_normals", "lookup_mask"):
+            if hasattr(self, name):
+                delattr(self, name)
+        self.document_dirty = True
+
+    def on_shown(self):
+        """Rebuild released buffers and catch up once when shown again."""
+        if self.document_dirty or self.texture is None:
+            self.update_texture()
+            self.document_dirty = False
+        self.update_idletasks()
+        self._begin_interactive_render(settle_delay=60, rebuild=True)
+
+    def _begin_interactive_render(self, settle_delay=140, rebuild=False):
+        """Render responsively now, then replace it with native resolution."""
+        self.interactive_render = True
+        desired = min(self.display_size if hasattr(self, "display_size") else
+                      self.INTERACTIVE_RENDER_SIZE,
+                      self.INTERACTIVE_RENDER_SIZE)
+        if rebuild or self.current_render_size != desired:
+            self.build_lookup()
+        self.redraw()
+        if self.full_quality_after_id is not None:
+            self.after_cancel(self.full_quality_after_id)
+        self.full_quality_after_id = self.after(
+            settle_delay, self._render_full_quality)
+
+    def _render_full_quality(self):
+        self.full_quality_after_id = None
+        if self.app.active_view != "globe":
+            return
+        self.interactive_render = False
+        self.build_lookup()
+        self.redraw()
 
     # --------------------------------------------------
 
     def redraw(self):
+
+        if self.app.active_view != "globe" or self.redraw_after_id is not None:
+            return
+        # Coalesce bursts of mouse events, but do not impose a fixed delay on
+        # every interaction.  The bounded renderer is fast enough to run as
+        # soon as Tk reaches idle.
+        self.redraw_after_id = self.after_idle(self._render_now)
+
+    def _render_now(self):
+
+        self.redraw_after_id = None
+
+        if self.app.active_view != "globe":
+            return
 
         if self.texture is None:
             return
@@ -251,14 +344,19 @@ class GlobeView(tk.Frame):
         rgb = self.render_numpy()
 
         image = Image.fromarray(rgb)
+        if image.size != (self.display_size, self.display_size):
+            image = image.resize(
+                (self.display_size, self.display_size),
+                Image.Resampling.BILINEAR,
+            )
 
         self.photo = ImageTk.PhotoImage(image)
 
         self.canvas.delete("all")
 
         self.canvas.create_image(
-            0,
-            0,
+            self.render_origin[0],
+            self.render_origin[1],
             image=self.photo,
             anchor="nw"
         )
@@ -297,55 +395,28 @@ class GlobeView(tk.Frame):
         y = normals[...,1]
         z = normals[...,2]
 
-        # Map screen normals back into texture space using the same inverse
-        # rotation as screen_to_uv(), so rendered and painted coordinates
-        # remain aligned after rotation.
-        yy = cp*y + sp*z
-        zz = -sp*y + cp*z
-        xr = cy*x - sy*zz
-        zr = sy*x + cy*zz
-
-        #
-        # Longitude
-        #
-
-        lon = np.arctan2(
-            zr,
-            xr
-        )
-
-        #
-        # Latitude
-        #
-
-        lat = np.arcsin(
-            np.clip(
-                yy,
-                -1.0,
-                1.0
-            )
-        )
-
-        # The equirectangular image is mirrored horizontally relative to the
-        # viewer's physical X axis.  Mirror the texture coordinate, not the
-        # sphere geometry itself; that preserves a proper yaw rotation.
-        u = (1.0 - (lon + np.pi) / (2*np.pi)) % 1.0
-
-        v = 0.5 - lat / np.pi
-
         tw = tex.shape[1]
         th = tex.shape[0]
+        projection_key = (self.yaw, self.pitch, tw, th,
+                          self.lookup_mask.shape)
+        if projection_key != self.projection_key:
+            # Map screen normals back into texture space.  These coordinates
+            # remain valid across paint frames until rotation or size changes.
+            yy = cp*y + sp*z
+            zz = -sp*y + cp*z
+            xr = cy*x - sy*zz
+            zr = sy*x + cy*zz
+            lon = np.arctan2(zr, xr)
+            lat = np.arcsin(np.clip(yy, -1.0, 1.0))
+            u = (1.0 - (lon + np.pi) / (2*np.pi)) % 1.0
+            v = 0.5 - lat / np.pi
+            self.projected_tx = (u * tw).astype(np.int32) % tw
+            self.projected_ty = np.clip(
+                (v * (th-1)).astype(np.int32), 0, th-1)
+            self.projection_key = projection_key
 
-        tx = (u * tw).astype(np.int32)
-        ty = (v * (th-1)).astype(np.int32)
-
-        tx %= tw
-
-        ty = np.clip(
-            ty,
-            0,
-            th-1
-        )
+        tx = self.projected_tx
+        ty = self.projected_ty
 
         mask = self.lookup_mask
 
@@ -372,30 +443,24 @@ class GlobeView(tk.Frame):
             None
         """
 
-        if not hasattr(self, "lookup_mask"):
+        if not hasattr(self, "display_center"):
             return None
 
-        h, w = self.lookup_mask.shape
-
-        if x < 0 or y < 0:
-            return None
-
-        if x >= w or y >= h:
-            return None
-
-        if not self.lookup_mask[y, x]:
+        cx, cy = self.display_center
+        dx = (x - cx) / self.display_radius
+        dy = (y - cy) / self.display_radius
+        r2 = dx * dx + dy * dy
+        if r2 > 1.0:
             return None
 
         #
         # Normal in viewer space.
         #
 
-        n = self.lookup_normals[y, x]
-
         normal = Vec3(
-            float(n[0]),
-            float(n[1]),
-            float(n[2])
+            float(dx),
+            float(-dy),
+            float(np.sqrt(max(0.0, 1.0 - r2)))
         )
 
         #
@@ -445,13 +510,25 @@ class GlobeView(tk.Frame):
 
         cx = w * 0.5
         cy = h * 0.5
-
         radius = min(w, h) * self.display_scale
+        display_size = max(2, int(radius * 2))
+        render_size = (min(display_size, self.INTERACTIVE_RENDER_SIZE)
+                       if self.interactive_render else display_size)
 
-        yy, xx = np.mgrid[0:h, 0:w]
+        self.display_center = (cx, cy)
+        self.display_radius = radius
+        self.display_size = display_size
+        self.current_render_size = render_size
+        self.render_origin = (int(cx - display_size / 2),
+                              int(cy - display_size / 2))
 
-        dx = (xx - cx) / radius
-        dy = (yy - cy) / radius
+        # Render into a bounded square rather than running trigonometry over
+        # every pixel of the whole application workspace.  The result is
+        # scaled to the requested on-screen globe size in _render_now().
+        yy, xx = np.mgrid[0:render_size, 0:render_size]
+        render_radius = render_size * 0.5
+        dx = (xx + 0.5 - render_radius) / render_radius
+        dy = (yy + 0.5 - render_radius) / render_radius
 
         r2 = dx * dx + dy * dy
 
@@ -466,7 +543,7 @@ class GlobeView(tk.Frame):
         # Unit sphere normals
         #
 
-        normals = np.zeros((h, w, 3), dtype=np.float32)
+        normals = np.zeros((render_size, render_size, 3), dtype=np.float32)
 
         normals[..., 0] = dx
         normals[..., 1] = -dy
@@ -483,6 +560,7 @@ class GlobeView(tk.Frame):
         normals /= length
 
         self.lookup_normals = normals
+        self.projection_key = None
 
     # --------------------------------------------------
     # Event handlers
@@ -490,8 +568,10 @@ class GlobeView(tk.Frame):
 
     def on_resize(self, event=None):
 
-        self.build_lookup()
-        self.redraw()
+        if self.app.active_view != "globe":
+            return
+
+        self._begin_interactive_render(rebuild=True)
 
     def on_left_press(self, event):
         self.start_paint(event, button=1)
@@ -614,21 +694,22 @@ class GlobeView(tk.Frame):
             min(limit, self.pitch)
         )
 
-        self.redraw()
+        self._begin_interactive_render()
 
     def on_middle_release(self, event):
 
         self.rotating = False
+        if self.full_quality_after_id is not None:
+            self.after_cancel(self.full_quality_after_id)
+        self.full_quality_after_id = self.after(40, self._render_full_quality)
 
     def zoom_in(self, event=None):
         self.display_scale = min(0.49, self.display_scale * 1.08)
-        self.build_lookup()
-        self.redraw()
+        self._begin_interactive_render(rebuild=True)
 
     def zoom_out(self, event=None):
         self.display_scale = max(0.15, self.display_scale / 1.08)
-        self.build_lookup()
-        self.redraw()
+        self._begin_interactive_render(rebuild=True)
 
     def on_mousewheel(self, event):
 
