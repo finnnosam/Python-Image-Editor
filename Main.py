@@ -9,6 +9,7 @@ import io
 import base64
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 class VectorObject:
@@ -398,6 +399,53 @@ class Layer:
             self.draw = ImageDraw.Draw(self.image)
             self.vector_data = VectorLayer(name, width, height)
 
+        # Level zero is always the editable image.  Smaller levels are built
+        # lazily as zooming needs them, rather than for every opened image.
+        self._mipmaps = [self.image]
+        self._mipmap_revision = 0
+
+    def reset_mipmaps(self):
+        """Discard reduced previews after replacing the whole layer image."""
+        self._mipmaps = [self.image]
+        self._mipmap_revision += 1
+
+    def get_mipmap(self, level):
+        """Return a cached 2**level reduction of this layer."""
+        if not self._mipmaps or self._mipmaps[0] is not self.image:
+            self.reset_mipmaps()
+        while len(self._mipmaps) <= level:
+            previous = self._mipmaps[-1]
+            size = (max(1, (previous.width + 1) // 2),
+                    max(1, (previous.height + 1) // 2))
+            self._mipmaps.append(previous.resize(size, Image.Resampling.BOX))
+        return self._mipmaps[level]
+
+    def update_mipmaps(self, box):
+        """Incrementally refresh cached levels touched by a raster edit."""
+        self._mipmap_revision += 1
+        if not self._mipmaps or self._mipmaps[0] is not self.image:
+            self.reset_mipmaps()
+            return
+
+        left, top, right, bottom = box
+        for level in range(1, len(self._mipmaps)):
+            previous = self._mipmaps[level - 1]
+            current = self._mipmaps[level]
+            # Include a pixel of context for BOX filtering at edit boundaries.
+            dl = max(0, int(math.floor(left / 2)) - 1)
+            dt = max(0, int(math.floor(top / 2)) - 1)
+            dr = min(current.width, int(math.ceil(right / 2)) + 1)
+            db = min(current.height, int(math.ceil(bottom / 2)) + 1)
+            if dr <= dl or db <= dt:
+                return
+            source_box = (dl * 2, dt * 2,
+                          min(previous.width, dr * 2),
+                          min(previous.height, db * 2))
+            reduced = previous.crop(source_box).resize(
+                (dr - dl, db - dt), Image.Resampling.BOX)
+            current.paste(reduced, (dl, dt))
+            left, top, right, bottom = dl, dt, dr, db
+
     def render_vector(self):
         """Render vector objects to the raster image"""
         if self.layer_type == "vector" and self.vector_data:
@@ -405,6 +453,7 @@ class Layer:
             self.image = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
             self.draw = ImageDraw.Draw(self.image)
             self.vector_data.render(self.draw)
+            self.reset_mipmaps()
 
 class PaintApp:
     def __init__(self, root):
@@ -417,6 +466,13 @@ class PaintApp:
 
         self.redraw_pending = False
         self.last_redraw = 0.0
+        self.redraw_after_id = None
+        self.mipmap_after_id = None
+        self.pending_mipmap_level = None
+        self.mipmap_future = None
+        self.mipmap_build_level = None
+        self.mipmap_executor = ThreadPoolExecutor(max_workers=1,
+                                                  thread_name_prefix="mipmap")
         self.main_view_dirty = False
         self.target_frame_time = 1 / 60.0    #FPS
 
@@ -443,6 +499,7 @@ class PaintApp:
         self._checker_pil = None        # cached full-viewport tiled PIL image
         self._checker_pil_dims = None   # (cw, ch) it was built for
         self._checker_tkimg = None      # cached cropped PhotoImage for the doc rect
+        self._canvas_image_id = None
 
         self.last_x = None
         self.last_y = None
@@ -630,23 +687,100 @@ class PaintApp:
         ]:
             tk.Button(right, text=label, command=cmd).pack(fill="x", padx=4, pady=1)
 
-    def request_redraw(self):
+    def request_redraw(self, defer=False):
         if hasattr(self, "active_view") and self.active_view != "main":
             self.main_view_dirty = True
             return
 
-        now = time.perf_counter()
-
-        if now - self.last_redraw < 1/60:
+        if self.redraw_after_id is not None:
             return
 
-        self.last_redraw = now
-        self.redraw()
+        now = time.perf_counter()
+        frame_time = 1 / 30.0 if defer else self.target_frame_time
+        delay = max(0.0, frame_time - (now - self.last_redraw))
+        if defer:
+            delay = max(delay, 0.008)
+        if delay == 0:
+            self.last_redraw = now
+            self.redraw()
+        else:
+            # Keep a trailing redraw.  Merely discarding requests received
+            # inside the frame interval makes fast drags look jerky and can
+            # leave the canvas one event behind the document.
+            self.redraw_after_id = self.root.after(
+                max(1, math.ceil(delay * 1000)), self._scheduled_redraw)
 
     def _scheduled_redraw(self):
-        self.redraw_pending = False
-        self.last_redraw_time = time.perf_counter()
-        self.request_redraw()
+        self.redraw_after_id = None
+        self.last_redraw = time.perf_counter()
+        self.redraw()
+
+    def request_mipmap_level(self, level):
+        """Build a missing zoom level after wheel input has settled.
+
+        Constructing a large level in the wheel callback makes zooming hitch.
+        Until this callback runs, compositing uses the nearest cached level.
+        """
+        if self.mipmap_future is not None:
+            self.pending_mipmap_level = max(
+                level, self.pending_mipmap_level or 0)
+            return
+        if (self.mipmap_after_id is not None and
+                self.pending_mipmap_level == level):
+            return
+        if self.mipmap_after_id is not None:
+            self.root.after_cancel(self.mipmap_after_id)
+        self.pending_mipmap_level = level
+        self.mipmap_after_id = self.root.after(140, self._build_pending_mipmaps)
+
+    def _build_pending_mipmaps(self):
+        level = self.pending_mipmap_level
+        self.mipmap_after_id = None
+        self.pending_mipmap_level = None
+        if level is None:
+            return
+        jobs = [(layer, layer._mipmap_revision, layer.image)
+                for layer in self.layers if layer.visible]
+
+        def build_levels():
+            results = []
+            for layer, revision, base in jobs:
+                pyramid = [base]
+                while len(pyramid) <= level:
+                    previous = pyramid[-1]
+                    size = (max(1, (previous.width + 1) // 2),
+                            max(1, (previous.height + 1) // 2))
+                    pyramid.append(previous.resize(size, Image.Resampling.BOX))
+                results.append((layer, revision, base, pyramid))
+            return results
+
+        self.mipmap_build_level = level
+        self.mipmap_future = self.mipmap_executor.submit(build_levels)
+        self.root.after(8, self._poll_mipmap_build)
+
+    def _poll_mipmap_build(self):
+        future = self.mipmap_future
+        if future is None:
+            return
+        if not future.done():
+            self.root.after(8, self._poll_mipmap_build)
+            return
+        self.mipmap_future = None
+        built_level = self.mipmap_build_level
+        self.mipmap_build_level = None
+        try:
+            results = future.result()
+        except Exception:
+            return
+        for layer, revision, base, pyramid in results:
+            if layer._mipmap_revision == revision and layer.image is base:
+                layer._mipmaps = pyramid
+        self.request_redraw(defer=True)
+        if (self.pending_mipmap_level is not None and
+                self.pending_mipmap_level > (built_level or 0)):
+            pending = self.pending_mipmap_level
+            self.pending_mipmap_level = None
+            self.request_mipmap_level(pending)
 
     def choose_primary_color(self):
         c = colorchooser.askcolor(self.primary_color)[1]
@@ -777,6 +911,7 @@ class PaintApp:
             if not messagebox.askyesno("Unsaved Changes",
                                        "You have unsaved changes. Quit anyway?"):
                 return
+        self.mipmap_executor.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
 
     def update_title(self):
@@ -812,6 +947,7 @@ class PaintApp:
             n.visible = l.visible
             n.image = l.image.copy()
             n.draw = ImageDraw.Draw(n.image)
+            n.reset_mipmaps()
             if l.layer_type == "vector" and l.vector_data:
                 n.vector_data = copy.deepcopy(l.vector_data)
             snap.append(n)
@@ -949,6 +1085,7 @@ class PaintApp:
             layer.image = img
             layer.visible = layer_info['visible']
             layer.draw = ImageDraw.Draw(layer.image)
+            layer.reset_mipmaps()
 
             if layer.layer_type == "vector" and 'vector_data' in layer_info:
                 layer.vector_data = VectorLayer.from_dict(
@@ -979,6 +1116,7 @@ class PaintApp:
         layer = Layer(self.doc_w, self.doc_h, Path(filename).stem, "raster")
         layer.image = image
         layer.draw = ImageDraw.Draw(layer.image)
+        layer.reset_mipmaps()
         self.layers = [layer]
         self.active_layer = 0
 
@@ -1281,10 +1419,14 @@ class PaintApp:
         # each copy to the image, preserving a brush that straddles the seam.
         layer = self.layers[self.active_layer]
         for offset in (-self.doc_w, 0, self.doc_w):
+            shifted = [(x + offset, y) for x, y in polygon]
             layer.draw.polygon(
-                [(x + offset, y) for x, y in polygon],
+                shifted,
                 fill=color,
             )
+            xs = [point[0] for point in shifted]
+            ys = [point[1] for point in shifted]
+            layer.update_mipmaps((min(xs), min(ys), max(xs) + 1, max(ys) + 1))
 
         self.last_x, self.last_y = center_x, center_y
         if refresh:
@@ -1327,6 +1469,8 @@ class PaintApp:
         layer = self.layers[self.active_layer]
         layer.draw.ellipse((x - radius, y - radius, x + radius, y + radius),
                            fill=color, outline=color)
+        layer.update_mipmaps((x - radius, y - radius,
+                              x + radius + 1, y + radius + 1))
 
     def vector_operation(self, event, x, y):
         if self.is_dragging_point and self.selected_vector_obj:
@@ -1457,12 +1601,19 @@ class PaintApp:
         self.zoom *= 1.1 if event.delta > 0 else (1 / 1.1)
         self.zoom = max(0.1, min(20, self.zoom))
 
+        # Do not rebuild an identical frame when the wheel keeps moving after
+        # reaching either zoom limit.
+        if self.zoom == old:
+            return
+
         ix = (event.x - self.offset_x) / old
         iy = (event.y - self.offset_y) / old
 
         self.offset_x = event.x - ix * self.zoom
         self.offset_y = event.y - iy * self.zoom
-        self.request_redraw()
+        # Wheel events arrive in bursts.  Always schedule their redraw so the
+        # input queue can coalesce several events before expensive Tk upload.
+        self.request_redraw(defer=True)
 
     def mouse_move(self, event):
         self.mouse_x = event.x
@@ -1485,6 +1636,49 @@ class PaintApp:
                 if layer.layer_type == "vector" and layer.vector_data:
                     layer.render_vector()
                 result.alpha_composite(layer.image)
+        return result
+
+    def composite_region(self, box, output_size=None):
+        """Composite only a document-space rectangle for interactive display.
+
+        A full 8192 x 4096 RGBA composite is 128 MiB.  Building it before
+        cropping to a roughly window-sized viewport made every mouse event do
+        work proportional to document size instead of screen size.
+        """
+        left, top, right, bottom = box
+        source_size = (right - left, bottom - top)
+        size = output_size or source_size
+
+        # Pick the nearest pyramid level that still has at least one source
+        # pixel per output pixel.  At 12.5% zoom, for example, display reads a
+        # cached 1/8-size layer instead of all 33 million original pixels.
+        reduction = max(source_size[0] / size[0], source_size[1] / size[1])
+        desired_level = (max(0, int(math.floor(math.log2(reduction))))
+                         if reduction > 1 else 0)
+        max_level = int(math.floor(math.log2(max(1, min(self.doc_w, self.doc_h)))))
+        desired_level = min(desired_level, max_level)
+
+        available_level = desired_level
+        for layer in self.layers:
+            if layer.visible:
+                if not layer._mipmaps or layer._mipmaps[0] is not layer.image:
+                    layer.reset_mipmaps()
+                available_level = min(available_level, len(layer._mipmaps) - 1)
+        if available_level < desired_level:
+            self.request_mipmap_level(desired_level)
+        level = available_level
+        factor = 1 << level
+
+        result = Image.new("RGBA", size, self.bg_color)
+        for layer in self.layers:
+            if layer.visible:
+                source = layer.get_mipmap(level)
+                extent = (left / factor, top / factor,
+                          right / factor, bottom / factor)
+                rendered = source.transform(
+                    size, Image.Transform.EXTENT, extent,
+                    resample=Image.Resampling.NEAREST)
+                result.alpha_composite(rendered)
         return result
 
     def get_checker_backdrop_pil(self, cw, ch):
@@ -1525,6 +1719,7 @@ class PaintApp:
         ch = max(1, self.canvas.winfo_height())
 
         self.canvas.delete("all")
+        self._canvas_image_id = None
 
         left = max(0, (-self.offset_x) / self.zoom)
         top = max(0, (-self.offset_y) / self.zoom)
@@ -1562,11 +1757,6 @@ class PaintApp:
             self.main_view_dirty = True
             return
         
-        # Ensure vector layers are rendered
-        for layer in self.layers:
-            if layer.layer_type == "vector" and layer.vector_data:
-                layer.render_vector()
-        
         cw = max(1, self.canvas.winfo_width())
         ch = max(1, self.canvas.winfo_height())
 
@@ -1575,9 +1765,11 @@ class PaintApp:
         right = min(self.doc_w, (cw - self.offset_x) / self.zoom)
         bottom = min(self.doc_h, (ch - self.offset_y) / self.zoom)
 
-        self.canvas.delete("all")
+        self.canvas.delete("overlay")
 
         if right <= left or bottom <= top:
+            if self._canvas_image_id is not None:
+                self.canvas.itemconfigure(self._canvas_image_id, state="hidden")
             return
 
         # Static checkerboard backdrop - only behind the document's on-screen
@@ -1587,30 +1779,26 @@ class PaintApp:
         doc_sy = max(0, int(self.offset_y + top * self.zoom))
         doc_sw = max(1, int((right - left) * self.zoom))
         doc_sh = max(1, int((bottom - top) * self.zoom))
-        # Build a PIL checkerboard crop so we can flatten the document to RGB
-        checker_pil = self.get_checker_backdrop_pil(cw, ch).crop(
-            (doc_sx, doc_sy, doc_sx + doc_sw, doc_sy + doc_sh)
-        )
-
-        img = self.composite_image()
-        crop = img.crop((int(left), int(top), int(right), int(bottom)))
         sw = max(1, int((right - left) * self.zoom))
         sh = max(1, int((bottom - top) * self.zoom))
-        crop = crop.resize((sw, sh), Image.Resampling.NEAREST)
+        crop_box = (int(left), int(top), int(right), int(bottom))
+        crop = self.composite_region(crop_box, (sw, sh))
 
-        if checker_pil.size != (sw, sh):
-            checker_pil = checker_pil.resize((sw, sh), Image.Resampling.NEAREST)
-
-        display = checker_pil.copy()
-        display.alpha_composite(crop)
-        display = display.convert("RGB")
-
-        self.tkimg = ImageTk.PhotoImage(display)
+        # composite_region already starts with the editor's opaque background;
+        # the previous checkerboard copy/resize/alpha pass could not affect the
+        # result and cost roughly a quarter of every large zoom frame.
+        self.tkimg = ImageTk.PhotoImage(crop.convert("RGB"))
 
         sx = self.offset_x + left * self.zoom
         sy = self.offset_y + top * self.zoom
 
-        self.canvas.create_image(sx, sy, image=self.tkimg, anchor="nw")
+        if self._canvas_image_id is None:
+            self._canvas_image_id = self.canvas.create_image(
+                sx, sy, image=self.tkimg, anchor="nw")
+        else:
+            self.canvas.coords(self._canvas_image_id, sx, sy)
+            self.canvas.itemconfigure(self._canvas_image_id,
+                                      image=self.tkimg, state="normal")
 
         # Draw brush cursor for raster layers
         current_layer = self.layers[self.active_layer]
@@ -1618,7 +1806,7 @@ class PaintApp:
             r = int(self.size_var.get()) * self.zoom / 2
             self.canvas.create_oval(self.mouse_x - r, self.mouse_y - r,
                                     self.mouse_x + r, self.mouse_y + r,
-                                    outline="white", width=1)
+                                    outline="white", width=1, tags=("overlay",))
         
         # Draw vector handles if in proper mode and on vector layer
         if self.tool == "vector edit" and current_layer.layer_type == "vector" and current_layer.vector_data:
@@ -1627,7 +1815,8 @@ class PaintApp:
                 for px, py in points:
                     sx, sy = self.screen_coords(px, py)
                     self.canvas.create_rectangle(sx - 3, sy - 3, sx + 3, sy + 3,
-                                               outline="cyan", fill="cyan", width=1)
+                                               outline="cyan", fill="cyan", width=1,
+                                               tags=("overlay",))
 
 
 if __name__ == "__main__":
