@@ -501,6 +501,15 @@ class PaintApp:
         self._checker_tkimg = None      # cached cropped PhotoImage for the doc rect
         self._canvas_image_id = None
 
+        # The brush cursor artwork lives beside the application instead of
+        # being drawn as a Canvas primitive.  Keep the source image and cache
+        # only the currently displayed size.
+        cursor_path = Path(__file__).resolve().parent / "icons" / "brush-outline.png"
+        with Image.open(cursor_path) as cursor_image:
+            self._brush_cursor_source = cursor_image.convert("RGBA")
+        self._brush_cursor_tkimg = None
+        self._brush_cursor_diameter = None
+
         self.last_x = None
         self.last_y = None
         self.mouse_x = 0
@@ -549,7 +558,7 @@ class PaintApp:
         main.pack(fill="both", expand=True)
 
         # ── Left panel: tools ─────────────────────────────────────────────
-        left = tk.Frame(main, width=110, bd=1, relief="sunken")
+        left = tk.Frame(main, width=190, bd=1, relief="sunken")
         left.pack(side="left", fill="y")
         left.pack_propagate(False)
 
@@ -559,16 +568,38 @@ class PaintApp:
         tool_frame.pack(fill="x", padx=4)
 
         tools = [
-            ("Brush",   "brush"),
-            ("Eraser",  "eraser"),
-            ("Vector Edit",  "vector edit"),
-            ("Line",    "line"),
-            ("Rect",    "rect"),
-            ("Ellipse", "ellipse"),
+            ("Brush",      "brush",       "brush.png"),
+            ("Eraser",     "eraser",      "eraser.png"),
+            ("Vector Edit", "vector edit", "vector-edit.png"),
+            ("Line",       "line",        "line.png"),
+            ("Rectangle",  "rect",        "rect.png"),
+            ("Ellipse",    "ellipse",     "ellipse.png"),
         ]
-        for label, tool in tools:
-            tk.Button(tool_frame, text=label, width=8,
-                      command=lambda t=tool: self.set_tool(t)).pack(pady=1)
+        icon_dir = Path(__file__).resolve().parent / "icons"
+        self.tool_icons = {}
+        self.tool_buttons = {}
+        self.tool_hint_var = tk.StringVar(value="Brush")
+        for index, (label, tool, filename) in enumerate(tools):
+            with Image.open(icon_dir / filename) as icon_image:
+                icon_image = icon_image.convert("RGBA").resize(
+                    (32, 32), Image.Resampling.LANCZOS)
+            icon = ImageTk.PhotoImage(icon_image)
+            self.tool_icons[tool] = icon
+            button = tk.Button(
+                tool_frame, image=icon, width=42, height=42,
+                command=lambda t=tool: self.set_tool(t),
+                relief="sunken" if tool == self.tool else "raised",
+                takefocus=True)
+            # Column 1 is intentionally left open for per-tool settings.
+            button.grid(row=index, column=0, padx=2, pady=2)
+            button.bind(
+                "<Enter>",
+                lambda event, name=label: self.tool_hint_var.set(name))
+            button.bind(
+                "<Leave>",
+                lambda event: self.tool_hint_var.set(self.tool.title()))
+            self.tool_buttons[tool] = button
+        tk.Label(left, textvariable=self.tool_hint_var).pack(pady=(2, 0))
 
         ttk.Separator(left, orient="horizontal").pack(fill="x", padx=4, pady=6)
 
@@ -591,16 +622,16 @@ class PaintApp:
         # Swap colors button
         tk.Button(left, text="↔", width=3, command=self.swap_colors).pack(pady=2)
 
-        ttk.Separator(left, orient="horizontal").pack(fill="x", padx=4, pady=6)
+        # Size is shared by tools, so it remains below the tool column.  The
+        # second column stays available for future per-tool settings.
+        self.size_frame = tk.Frame(tool_frame)
+        self.size_frame.grid(row=len(tools), column=0, padx=2, pady=(6, 2))
 
-        # Size control
-        size_frame = tk.Frame(left)
-        size_frame.pack(padx=4, pady=2)
-
-        tk.Label(size_frame, text="Size:").pack(side="left")
+        tk.Label(self.size_frame, text="Size:").pack(side="left")
 
         self.size_var = tk.StringVar(value="20")
-        self.size_entry = tk.Entry(size_frame, width=6, textvariable=self.size_var)
+        self.size_entry = tk.Entry(
+            self.size_frame, width=6, textvariable=self.size_var)
         self.size_entry.pack(side="left", padx=4)
 
         # Update size when Enter is pressed or focus is lost
@@ -1136,10 +1167,15 @@ class PaintApp:
 
     def set_tool(self, tool):
         self.tool = tool
+        if hasattr(self, "tool_buttons"):
+            for name, button in self.tool_buttons.items():
+                button.configure(relief="sunken" if name == tool else "raised")
+            self.tool_hint_var.set(tool.title())
         # Reset vector drawing state
         self.vector_start_x = None
         self.vector_start_y = None
         self.current_vector_obj = None
+        self.request_redraw()
 
     def add_layer(self, layer_type="raster"):
         self.snapshot()
@@ -1818,11 +1854,19 @@ class PaintApp:
 
         # Draw brush cursor for raster layers
         current_layer = self.layers[self.active_layer]
-        if current_layer.layer_type == "raster" and 0 <= self.mouse_x < cw and 0 <= self.mouse_y < ch:
-            r = int(self.size_var.get()) * self.zoom / 2
-            self.canvas.create_oval(self.mouse_x - r, self.mouse_y - r,
-                                    self.mouse_x + r, self.mouse_y + r,
-                                    outline="white", width=1, tags=("overlay",))
+        if (current_layer.layer_type == "raster" and
+                self.tool in ("brush", "eraser") and
+                0 <= self.mouse_x < cw and 0 <= self.mouse_y < ch):
+            diameter = max(1, round(int(self.size_var.get()) * self.zoom))
+            if diameter != self._brush_cursor_diameter:
+                cursor_image = self._brush_cursor_source.resize(
+                    (diameter, diameter), Image.Resampling.LANCZOS)
+                self._brush_cursor_tkimg = ImageTk.PhotoImage(cursor_image)
+                self._brush_cursor_diameter = diameter
+            self.canvas.create_image(
+                self.mouse_x, self.mouse_y,
+                image=self._brush_cursor_tkimg,
+                anchor="center", tags=("overlay",))
         
         # Draw vector handles if in proper mode and on vector layer
         if self.tool == "vector edit" and current_layer.layer_type == "vector" and current_layer.vector_data:
