@@ -498,7 +498,6 @@ class PaintApp:
         self.checker_dark = (210, 210, 210, 255)
         self._checker_pil = None        # cached full-viewport tiled PIL image
         self._checker_pil_dims = None   # (cw, ch) it was built for
-        self._checker_tkimg = None      # cached cropped PhotoImage for the doc rect
         self._canvas_image_id = None
 
         # The brush cursor artwork lives beside the application instead of
@@ -1548,11 +1547,26 @@ class PaintApp:
         if self.tool == "line":
             preview_draw.line([(x1, y1), (x2, y2)], fill=self.primary_color, width=2)
         elif self.tool == "rect":
-            preview_draw.rectangle([(x1, y1), (x2, y2)], outline=self.primary_color, width=2)
+            bounds = [(min(x1, x2), min(y1, y2)),
+                      (max(x1, x2), max(y1, y2))]
+            preview_draw.rectangle(bounds, outline=self.primary_color, width=2)
         elif self.tool == "ellipse":
-            preview_draw.ellipse([(x1, y1), (x2, y2)], outline=self.primary_color, width=2)
-        
-        self.display_image(preview_img)
+            bounds = [(min(x1, x2), min(y1, y2)),
+                      (max(x1, x2), max(y1, y2))]
+            preview_draw.ellipse(bounds, outline=self.primary_color, width=2)
+
+        # Preview the active vector layer in its normal place in the complete
+        # layer stack.  Displaying preview_img directly hides every raster
+        # layer for the duration of the drag.
+        preview_composite = Image.new(
+            "RGBA", (self.doc_w, self.doc_h), (0, 0, 0, 0))
+        for candidate in self.layers:
+            if not candidate.visible:
+                continue
+            candidate_image = preview_img if candidate is layer else candidate.image
+            preview_composite.alpha_composite(candidate_image)
+
+        self.display_image(preview_composite)
 
     def create_vector_object(self, x1, y1, x2, y2):
         """Create a vector object and add it to the current layer"""
@@ -1721,7 +1735,10 @@ class PaintApp:
         level = available_level
         factor = 1 << level
 
-        result = Image.new("RGBA", size, self.bg_color)
+        # Preserve document transparency here.  The Main view adds its
+        # checkerboard after compositing the layers; beginning with an opaque
+        # white image would permanently cover that backdrop.
+        result = Image.new("RGBA", size, (0, 0, 0, 0))
         for layer in self.layers:
             if layer.visible:
                 source = layer.get_mipmap(level)
@@ -1754,17 +1771,6 @@ class PaintApp:
         self._checker_pil = backdrop
         self._checker_pil_dims = (cw, ch)
         return backdrop
-
-    def get_checker_backdrop_crop(self, cw, ch, rect):
-        """Cheaply crop the cached full-viewport checker pattern down to the
-        document's on-screen rect (left, top, w, h) - no re-tiling, just a
-        crop, so this is fine to call every redraw."""
-        pil_backdrop = self.get_checker_backdrop_pil(cw, ch)
-        x, y, w, h = rect
-        crop = pil_backdrop.crop((x, y, x + w, y + h))
-        self._checker_tkimg = ImageTk.PhotoImage(crop)
-        return self._checker_tkimg
-
     def display_image(self, img):
         """Display an image on the canvas"""
         cw = max(1, self.canvas.winfo_width())
@@ -1786,21 +1792,23 @@ class PaintApp:
         # everywhere else), and it never pans/zooms with the content.
         doc_sx = max(0, int(self.offset_x + left * self.zoom))
         doc_sy = max(0, int(self.offset_y + top * self.zoom))
-        doc_sw = max(1, int((right - left) * self.zoom))
-        doc_sh = max(1, int((bottom - top) * self.zoom))
-        checker = self.get_checker_backdrop_crop(cw, ch, (doc_sx, doc_sy, doc_sw, doc_sh))
-        self.canvas.create_image(doc_sx, doc_sy, image=checker, anchor="nw")
-
         crop = img.crop((int(left), int(top), int(right), int(bottom)))
         sw = max(1, int((right - left) * self.zoom))
         sh = max(1, int((bottom - top) * self.zoom))
         crop = crop.resize((sw, sh), Image.Resampling.NEAREST)
-        
-        self.tkimg = ImageTk.PhotoImage(crop)
+
+        # Keep the backdrop and document in one tracked canvas item.  The old
+        # preview path created a separate, untracked checkerboard item which
+        # survived the next redraw and appeared as a second locked pattern.
+        checker = self.get_checker_backdrop_pil(cw, ch).crop(
+            (doc_sx, doc_sy, doc_sx + sw, doc_sy + sh))
+        checker.alpha_composite(crop)
+        self.tkimg = ImageTk.PhotoImage(checker.convert("RGB"))
         
         sx = self.offset_x + left * self.zoom
         sy = self.offset_y + top * self.zoom
-        self.canvas.create_image(sx, sy, image=self.tkimg, anchor="nw")
+        self._canvas_image_id = self.canvas.create_image(
+            sx, sy, image=self.tkimg, anchor="nw")
 
     def redraw(self):
         # Keep inactive views lazy.  In particular, globe painting used to
@@ -1829,17 +1837,15 @@ class PaintApp:
         # elsewhere. Never pans/zooms with the content.
         doc_sx = max(0, int(self.offset_x + left * self.zoom))
         doc_sy = max(0, int(self.offset_y + top * self.zoom))
-        doc_sw = max(1, int((right - left) * self.zoom))
-        doc_sh = max(1, int((bottom - top) * self.zoom))
         sw = max(1, int((right - left) * self.zoom))
         sh = max(1, int((bottom - top) * self.zoom))
         crop_box = (int(left), int(top), int(right), int(bottom))
         crop = self.composite_region(crop_box, (sw, sh))
 
-        # composite_region already starts with the editor's opaque background;
-        # the previous checkerboard copy/resize/alpha pass could not affect the
-        # result and cost roughly a quarter of every large zoom frame.
-        self.tkimg = ImageTk.PhotoImage(crop.convert("RGB"))
+        checker = self.get_checker_backdrop_pil(cw, ch).crop(
+            (doc_sx, doc_sy, doc_sx + sw, doc_sy + sh))
+        checker.alpha_composite(crop)
+        self.tkimg = ImageTk.PhotoImage(checker.convert("RGB"))
 
         sx = self.offset_x + left * self.zoom
         sy = self.offset_y + top * self.zoom
