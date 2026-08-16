@@ -1309,7 +1309,13 @@ class PaintApp:
             # Pan up/down
             self.offset_y += pan_amount
         
-        self.request_redraw()
+        # Wheel input arrives in dense bursts (especially from touchpads and
+        # high-resolution wheels).  Rendering synchronously for the first
+        # event in each burst blocks Tk from consuming the remaining deltas,
+        # which makes both vertical and Shift+horizontal panning trail behind.
+        # The offsets above still accumulate every event; only the expensive
+        # canvas refresh is coalesced to the most recent position.
+        self.request_redraw(defer=True)
 
     def begin_external_raster_draw(self, x, y, button=1):
         """

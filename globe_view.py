@@ -184,15 +184,8 @@ class GlobeView(tk.Frame):
         # Linux wheel
         #
 
-        self.canvas.bind(
-            "<Button-4>",
-            self.zoom_in
-        )
-
-        self.canvas.bind(
-            "<Button-5>",
-            self.zoom_out
-        )
+        self.canvas.bind("<Button-4>", self.on_mousewheel)
+        self.canvas.bind("<Button-5>", self.on_mousewheel)
 
         #
         # Windows wheel
@@ -202,6 +195,7 @@ class GlobeView(tk.Frame):
             "<MouseWheel>",
             self.on_mousewheel
         )
+        self.canvas.bind("<Control-MouseWheel>", self.on_mousewheel)
 
     # --------------------------------------------------
 
@@ -691,27 +685,16 @@ class GlobeView(tk.Frame):
             event.y
         )
 
-        #
-        # Rotation speed
-        #
-
-        # Keep the texture's on-screen travel approximately constant across
-        # zoom levels.  A fixed angular step becomes extremely sensitive when
-        # the sphere radius is much larger than the viewport.
+        # Match wheel rotation while retaining two-axis free rotation as an
+        # additional mouse gesture.  Scale the angular step so dragging feels
+        # consistent at different globe zoom levels.
         rotation_speed = 0.01 * (0.45 / self.display_scale)
         self.yaw += dx * rotation_speed
 
-        self.pitch += dy * rotation_speed
-
-        #
-        # Prevent flipping
-        #
-
         limit = np.pi / 2.0 - 0.02
-
         self.pitch = max(
             -limit,
-            min(limit, self.pitch)
+            min(limit, self.pitch + dy * rotation_speed)
         )
 
         self._begin_interactive_render()
@@ -732,12 +715,34 @@ class GlobeView(tk.Frame):
         self._begin_interactive_render(rebuild=True)
 
     def on_mousewheel(self, event):
-
-        if event.delta > 0:
-            self.zoom_in()
-
+        """Rotate the globe, or zoom it with Ctrl, from any platform wheel."""
+        if getattr(event, "num", None) == 4:
+            delta = 120
+        elif getattr(event, "num", None) == 5:
+            delta = -120
         else:
-            self.zoom_out()
+            delta = getattr(event, "delta", 0)
+        if not delta:
+            return "break"
+
+        if event.state & 0x4:  # Ctrl: retain the editor's wheel-to-zoom convention.
+            if delta > 0:
+                self.zoom_in()
+            else:
+                self.zoom_out()
+            return "break"
+
+        # One conventional wheel notch is 120 on Windows.  Keeping fractional
+        # deltas allows high-resolution wheels and touchpads to remain smooth.
+        rotation = (delta / 120.0) * 0.08
+        if event.state & 0x1:  # Shift: rotate along longitude (east/west).
+            self.yaw += rotation
+        else:  # Plain wheel: rotate along latitude (north/south).
+            limit = np.pi / 2.0 - 0.02
+            self.pitch = max(-limit, min(limit, self.pitch + rotation))
+
+        self._begin_interactive_render()
+        return "break"
 
     def begin_external_raster_draw(
         self,
