@@ -701,25 +701,70 @@ class PaintApp:
 
         tk.Label(right, text="Layers", font=("TkDefaultFont", 9, "bold")).pack(pady=(6, 2))
 
-        self.layer_list = tk.Listbox(right)
+        layer_style = ttk.Style()
+        layer_style.configure("Layer.Treeview", rowheight=32)
+        self.layer_list = ttk.Treeview(
+            right, show="tree", selectmode="browse", style="Layer.Treeview")
         self.layer_list.pack(fill="both", expand=True, padx=4)
-        self.layer_list.bind("<<ListboxSelect>>",  self.select_layer)
-        self.layer_list.bind("<Button-1>",         self.on_layer_drag_start)
+        self.layer_list.column("#0", stretch=True, width=220)
+        self.layer_list.bind("<<TreeviewSelect>>", self.select_layer)
+        self.layer_list.bind("<Button-1>",         self.on_layer_pointer_down)
         self.layer_list.bind("<B1-Motion>",        self.on_layer_drag)
         self.layer_list.bind("<ButtonRelease-1>",  self.on_layer_drag_end)
 
-        add_frame = tk.Frame(right)
-        add_frame.pack(fill="x", padx=4, pady=(2, 0))
-        tk.Button(add_frame, text="+ Raster", command=lambda: self.add_layer("raster")).pack(side="left", fill="x", expand=True)
-        tk.Button(add_frame, text="+ Vector", command=lambda: self.add_layer("vector")).pack(side="left", fill="x", expand=True)
+        self.layer_row_icons = {}
+        row_sources = {}
+        for name in ("layer-visible", "layer-hidden",
+                     "layer-raster", "layer-vector"):
+            with Image.open(icon_dir / f"{name}.png") as row_icon:
+                row_sources[name] = row_icon.convert("RGBA").resize(
+                    (24, 24), Image.Resampling.LANCZOS)
+        for visible in (True, False):
+            for layer_type in ("raster", "vector"):
+                row_image = Image.new("RGBA", (58, 28), (0, 0, 0, 0))
+                row_draw = ImageDraw.Draw(row_image)
+                row_draw.rounded_rectangle(
+                    (0, 0, 27, 27), radius=4,
+                    fill=(232, 232, 232, 255), outline=(135, 135, 135, 255))
+                visibility_name = "layer-visible" if visible else "layer-hidden"
+                row_image.alpha_composite(row_sources[visibility_name], (2, 2))
+                row_image.alpha_composite(row_sources[f"layer-{layer_type}"],
+                                          (34, 2))
+                self.layer_row_icons[(visible, layer_type)] = \
+                    ImageTk.PhotoImage(row_image)
 
-        for label, cmd in [
-            ("Delete Layer",   self.delete_layer),
-            ("Toggle Visible", self.toggle_visibility),
-            ("Move Up",        self.move_layer_up),
-            ("Move Down",      self.move_layer_down),
-        ]:
-            tk.Button(right, text=label, command=cmd).pack(fill="x", padx=4, pady=1)
+        layer_actions = [
+            ("Add Raster Layer", "add-raster-layer.png",
+             lambda: self.add_layer("raster")),
+            ("Add Vector Layer", "add-vector-layer.png",
+             lambda: self.add_layer("vector")),
+            ("Delete Layer", "delete-layer.png", self.delete_layer),
+            ("Toggle Visibility", "toggle-visibility.png",
+             self.toggle_visibility),
+            ("Move Layer Up", "move-layer-up.png", self.move_layer_up),
+            ("Move Layer Down", "move-layer-down.png", self.move_layer_down),
+        ]
+        action_frame = tk.Frame(right)
+        action_frame.pack(padx=4, pady=(4, 0))
+        self.layer_action_icons = {}
+        self.layer_action_hint = tk.StringVar(value="Layer Actions")
+        for index, (label, filename, command) in enumerate(layer_actions):
+            with Image.open(icon_dir / filename) as icon_image:
+                icon_image = icon_image.convert("RGBA").resize(
+                    (28, 28), Image.Resampling.LANCZOS)
+            icon = ImageTk.PhotoImage(icon_image)
+            self.layer_action_icons[filename] = icon
+            button = tk.Button(
+                action_frame, image=icon, width=34, height=34,
+                command=command, takefocus=True)
+            button.grid(row=0, column=index, padx=1, pady=1)
+            button.bind(
+                "<Enter>",
+                lambda event, name=label: self.layer_action_hint.set(name))
+            button.bind(
+                "<Leave>",
+                lambda event: self.layer_action_hint.set("Layer Actions"))
+        tk.Label(right, textvariable=self.layer_action_hint).pack(pady=(1, 4))
 
     def request_redraw(self, defer=False):
         if hasattr(self, "active_view") and self.active_view != "main":
@@ -1227,33 +1272,61 @@ class PaintApp:
         self.notify_globe_document_changed()
 
     def select_layer(self, event=None):
-        sel = self.layer_list.curselection()
+        sel = self.layer_list.selection()
         if sel:
-            self.active_layer = len(self.layers) - 1 - sel[0]
+            display_index = self.layer_list.index(sel[0])
+            self.active_layer = len(self.layers) - 1 - display_index
             self.request_redraw()
 
     def refresh_layers(self):
-        self.layer_list.delete(0, tk.END)
+        self.layer_list.delete(*self.layer_list.get_children())
         for i in range(len(self.layers) - 1, -1, -1):
             l = self.layers[i]
-            prefix = "✓" if l.visible else "✗"
-            type_icon = "🖌" if l.layer_type == "raster" else "✏️"
-            self.layer_list.insert(tk.END, f"{prefix} {type_icon} {l.name}")
+            self.layer_list.insert(
+                "", "end", text=l.name,
+                image=self.layer_row_icons[(l.visible, l.layer_type)])
         
         display_index = len(self.layers) - 1 - self.active_layer
-        if 0 <= display_index < self.layer_list.size():
-            self.layer_list.selection_set(display_index)
+        rows = self.layer_list.get_children()
+        if 0 <= display_index < len(rows):
+            self.layer_list.selection_set(rows[display_index])
+            self.layer_list.focus(rows[display_index])
 
-    def on_layer_drag_start(self, event):
-        self.drag_start_index = self.layer_list.nearest(event.y)
+    def on_layer_pointer_down(self, event):
+        row = self.layer_list.identify_row(event.y)
+        if not row:
+            return
+        display_index = self.layer_list.index(row)
+
+        # The first icon in each row is a button-shaped visibility control.
+        row_box = self.layer_list.bbox(row, "#0")
+        # Treeview reserves a small indent before the row image; the button
+        # occupies the first 28 pixels of that image.
+        if row_box and event.x < row_box[0] + 50:
+            layer_index = len(self.layers) - 1 - display_index
+            self.layers[layer_index].visible = not self.layers[layer_index].visible
+            self.refresh_layers()
+            self.request_redraw()
+            self.notify_globe_document_changed()
+            return "break"
+
+        self.layer_list.selection_set(row)
+        self.layer_list.focus(row)
+        self.active_layer = len(self.layers) - 1 - display_index
+        self.drag_start_index = display_index
         self.drag_start_y = event.y
         self.snapshot()  # snapshot once at the start of the drag
+        self.request_redraw()
+        return "break"
 
     def on_layer_drag(self, event):
         if self.drag_start_index is None:
             return
-        
-        current_index = self.layer_list.nearest(event.y)
+
+        row = self.layer_list.identify_row(event.y)
+        if not row:
+            return
+        current_index = self.layer_list.index(row)
         
         if current_index == self.drag_start_index:
             return
