@@ -364,10 +364,11 @@ class GlobeView(tk.Frame):
 
         h, w = self.lookup_mask.shape
 
-        out = np.zeros(
-            (h, w, 3),
-            dtype=np.uint8
-        )
+        # Match the canvas background outside the sphere.  Transparent pixels
+        # on the sphere are composited over a screen-anchored checkerboard
+        # below, rather than being confused with the area around the globe.
+        out = np.empty((h, w, 3), dtype=np.uint8)
+        out[...] = (48, 48, 48)
 
         # This array is only read below.  Copying the full screen-sized normal
         # map for every frame was a substantial allocation during painting.
@@ -415,11 +416,33 @@ class GlobeView(tk.Frame):
 
         mask = self.lookup_mask
 
-        out[mask] = tex[
-            ty[mask],
-            tx[mask],
-            :3
-        ]
+        sampled = tex[ty[mask], tx[mask]]
+
+        if sampled.shape[1] >= 4:
+            # Evaluate the pattern in canvas/screen coordinates.  Its squares
+            # therefore retain their pixel size and phase while the globe is
+            # zoomed or otherwise moved relative to the document texture.
+            display_w, display_h = self.render_display_size
+            origin_x, origin_y = self.render_origin
+            screen_x = origin_x + (np.arange(w) + 0.5) * (display_w / w)
+            screen_y = origin_y + (np.arange(h) + 0.5) * (display_h / h)
+            checker_parity = (
+                (screen_y[:, None] // self.app.checker_size).astype(np.int32)
+                + (screen_x[None, :] // self.app.checker_size).astype(np.int32)
+            ) & 1
+            light = np.asarray(self.app.checker_light[:3], dtype=np.uint8)
+            dark = np.asarray(self.app.checker_dark[:3], dtype=np.uint8)
+            checker = np.where(checker_parity[..., None] == 0, light, dark)
+
+            alpha = sampled[:, 3:4].astype(np.uint16)
+            source_rgb = sampled[:, :3].astype(np.uint16)
+            checker_rgb = checker[mask].astype(np.uint16)
+            out[mask] = (
+                (source_rgb * alpha + checker_rgb * (255 - alpha) + 127)
+                // 255
+            ).astype(np.uint8)
+        else:
+            out[mask] = sampled[:, :3]
 
         return out
 

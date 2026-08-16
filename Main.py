@@ -488,7 +488,10 @@ class PaintApp:
         self.primary_color = "#000000"
         self.secondary_color = "#ffffff"
         self.color = self.primary_color  # Keep for compatibility
-        self.bg_color = (255, 255, 255, 255)
+        # Empty document pixels stay transparent.  The checkerboard is a view
+        # backdrop, not document content, so compositing (including the globe
+        # texture) must not begin on opaque white.
+        self.bg_color = (255, 255, 255, 0)
         self.last_button = 1  # Track which mouse button was pressed
 
         # Checkerboard "absent pixel" backdrop (lives behind the canvas content,
