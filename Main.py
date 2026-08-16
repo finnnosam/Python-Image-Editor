@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import filedialog, colorchooser, messagebox
 from tkinter import ttk
-from PIL import Image, ImageDraw, ImageTk, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageTk, ImageOps
 import numpy as np
 import math
 import copy
@@ -387,11 +387,11 @@ class Layer:
         self.name = name
         self.visible = True
         self.opacity = 100
-        self.layer_type = layer_type  # "raster" or "vector"
+        self.layer_type = layer_type  # "raster", "mask", or "vector"
         self.width = width
         self.height = height
         
-        if layer_type == "raster":
+        if layer_type in ("raster", "mask"):
             self.image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
             self.draw = ImageDraw.Draw(self.image)
             self.vector_data = None
@@ -409,6 +409,10 @@ class Layer:
         """Discard reduced previews after replacing the whole layer image."""
         self._mipmaps = [self.image]
         self._mipmap_revision += 1
+
+    @property
+    def is_raster(self):
+        return self.layer_type in ("raster", "mask")
 
     def get_mipmap(self, level):
         """Return a cached 2**level reduction of this layer."""
@@ -713,12 +717,23 @@ class PaintApp:
 
         tk.Label(right, text="Layers", font=("TkDefaultFont", 9, "bold")).pack(pady=(6, 2))
 
-        layer_style = ttk.Style()
-        layer_style.configure("Layer.Treeview", rowheight=32)
+        self.layer_style = ttk.Style()
+        self.layer_style.configure("Layer.Treeview", rowheight=32)
+        self.layer_selected_vector_color = (
+            self.layer_style.lookup(
+                "Treeview", "background", ("selected",)) or "#4a6984")
+        self.layer_selected_text_color = (
+            self.layer_style.lookup(
+                "Treeview", "foreground", ("selected",)) or "#ffffff")
+        self.layer_selected_raster_color = "#c94f4f"
+        self.layer_selected_mask_color = "#242424"
         self.layer_list = ttk.Treeview(
             right, show="tree", selectmode="browse", style="Layer.Treeview")
         self.layer_list.pack(fill="both", expand=True, padx=4)
         self.layer_list.column("#0", stretch=True, width=220)
+        self.layer_list.tag_configure("raster", background="#f7dddd")
+        self.layer_list.tag_configure("vector", background="#dcecff")
+        self.layer_list.tag_configure("mask", background="#B7B7B7")
         self.layer_list.bind("<<TreeviewSelect>>", self.select_layer)
         self.layer_list.bind("<Button-1>",         self.on_layer_pointer_down)
         self.layer_list.bind("<Button-3>",         self.show_layer_properties)
@@ -1025,7 +1040,7 @@ class PaintApp:
 
     def can_paint_from_globe(self):
         layer = self.layers[self.active_layer]
-        return ((layer.layer_type == "raster" and self.tool in ("brush", "eraser")) or
+        return ((layer.is_raster and self.tool in ("brush", "eraser")) or
                 (layer.layer_type == "vector" and self.tool in ("line", "rect", "ellipse")))
 
     def can_draw_vector_from_globe(self):
@@ -1292,7 +1307,21 @@ class PaintApp:
         if sel:
             display_index = self.layer_list.index(sel[0])
             self.active_layer = len(self.layers) - 1 - display_index
+            self.update_layer_selection_style()
             self.request_redraw()
+
+    def update_layer_selection_style(self):
+        """Match the selected-row color to the active layer's type."""
+        layer_type = self.layers[self.active_layer].layer_type
+        selected_color = {
+            "raster": self.layer_selected_raster_color,
+            "mask": self.layer_selected_mask_color,
+            "vector": self.layer_selected_vector_color,
+        }[layer_type]
+        self.layer_style.map(
+            "Layer.Treeview",
+            background=[("selected", selected_color)],
+            foreground=[("selected", self.layer_selected_text_color)])
 
     def show_layer_properties(self, event):
         """Open the properties editor for the layer under the pointer."""
@@ -1305,9 +1334,11 @@ class PaintApp:
         layer = self.layers[layer_index]
         original_name = layer.name
         original_opacity = layer.opacity
+        original_type = layer.layer_type
         self.active_layer = layer_index
         self.layer_list.selection_set(row)
         self.layer_list.focus(row)
+        self.update_layer_selection_style()
 
         dialog = tk.Toplevel(self.root)
         dialog.title("Layer Properties")
@@ -1324,19 +1355,31 @@ class PaintApp:
         name_entry = ttk.Entry(body, textvariable=name_var, width=30)
         name_entry.grid(row=0, column=1, columnspan=2, sticky="ew", pady=(0, 10))
 
+        type_var = None
+        if layer.is_raster:
+            ttk.Label(body, text="Type:").grid(
+                row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 10))
+            type_var = tk.StringVar(
+                value="Mask" if layer.layer_type == "mask" else "Raster")
+            type_picker = ttk.Combobox(
+                body, textvariable=type_var, values=("Raster", "Mask"),
+                state="readonly", width=12)
+            type_picker.grid(
+                row=1, column=1, columnspan=2, sticky="w", pady=(0, 10))
+
         ttk.Label(body, text="Opacity:").grid(
-            row=1, column=0, sticky="w", padx=(0, 8))
+            row=2, column=0, sticky="w", padx=(0, 8))
         opacity_var = tk.IntVar(value=layer.opacity)
         opacity_scale = ttk.Scale(
             body, from_=0, to=100, orient="horizontal", length=190)
         opacity_scale.set(layer.opacity)
-        opacity_scale.grid(row=1, column=1, sticky="ew")
+        opacity_scale.grid(row=2, column=1, sticky="ew")
 
         opacity_spinbox = ttk.Spinbox(
             body, from_=0, to=100, textvariable=opacity_var,
             width=5, justify="right")
-        opacity_spinbox.grid(row=1, column=2, padx=(8, 0))
-        ttk.Label(body, text="%").grid(row=1, column=3, sticky="w", padx=(3, 0))
+        opacity_spinbox.grid(row=2, column=2, padx=(8, 0))
+        ttk.Label(body, text="%").grid(row=2, column=3, sticky="w", padx=(3, 0))
 
         syncing = False
         preview_after_id = None
@@ -1410,13 +1453,26 @@ class PaintApp:
 
             # The controls have already previewed their values. Temporarily
             # restore the originals so Undo records the pre-dialog state.
+            new_type = (type_var.get().lower()
+                        if type_var is not None else original_type)
             layer.name = original_name
             layer.opacity = original_opacity
+            layer.layer_type = original_type
             if layer.vector_data:
                 layer.vector_data.name = original_name
             self.snapshot()
             layer.name = name
             layer.opacity = opacity
+            layer.layer_type = new_type
+            if (new_type == "mask" and original_type != "mask" and
+                    any(other is not layer and other.layer_type == "mask"
+                        for other in self.layers)):
+                messagebox.showwarning(
+                    "Multiple Masks",
+                    "This project already has a mask layer. Multiple masks "
+                    "are allowed, but their opacity caps will all apply to "
+                    "the final image.",
+                    parent=dialog)
             if layer.vector_data:
                 layer.vector_data.name = name
             self.refresh_layers()
@@ -1431,6 +1487,7 @@ class PaintApp:
                 preview_after_id = None
             layer.name = original_name
             layer.opacity = original_opacity
+            layer.layer_type = original_type
             if layer.vector_data:
                 layer.vector_data.name = original_name
             self.refresh_layers()
@@ -1439,7 +1496,7 @@ class PaintApp:
             dialog.destroy()
 
         buttons = ttk.Frame(body)
-        buttons.grid(row=2, column=0, columnspan=4, sticky="e", pady=(14, 0))
+        buttons.grid(row=3, column=0, columnspan=4, sticky="e", pady=(14, 0))
         ttk.Button(buttons, text="Cancel", command=cancel).pack(
             side="right", padx=(6, 0))
         ttk.Button(buttons, text="OK", command=accept).pack(side="right")
@@ -1462,7 +1519,11 @@ class PaintApp:
             l = self.layers[i]
             self.layer_list.insert(
                 "", "end", text=l.name,
-                image=self.layer_row_icons[(l.visible, l.layer_type)])
+                image=self.layer_row_icons[
+                    (l.visible, "raster" if l.layer_type == "mask" else l.layer_type)],
+                tags=(l.layer_type,))
+
+        self.update_layer_selection_style()
         
         display_index = len(self.layers) - 1 - self.active_layer
         rows = self.layer_list.get_children()
@@ -1491,6 +1552,7 @@ class PaintApp:
         self.layer_list.selection_set(row)
         self.layer_list.focus(row)
         self.active_layer = len(self.layers) - 1 - display_index
+        self.update_layer_selection_style()
         self.drag_start_index = display_index
         self.drag_start_y = event.y
         self.snapshot()  # snapshot once at the start of the drag
@@ -1539,7 +1601,7 @@ class PaintApp:
         x, y = self.image_coords(event.x, event.y)
         current_layer = self.layers[self.active_layer]
         
-        if current_layer.layer_type == "raster":
+        if current_layer.is_raster:
             self.start_raster_draw(event)
         else:  # vector layer
             self.start_vector_operation(event, x, y)
@@ -1578,7 +1640,7 @@ class PaintApp:
         x, y = self.image_coords(event.x, event.y)
         current_layer = self.layers[self.active_layer]
         
-        if current_layer.layer_type == "raster":
+        if current_layer.is_raster:
             self.raster_paint(event)
         else:  # vector layer
             self.vector_operation(event, x, y)
@@ -1821,6 +1883,8 @@ class PaintApp:
             preview_composite.alpha_composite(
                 candidate.image_with_opacity(candidate_image))
 
+        self.apply_visible_masks(preview_composite)
+
         self.display_image(preview_composite)
 
     def create_vector_object(self, x1, y1, x2, y2):
@@ -1888,7 +1952,7 @@ class PaintApp:
         x, y = self.image_coords(event.x, event.y)
         current_layer = self.layers[self.active_layer]
         
-        if current_layer.layer_type == "raster":
+        if current_layer.is_raster:
             self.last_x = None
             self.last_y = None
         else:  # vector layer
@@ -1957,7 +2021,16 @@ class PaintApp:
                 if layer.layer_type == "vector" and layer.vector_data:
                     layer.render_vector()
                 result.alpha_composite(layer.image_with_opacity())
+        self.apply_visible_masks(result)
         return result
+
+    def apply_visible_masks(self, image):
+        """Cap the composite alpha with every visible document mask."""
+        for layer in self.layers:
+            if not layer.visible or layer.layer_type != "mask":
+                continue
+            mask_alpha = layer.image_with_opacity().getchannel("A")
+            image.putalpha(ImageChops.darker(image.getchannel("A"), mask_alpha))
 
     def composite_region(self, box, output_size=None):
         """Composite only a document-space rectangle for interactive display.
@@ -1994,6 +2067,7 @@ class PaintApp:
         # checkerboard after compositing the layers; beginning with an opaque
         # white image would permanently cover that backdrop.
         result = Image.new("RGBA", size, (0, 0, 0, 0))
+        rendered_masks = []
         for layer in self.layers:
             if layer.visible:
                 source = layer.get_mipmap(level)
@@ -2002,7 +2076,12 @@ class PaintApp:
                 rendered = source.transform(
                     size, Image.Transform.EXTENT, extent,
                     resample=Image.Resampling.NEAREST)
-                result.alpha_composite(layer.image_with_opacity(rendered))
+                rendered = layer.image_with_opacity(rendered)
+                if layer.layer_type == "mask":
+                    rendered_masks.append(rendered.getchannel("A"))
+                result.alpha_composite(rendered)
+        for mask_alpha in rendered_masks:
+            result.putalpha(ImageChops.darker(result.getchannel("A"), mask_alpha))
         return result
 
     def get_checker_backdrop_pil(self, cw, ch):
@@ -2115,7 +2194,7 @@ class PaintApp:
 
         # Draw brush cursor for raster layers
         current_layer = self.layers[self.active_layer]
-        if (current_layer.layer_type == "raster" and
+        if (current_layer.is_raster and
                 self.tool in ("brush", "eraser") and
                 0 <= self.mouse_x < cw and 0 <= self.mouse_y < ch):
             diameter = max(1, round(int(self.size_var.get()) * self.zoom))
