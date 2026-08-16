@@ -386,6 +386,7 @@ class Layer:
     def __init__(self, width, height, name, layer_type="raster"):
         self.name = name
         self.visible = True
+        self.opacity = 100
         self.layer_type = layer_type  # "raster" or "vector"
         self.width = width
         self.height = height
@@ -454,6 +455,17 @@ class Layer:
             self.draw = ImageDraw.Draw(self.image)
             self.vector_data.render(self.draw)
             self.reset_mipmaps()
+
+    def image_with_opacity(self, image=None):
+        """Return a compositing copy with this layer's opacity applied."""
+        source = image if image is not None else self.image
+        if self.opacity >= 100:
+            return source
+        adjusted = source.copy()
+        alpha = adjusted.getchannel("A").point(
+            lambda value: (value * self.opacity + 50) // 100)
+        adjusted.putalpha(alpha)
+        return adjusted
 
 class PaintApp:
     def __init__(self, root):
@@ -709,6 +721,7 @@ class PaintApp:
         self.layer_list.column("#0", stretch=True, width=220)
         self.layer_list.bind("<<TreeviewSelect>>", self.select_layer)
         self.layer_list.bind("<Button-1>",         self.on_layer_pointer_down)
+        self.layer_list.bind("<Button-3>",         self.show_layer_properties)
         self.layer_list.bind("<B1-Motion>",        self.on_layer_drag)
         self.layer_list.bind("<ButtonRelease-1>",  self.on_layer_drag_end)
 
@@ -1024,6 +1037,7 @@ class PaintApp:
         for l in self.layers:
             n = Layer(self.doc_w, self.doc_h, l.name, l.layer_type)
             n.visible = l.visible
+            n.opacity = l.opacity
             n.image = l.image.copy()
             n.draw = ImageDraw.Draw(n.image)
             n.reset_mipmaps()
@@ -1090,6 +1104,7 @@ class PaintApp:
                 layer_info = {
                     'name': layer.name,
                     'visible': layer.visible,
+                    'opacity': layer.opacity,
                     'layer_type': layer.layer_type,
                     'image_data': img_base64,
                     'width': self.doc_w,
@@ -1163,6 +1178,7 @@ class PaintApp:
                           layer_info.get('layer_type', 'raster'))
             layer.image = img
             layer.visible = layer_info['visible']
+            layer.opacity = max(0, min(100, int(layer_info.get('opacity', 100))))
             layer.draw = ImageDraw.Draw(layer.image)
             layer.reset_mipmaps()
 
@@ -1277,6 +1293,168 @@ class PaintApp:
             display_index = self.layer_list.index(sel[0])
             self.active_layer = len(self.layers) - 1 - display_index
             self.request_redraw()
+
+    def show_layer_properties(self, event):
+        """Open the properties editor for the layer under the pointer."""
+        row = self.layer_list.identify_row(event.y)
+        if not row:
+            return "break"
+
+        display_index = self.layer_list.index(row)
+        layer_index = len(self.layers) - 1 - display_index
+        layer = self.layers[layer_index]
+        original_name = layer.name
+        original_opacity = layer.opacity
+        self.active_layer = layer_index
+        self.layer_list.selection_set(row)
+        self.layer_list.focus(row)
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Layer Properties")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+
+        body = ttk.Frame(dialog, padding=12)
+        body.grid(row=0, column=0, sticky="nsew")
+        body.columnconfigure(1, weight=1)
+
+        ttk.Label(body, text="Name:").grid(
+            row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 10))
+        name_var = tk.StringVar(value=layer.name)
+        name_entry = ttk.Entry(body, textvariable=name_var, width=30)
+        name_entry.grid(row=0, column=1, columnspan=2, sticky="ew", pady=(0, 10))
+
+        ttk.Label(body, text="Opacity:").grid(
+            row=1, column=0, sticky="w", padx=(0, 8))
+        opacity_var = tk.IntVar(value=layer.opacity)
+        opacity_scale = ttk.Scale(
+            body, from_=0, to=100, orient="horizontal", length=190)
+        opacity_scale.set(layer.opacity)
+        opacity_scale.grid(row=1, column=1, sticky="ew")
+
+        opacity_spinbox = ttk.Spinbox(
+            body, from_=0, to=100, textvariable=opacity_var,
+            width=5, justify="right")
+        opacity_spinbox.grid(row=1, column=2, padx=(8, 0))
+        ttk.Label(body, text="%").grid(row=1, column=3, sticky="w", padx=(3, 0))
+
+        syncing = False
+        preview_after_id = None
+
+        def schedule_preview():
+            """Coalesce rapid slider/key events into a modest refresh rate."""
+            nonlocal preview_after_id
+            if preview_after_id is not None:
+                self.root.after_cancel(preview_after_id)
+            preview_after_id = self.root.after(75, apply_preview)
+
+        def apply_preview():
+            nonlocal preview_after_id
+            preview_after_id = None
+            self.request_redraw()
+            self.notify_globe_document_changed()
+
+        def name_changed(*_args):
+            layer.name = name_var.get()
+            if layer.vector_data:
+                layer.vector_data.name = layer.name
+            self.refresh_layers()
+
+        def scale_changed(value):
+            nonlocal syncing
+            if syncing:
+                return
+            value = round(float(value))
+            syncing = True
+            opacity_var.set(value)
+            syncing = False
+            layer.opacity = value
+            schedule_preview()
+
+        def number_changed(*_args):
+            nonlocal syncing
+            if syncing:
+                return
+            try:
+                entered_value = int(opacity_var.get())
+                value = max(0, min(100, entered_value))
+            except (tk.TclError, ValueError):
+                return
+            syncing = True
+            if entered_value != value:
+                opacity_var.set(value)
+            opacity_scale.set(value)
+            syncing = False
+            layer.opacity = value
+            schedule_preview()
+
+        opacity_scale.configure(command=scale_changed)
+        opacity_var.trace_add("write", number_changed)
+        name_var.trace_add("write", name_changed)
+
+        def accept(_event=None):
+            name = name_var.get().strip()
+            if not name:
+                messagebox.showwarning(
+                    "Layer Properties", "Layer name cannot be empty.", parent=dialog)
+                name_entry.focus_set()
+                return
+            try:
+                opacity = max(0, min(100, int(opacity_var.get())))
+            except (tk.TclError, ValueError):
+                messagebox.showwarning(
+                    "Layer Properties", "Opacity must be a number from 0 to 100.",
+                    parent=dialog)
+                opacity_spinbox.focus_set()
+                return
+
+            # The controls have already previewed their values. Temporarily
+            # restore the originals so Undo records the pre-dialog state.
+            layer.name = original_name
+            layer.opacity = original_opacity
+            if layer.vector_data:
+                layer.vector_data.name = original_name
+            self.snapshot()
+            layer.name = name
+            layer.opacity = opacity
+            if layer.vector_data:
+                layer.vector_data.name = name
+            self.refresh_layers()
+            self.request_redraw()
+            self.notify_globe_document_changed()
+            dialog.destroy()
+
+        def cancel(_event=None):
+            nonlocal preview_after_id
+            if preview_after_id is not None:
+                self.root.after_cancel(preview_after_id)
+                preview_after_id = None
+            layer.name = original_name
+            layer.opacity = original_opacity
+            if layer.vector_data:
+                layer.vector_data.name = original_name
+            self.refresh_layers()
+            self.request_redraw()
+            self.notify_globe_document_changed()
+            dialog.destroy()
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=2, column=0, columnspan=4, sticky="e", pady=(14, 0))
+        ttk.Button(buttons, text="Cancel", command=cancel).pack(
+            side="right", padx=(6, 0))
+        ttk.Button(buttons, text="OK", command=accept).pack(side="right")
+
+        dialog.bind("<Return>", accept)
+        dialog.bind("<Escape>", cancel)
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+        dialog.update_idletasks()
+        x = event.x_root - dialog.winfo_reqwidth()
+        y = event.y_root
+        dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
+        name_entry.focus_set()
+        name_entry.selection_range(0, "end")
+        dialog.grab_set()
+        return "break"
 
     def refresh_layers(self):
         self.layer_list.delete(*self.layer_list.get_children())
@@ -1640,7 +1818,8 @@ class PaintApp:
             if not candidate.visible:
                 continue
             candidate_image = preview_img if candidate is layer else candidate.image
-            preview_composite.alpha_composite(candidate_image)
+            preview_composite.alpha_composite(
+                candidate.image_with_opacity(candidate_image))
 
         self.display_image(preview_composite)
 
@@ -1777,7 +1956,7 @@ class PaintApp:
             if layer.visible:
                 if layer.layer_type == "vector" and layer.vector_data:
                     layer.render_vector()
-                result.alpha_composite(layer.image)
+                result.alpha_composite(layer.image_with_opacity())
         return result
 
     def composite_region(self, box, output_size=None):
@@ -1823,7 +2002,7 @@ class PaintApp:
                 rendered = source.transform(
                     size, Image.Transform.EXTENT, extent,
                     resample=Image.Resampling.NEAREST)
-                result.alpha_composite(rendered)
+                result.alpha_composite(layer.image_with_opacity(rendered))
         return result
 
     def get_checker_backdrop_pil(self, cw, ch):
