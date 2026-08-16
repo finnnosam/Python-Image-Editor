@@ -645,6 +645,7 @@ class PaintApp:
         self.canvas.bind("<B2-Motion>",       self.pan)
         self.canvas.bind("<Button-3>",        self.on_mouse_down)
         self.canvas.bind("<B3-Motion>",       self.on_mouse_move)
+        self.canvas.bind("<ButtonRelease-3>", self.on_mouse_up)
         self.canvas.bind("<MouseWheel>",      self.on_mousewheel)  # Plain scroll for panning
         self.canvas.bind("<Control-MouseWheel>", self.zoom_mouse)  # Ctrl+scroll for zoom
         # Hotkeys
@@ -1243,6 +1244,8 @@ class PaintApp:
                 iy * self.zoom + self.offset_y)
 
     def on_mouse_down(self, event):
+        self.mouse_x = event.x
+        self.mouse_y = event.y
         self.last_button = event.num  # Track which button (1=left, 3=right)
         x, y = self.image_coords(event.x, event.y)
         current_layer = self.layers[self.active_layer]
@@ -1255,6 +1258,9 @@ class PaintApp:
     def start_raster_draw(self, event):
         self.snapshot()
         self.last_x, self.last_y = self.image_coords(event.x, event.y)
+        # Stamp the initial point immediately so a click/tap without any
+        # motion produces a dot, just as it does in the globe view.
+        self.raster_paint_image(self.last_x, self.last_y)
 
     def start_vector_operation(self, event, x, y):
         if self.tool == "vector edit":
@@ -1276,6 +1282,10 @@ class PaintApp:
             self.snapshot()
 
     def on_mouse_move(self, event):
+        # Tk dispatches B1/B3-Motion to this handler instead of mouse_move(),
+        # so keep the brush outline position current during a stroke too.
+        self.mouse_x = event.x
+        self.mouse_y = event.y
         x, y = self.image_coords(event.x, event.y)
         current_layer = self.layers[self.active_layer]
         
