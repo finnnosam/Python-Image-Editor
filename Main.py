@@ -1,9 +1,10 @@
 import tkinter as tk
-from tkinter import filedialog, colorchooser, messagebox
+from tkinter import filedialog, messagebox
 from tkinter import ttk
 from PIL import Image, ImageChops, ImageDraw, ImageTk, ImageOps
 import numpy as np
 import math
+import colorsys
 import copy
 import io
 import base64
@@ -503,6 +504,11 @@ class PaintApp:
         self.tool = "brush"
         self.primary_color = "#000000"
         self.secondary_color = "#ffffff"
+        self.primary_opacity = 255
+        self.secondary_opacity = 255
+        self.active_color_slot = "primary"
+        self.picker_hue = 0.0
+        self._color_controls_updating = False
         self.color = self.primary_color  # Keep for compatibility
         # Empty document pixels stay transparent.  The checkerboard is a view
         # backdrop, not document content, so compositing (including the globe
@@ -619,26 +625,70 @@ class PaintApp:
             self.tool_buttons[tool] = button
         tk.Label(left, textvariable=self.tool_hint_var).pack(pady=(2, 0))
 
-        ttk.Separator(left, orient="horizontal").pack(fill="x", padx=4, pady=6)
-
         # ── Color Selector ─────────────────────────────────────────────
-        tk.Label(left, text="Colors", font=("TkDefaultFont", 9, "bold")).pack(pady=(6, 2))
+        # Keep the whole group anchored to the bottom of the sidebar. The
+        # unused height between Tools and Colors expands with the window.
+        color_panel = tk.Frame(left)
+        color_panel.pack(side="bottom", fill="x", pady=(0, 6))
 
-        color_frame = tk.Frame(left)
+        ttk.Separator(color_panel, orient="horizontal").pack(
+            fill="x", padx=4, pady=(0, 12))
+        tk.Label(color_panel, text="Colors",
+                 font=("TkDefaultFont", 9, "bold")).pack(pady=(0, 2))
+
+        color_frame = tk.Frame(color_panel)
         color_frame.pack(pady=4)
 
         # Primary color square (left)
-        self.primary_square = tk.Canvas(color_frame, width=30, height=30, bg=self.primary_color, highlightthickness=1, highlightbackground="black")
+        self.primary_square = tk.Canvas(color_frame, width=30, height=30, bg=self.primary_color,
+                                        highlightthickness=3, highlightbackground="#2878d7")
         self.primary_square.pack(side="left", padx=2)
         self.primary_square.bind("<Button-1>", lambda e: self.choose_primary_color())
 
         # Secondary color square (right)
-        self.secondary_square = tk.Canvas(color_frame, width=30, height=30, bg=self.secondary_color, highlightthickness=1, highlightbackground="black")
+        self.secondary_square = tk.Canvas(color_frame, width=30, height=30, bg=self.secondary_color,
+                                          highlightthickness=3, highlightbackground="black")
         self.secondary_square.pack(side="left", padx=2)
         self.secondary_square.bind("<Button-1>", lambda e: self.choose_secondary_color())
 
         # Swap colors button
-        tk.Button(left, text="↔", width=3, command=self.swap_colors).pack(pady=2)
+        tk.Button(color_panel, text="↔", width=3,
+                  command=self.swap_colors).pack(pady=(0, 6))
+
+        controls = tk.Frame(color_panel)
+        controls.pack(fill="x", padx=8, pady=(4, 0))
+        self.rgb_vars = [tk.IntVar(value=0) for _ in range(3)]
+        self.hsv_vars = [tk.IntVar(value=0), tk.IntVar(value=0),
+                         tk.IntVar(value=0)]
+        self.opacity_var = tk.IntVar(value=255)
+        self.hex_var = tk.StringVar(value="000000")
+        self.color_sliders = []
+
+        tk.Label(controls, text="RGB", anchor="w").pack(fill="x")
+        for label, variable in zip(("R", "G", "B"), self.rgb_vars):
+            self._add_color_slider(controls, label, variable, 0, 255,
+                                   self._rgb_controls_changed)
+
+        hex_row = tk.Frame(controls)
+        hex_row.pack(fill="x", pady=(2, 3))
+        tk.Label(hex_row, text="Hex:", width=4, anchor="w").pack(side="left")
+        self.hex_entry = tk.Entry(hex_row, textvariable=self.hex_var,
+                                  width=8, justify="right")
+        self.hex_entry.pack(side="right")
+        self.hex_entry.bind("<Return>", self._hex_control_changed)
+        self.hex_entry.bind("<FocusOut>", self._hex_control_changed)
+
+        tk.Label(controls, text="HSV", anchor="w").pack(fill="x")
+        for label, variable, maximum in zip(
+                ("H", "S", "V"), self.hsv_vars, (359, 100, 100)):
+            self._add_color_slider(controls, label, variable, 0, maximum,
+                                   self._hsv_controls_changed)
+
+        tk.Label(controls, text="Opacity", anchor="w").pack(fill="x", pady=(3, 0))
+        self._add_color_slider(controls, "A", self.opacity_var, 0, 255,
+                               self._opacity_control_changed)
+
+        self._sync_picker_to_active_color()
 
         # Size is shared by tools, so it remains below the tool column.  The
         # second column stays available for future per-tool settings.
@@ -890,24 +940,228 @@ class PaintApp:
             self.request_mipmap_level(pending)
 
     def choose_primary_color(self):
-        c = colorchooser.askcolor(self.primary_color)[1]
-        if c:
-            self.primary_color = c
-            self.color = c  # Update current color for compatibility
-            self.primary_square.config(bg=c)
-            self.request_redraw()
+        self.active_color_slot = "primary"
+        self._sync_picker_to_active_color()
 
     def choose_secondary_color(self):
-        c = colorchooser.askcolor(self.secondary_color)[1]
-        if c:
-            self.secondary_color = c
-            self.secondary_square.config(bg=c)
+        self.active_color_slot = "secondary"
+        self._sync_picker_to_active_color()
+
+    @staticmethod
+    def _hex_to_rgb(color):
+        color = color.lstrip("#")
+        return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+
+    @staticmethod
+    def _rgb_to_hex(rgb):
+        return "#{:02x}{:02x}{:02x}".format(*rgb)
+
+    def _add_color_slider(self, parent, label, variable, minimum, maximum,
+                          callback):
+        row = tk.Frame(parent)
+        row.pack(fill="x")
+        tk.Label(row, text=f"{label}:", width=2, anchor="w").pack(side="left")
+        if label == "H":
+            slider = tk.Canvas(row, width=92, height=14, bd=0,
+                               highlightthickness=0, cursor="sb_h_double_arrow")
+            slider.pack(side="left", fill="x", expand=True)
+            slider.bind(
+                "<Button-1>",
+                lambda event, control=slider, value=variable, changed=callback:
+                    self._set_hue_slider_from_pointer(
+                        control, value, event, changed))
+            slider.bind(
+                "<B1-Motion>",
+                lambda event, control=slider, value=variable, changed=callback:
+                    self._set_hue_slider_from_pointer(
+                        control, value, event, changed))
+            variable.trace_add(
+                "write", lambda *args, control=slider, value=variable:
+                    self._render_hue_slider(control, value))
+            slider.bind(
+                "<Configure>",
+                lambda event, control=slider, value=variable:
+                    self._render_hue_slider(control, value))
+            slider.after_idle(lambda: self._render_hue_slider(slider, variable))
+        else:
+            slider = tk.Scale(row, variable=variable, from_=minimum, to=maximum,
+                              orient="horizontal", showvalue=False, length=92,
+                              resolution=1, bd=0, highlightthickness=0,
+                              sliderlength=6, width=8,
+                              command=lambda value: callback())
+            slider.pack(side="left", fill="x", expand=True)
+            slider.bind(
+                "<Button-1>",
+                lambda event, control=slider, changed=callback:
+                    self._set_slider_from_pointer(control, event, changed))
+            slider.bind(
+                "<B1-Motion>",
+                lambda event, control=slider, changed=callback:
+                    self._set_slider_from_pointer(control, event, changed))
+        spinner = tk.Spinbox(row, textvariable=variable, from_=minimum,
+                             to=maximum, width=4, justify="right",
+                             command=callback)
+        spinner.pack(side="right")
+        spinner.bind("<Return>", lambda event: callback())
+        spinner.bind("<FocusOut>", lambda event: callback())
+        self.color_sliders.append(slider)
+
+    def _render_hue_slider(self, slider, variable):
+        width = max(2, slider.winfo_width())
+        height = max(2, slider.winfo_height())
+        image = Image.new("RGB", (width, height))
+        pixels = image.load()
+        for x in range(width):
+            rgb = colorsys.hsv_to_rgb(x / (width - 1), 1, 1)
+            color = tuple(round(channel * 255) for channel in rgb)
+            for y in range(height):
+                pixels[x, y] = color
+        slider._hue_image = ImageTk.PhotoImage(image)
+        slider.delete("all")
+        slider.create_image(0, 0, image=slider._hue_image, anchor="nw")
+        try:
+            marker_x = int(variable.get()) / 359 * (width - 1)
+        except (tk.TclError, ValueError):
+            marker_x = 0
+        slider.create_line(marker_x, 0, marker_x, height,
+                           fill="white", width=3)
+        slider.create_line(marker_x, 0, marker_x, height, fill="black")
+
+    def _set_hue_slider_from_pointer(self, slider, variable, event, callback):
+        width = max(2, slider.winfo_width())
+        fraction = min(1.0, max(0.0, event.x / (width - 1)))
+        variable.set(round(fraction * 359))
+        callback()
+        return "break"
+
+    def _set_slider_from_pointer(self, slider, event, callback):
+        """Snap a compact scale's handle directly beneath the pointer."""
+        handle_width = float(slider.cget("sliderlength"))
+        usable_width = max(1.0, slider.winfo_width() - handle_width)
+        fraction = (event.x - handle_width / 2) / usable_width
+        fraction = min(1.0, max(0.0, fraction))
+        minimum = float(slider.cget("from"))
+        maximum = float(slider.cget("to"))
+        slider.set(round(minimum + fraction * (maximum - minimum)))
+        callback()
+        return "break"
+
+    @staticmethod
+    def _clamp_control(variable, minimum, maximum):
+        try:
+            value = int(variable.get())
+        except (tk.TclError, ValueError):
+            value = minimum
+        value = min(maximum, max(minimum, value))
+        variable.set(value)
+        return value
+
+    def _rgb_controls_changed(self):
+        if self._color_controls_updating:
+            return
+        rgb = tuple(self._clamp_control(variable, 0, 255)
+                    for variable in self.rgb_vars)
+        self._set_selected_color(self._rgb_to_hex(rgb))
+
+    def _hsv_controls_changed(self):
+        if self._color_controls_updating:
+            return
+        hue = self._clamp_control(self.hsv_vars[0], 0, 359) / 359
+        saturation = self._clamp_control(self.hsv_vars[1], 0, 100) / 100
+        value = self._clamp_control(self.hsv_vars[2], 0, 100) / 100
+        rgb = colorsys.hsv_to_rgb(hue, saturation, value)
+        self.picker_hue = hue
+        self.picker_saturation = saturation
+        self.picker_value = value
+        self._set_selected_color(
+            self._rgb_to_hex(tuple(round(channel * 255) for channel in rgb)),
+            preserve_black_hsv=True)
+
+    def _hex_control_changed(self, event=None):
+        if self._color_controls_updating:
+            return
+        value = self.hex_var.get().strip().lstrip("#")
+        if len(value) == 3:
+            value = "".join(character * 2 for character in value)
+        try:
+            if len(value) != 6:
+                raise ValueError
+            int(value, 16)
+        except ValueError:
+            self._sync_picker_to_active_color()
+            return
+        self._set_selected_color("#" + value.lower())
+
+    def _opacity_control_changed(self):
+        if self._color_controls_updating:
+            return
+        opacity = self._clamp_control(self.opacity_var, 0, 255)
+        if self.active_color_slot == "primary":
+            self.primary_opacity = opacity
+        else:
+            self.secondary_opacity = opacity
+        self.request_redraw()
+
+    def _set_selected_color(self, color, preserve_black_hsv=False):
+        if self.active_color_slot == "primary":
+            self.primary_color = color
+            self.color = color
+            self.primary_square.config(bg=color)
+        else:
+            self.secondary_color = color
+            self.secondary_square.config(bg=color)
+        self._sync_picker_to_active_color(
+            preserve_black_hsv=preserve_black_hsv)
+        self.request_redraw()
+
+    def _color_with_opacity(self, slot):
+        if slot == "primary":
+            color, opacity = self.primary_color, self.primary_opacity
+        else:
+            color, opacity = self.secondary_color, self.secondary_opacity
+        return color if opacity == 255 else f"{color}{opacity:02x}"
+
+    def _sync_picker_to_active_color(self, preserve_black_hsv=False):
+        color = (self.primary_color if self.active_color_slot == "primary"
+                 else self.secondary_color)
+        r, g, b = (channel / 255 for channel in self._hex_to_rgb(color))
+        hue, saturation, value = colorsys.rgb_to_hsv(r, g, b)
+        # Hue is undefined for grayscale colors, so retain the last useful hue.
+        if saturation > 0:
+            self.picker_hue = hue
+        # While V is zero, let the user stage a saturation value even though
+        # the stored RGB color is necessarily black. It is intentionally only
+        # temporary picker state; selecting another swatch reconstructs HSV
+        # from that swatch's actual color and discards it.
+        if not (preserve_black_hsv and value == 0):
+            self.picker_saturation = saturation
+        self.picker_value = value
+        self.primary_square.config(
+            highlightbackground="#2878d7" if self.active_color_slot == "primary" else "black")
+        self.secondary_square.config(
+            highlightbackground="#2878d7" if self.active_color_slot == "secondary" else "black")
+        opacity = (self.primary_opacity if self.active_color_slot == "primary"
+                   else self.secondary_opacity)
+        self._color_controls_updating = True
+        try:
+            for variable, channel in zip(self.rgb_vars, self._hex_to_rgb(color)):
+                variable.set(channel)
+            self.hsv_vars[0].set(round(self.picker_hue * 359))
+            self.hsv_vars[1].set(round(self.picker_saturation * 100))
+            self.hsv_vars[2].set(round(value * 100))
+            self.opacity_var.set(opacity)
+            self.hex_var.set(color.lstrip("#").upper())
+        finally:
+            self._color_controls_updating = False
 
     def swap_colors(self):
         self.primary_color, self.secondary_color = self.secondary_color, self.primary_color
+        self.primary_opacity, self.secondary_opacity = (
+            self.secondary_opacity, self.primary_opacity)
         self.color = self.primary_color
         self.primary_square.config(bg=self.primary_color)
         self.secondary_square.config(bg=self.secondary_color)
+        self._sync_picker_to_active_color()
         self.request_redraw()
 
     def open_settings(self):
@@ -1711,11 +1965,8 @@ class PaintApp:
         if self.tool == "eraser":
             color = (0, 0, 0, 0)
         else:
-            color = (
-                self.primary_color
-                if self.last_button == 1
-                else self.secondary_color
-            )
+            color = self._color_with_opacity(
+                "primary" if self.last_button == 1 else "secondary")
 
         dx = x - self.last_x
         dy = y - self.last_y
@@ -1755,9 +2006,9 @@ class PaintApp:
             return
 
         radius = int(self.size_var.get()) / 2
-        color = (0, 0, 0, 0) if self.tool == "eraser" else (
-            self.primary_color if self.last_button == 1 else self.secondary_color
-        )
+        color = ((0, 0, 0, 0) if self.tool == "eraser" else
+                 self._color_with_opacity(
+                     "primary" if self.last_button == 1 else "secondary"))
         self.draw_circle(x, y, radius, color)
         self.draw_circle(x - self.doc_w, y, radius, color)
         self.draw_circle(x + self.doc_w, y, radius, color)
@@ -1777,9 +2028,9 @@ class PaintApp:
         if not self.can_paint_from_globe() or not footprint_uv:
             return
 
-        color = (0, 0, 0, 0) if self.tool == "eraser" else (
-            self.primary_color if self.last_button == 1 else self.secondary_color
-        )
+        color = ((0, 0, 0, 0) if self.tool == "eraser" else
+                 self._color_with_opacity(
+                     "primary" if self.last_button == 1 else "secondary"))
         polygon = [(u * self.doc_w, v * self.doc_h) for u, v in footprint_uv]
 
         # Repeat the unwrapped polygon on both sides of the texture.  PIL clips
@@ -1861,15 +2112,18 @@ class PaintApp:
         preview_draw = ImageDraw.Draw(preview_img)
         
         if self.tool == "line":
-            preview_draw.line([(x1, y1), (x2, y2)], fill=self.primary_color, width=2)
+            preview_draw.line([(x1, y1), (x2, y2)],
+                              fill=self._color_with_opacity("primary"), width=2)
         elif self.tool == "rect":
             bounds = [(min(x1, x2), min(y1, y2)),
                       (max(x1, x2), max(y1, y2))]
-            preview_draw.rectangle(bounds, outline=self.primary_color, width=2)
+            preview_draw.rectangle(bounds,
+                                   outline=self._color_with_opacity("primary"), width=2)
         elif self.tool == "ellipse":
             bounds = [(min(x1, x2), min(y1, y2)),
                       (max(x1, x2), max(y1, y2))]
-            preview_draw.ellipse(bounds, outline=self.primary_color, width=2)
+            preview_draw.ellipse(bounds,
+                                outline=self._color_with_opacity("primary"), width=2)
 
         # Preview the active vector layer in its normal place in the complete
         # layer stack.  Displaying preview_img directly hides every raster
@@ -1896,7 +2150,8 @@ class PaintApp:
         # Use primary color for vector objects
         obj = None
         if self.tool == "line":
-            obj = Line(x1, y1, x2, y2, self.primary_color, 2)
+            obj = Line(x1, y1, x2, y2,
+                       self._color_with_opacity("primary"), 2)
         elif self.tool in ("rect", "ellipse"):
             obj = self.make_shape_preset(self.tool, [(x1, y1), (x2, y2)], "flat")
         
@@ -1905,7 +2160,7 @@ class PaintApp:
 
     def make_shape_preset(self, preset, points, space="flat"):
         """Turn a UI shape preset into lines; presets are never special render objects."""
-        color, width = self.primary_color, 2
+        color, width = self._color_with_opacity("primary"), 2
         if preset == "rect":
             if len(points) == 2:
                 (x1, y1), (x2, y2) = points
@@ -1932,14 +2187,16 @@ class PaintApp:
                 lines = [Line(*vertices[i], *vertices[(i+1)%len(vertices)], color,
                               width, space=space) for i in range(len(vertices))]
         # The secondary colour represents the shape's filled (inside) side.
-        return Shape(lines, color, width, self.secondary_color, "inside", preset)
+        return Shape(lines, color, width,
+                     self._color_with_opacity("secondary"), "inside", preset)
 
     def create_globe_vector(self, preset, image_points):
         if not self.can_draw_vector_from_globe() or len(image_points) < 2:
             return
         self.snapshot()
         if preset == "line":
-            obj = Line(*image_points[0], *image_points[-1], self.primary_color, 2,
+            obj = Line(*image_points[0], *image_points[-1],
+                       self._color_with_opacity("primary"), 2,
                        space="globe")
         else:
             obj = self.make_shape_preset(preset, image_points, "globe")
