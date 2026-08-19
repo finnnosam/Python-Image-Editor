@@ -5,5 +5,6 @@ __pycache__/
 #Files
 Debug_Version.py
 Debug_Version_old.py
+Debug_Example.py
 Performance_Reports.txt
 wishlist.txt

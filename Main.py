@@ -679,10 +679,10 @@ class PaintApp:
         self.hex_entry.bind("<FocusOut>", self._hex_control_changed)
 
         tk.Label(controls, text="HSV", anchor="w").pack(fill="x")
-        for label, variable, maximum in zip(
-                ("H", "S", "V"), self.hsv_vars, (359, 100, 100)):
+        for index, (label, variable, maximum) in enumerate(zip(
+                ("H", "S", "V"), self.hsv_vars, (359, 100, 100))):
             self._add_color_slider(controls, label, variable, 0, maximum,
-                                   self._hsv_controls_changed)
+                                   lambda component=index: self._hsv_controls_changed(component))
 
         tk.Label(controls, text="Opacity", anchor="w").pack(fill="x", pady=(3, 0))
         self._add_color_slider(controls, "A", self.opacity_var, 0, 255,
@@ -1063,19 +1063,26 @@ class PaintApp:
                     for variable in self.rgb_vars)
         self._set_selected_color(self._rgb_to_hex(rgb))
 
-    def _hsv_controls_changed(self):
+    def _hsv_controls_changed(self, component=None):
         if self._color_controls_updating:
             return
-        hue = self._clamp_control(self.hsv_vars[0], 0, 359) / 359
-        saturation = self._clamp_control(self.hsv_vars[1], 0, 100) / 100
-        value = self._clamp_control(self.hsv_vars[2], 0, 100) / 100
+        hue = self.picker_hue
+        saturation = self.picker_saturation
+        value = self.picker_value
+        if component in (None, 0):
+            hue = self._clamp_control(self.hsv_vars[0], 0, 359) / 360
+        if component in (None, 1):
+            saturation = self._clamp_control(
+                self.hsv_vars[1], 0, 100) / 100
+        if component in (None, 2):
+            value = self._clamp_control(self.hsv_vars[2], 0, 100) / 100
         rgb = colorsys.hsv_to_rgb(hue, saturation, value)
         self.picker_hue = hue
         self.picker_saturation = saturation
         self.picker_value = value
         self._set_selected_color(
             self._rgb_to_hex(tuple(round(channel * 255) for channel in rgb)),
-            preserve_black_hsv=True)
+            preserve_hsv=True)
 
     def _hex_control_changed(self, event=None):
         if self._color_controls_updating:
@@ -1102,7 +1109,7 @@ class PaintApp:
             self.secondary_opacity = opacity
         self.request_redraw()
 
-    def _set_selected_color(self, color, preserve_black_hsv=False):
+    def _set_selected_color(self, color, preserve_hsv=False):
         if self.active_color_slot == "primary":
             self.primary_color = color
             self.color = color
@@ -1111,7 +1118,7 @@ class PaintApp:
             self.secondary_color = color
             self.secondary_square.config(bg=color)
         self._sync_picker_to_active_color(
-            preserve_black_hsv=preserve_black_hsv)
+            preserve_hsv=preserve_hsv)
         self.request_redraw()
 
     def _color_with_opacity(self, slot):
@@ -1121,21 +1128,22 @@ class PaintApp:
             color, opacity = self.secondary_color, self.secondary_opacity
         return color if opacity == 255 else f"{color}{opacity:02x}"
 
-    def _sync_picker_to_active_color(self, preserve_black_hsv=False):
+    def _sync_picker_to_active_color(self, preserve_hsv=False):
         color = (self.primary_color if self.active_color_slot == "primary"
                  else self.secondary_color)
         r, g, b = (channel / 255 for channel in self._hex_to_rgb(color))
         hue, saturation, value = colorsys.rgb_to_hsv(r, g, b)
-        # Hue is undefined for grayscale colors, so retain the last useful hue.
-        if saturation > 0:
-            self.picker_hue = hue
-        # While V is zero, let the user stage a saturation value even though
-        # the stored RGB color is necessarily black. It is intentionally only
-        # temporary picker state; selecting another swatch reconstructs HSV
-        # from that swatch's actual color and discards it.
-        if not (preserve_black_hsv and value == 0):
+        # HSV controls have more precision than the stored 8-bit RGB color.
+        # Preserve their exact state after an HSV edit instead of converting
+        # the rounded RGB value back to HSV, which makes H and S slowly drift
+        # while V is dragged back and forth.
+        if not preserve_hsv:
+            # Hue is undefined for grayscale colors, so retain the last useful
+            # hue when syncing from RGB, hex, or a selected swatch.
+            if saturation > 0:
+                self.picker_hue = hue
             self.picker_saturation = saturation
-        self.picker_value = value
+            self.picker_value = value
         self.primary_square.config(
             highlightbackground="#2878d7" if self.active_color_slot == "primary" else "black")
         self.secondary_square.config(
@@ -1146,9 +1154,9 @@ class PaintApp:
         try:
             for variable, channel in zip(self.rgb_vars, self._hex_to_rgb(color)):
                 variable.set(channel)
-            self.hsv_vars[0].set(round(self.picker_hue * 359))
+            self.hsv_vars[0].set(round(self.picker_hue * 360) % 360)
             self.hsv_vars[1].set(round(self.picker_saturation * 100))
-            self.hsv_vars[2].set(round(value * 100))
+            self.hsv_vars[2].set(round(self.picker_value * 100))
             self.opacity_var.set(opacity)
             self.hex_var.set(color.lstrip("#").upper())
         finally:
