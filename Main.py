@@ -1982,7 +1982,10 @@ class PaintApp:
         dist = math.hypot(dx, dy)
 
         spacing = max(1, radius * 0.25)
-        steps = max(1, int(dist / spacing))
+        # Round upward so the distance between adjacent stamps never exceeds
+        # the requested spacing. Flooring this value could leave one- or
+        # two-pixel holes in thin strokes between mouse-motion events.
+        steps = max(1, math.ceil(dist / spacing))
 
         for i in range(steps + 1):
 
@@ -2093,10 +2096,21 @@ class PaintApp:
 
     def draw_circle(self, x, y, radius, color):
         layer = self.layers[self.active_layer]
-        layer.draw.ellipse((x - radius, y - radius, x + radius, y + radius),
+        # Pillow includes both ends of an ellipse's bounding box. Reduce the
+        # raster radius by half a pixel so a requested diameter of 1 paints
+        # one pixel (and diameter N spans N pixels), rather than N + 1.
+        raster_radius = max(0, radius - 0.5)
+        if raster_radius == 0:
+            px, py = round(x), round(y)
+            layer.draw.point((px, py), fill=color)
+            layer.update_mipmaps((px, py, px + 1, py + 1))
+            return
+        bounds = (x - raster_radius, y - raster_radius,
+                  x + raster_radius, y + raster_radius)
+        layer.draw.ellipse(bounds,
                            fill=color, outline=color)
-        layer.update_mipmaps((x - radius, y - radius,
-                              x + radius + 1, y + radius + 1))
+        layer.update_mipmaps((bounds[0], bounds[1],
+                              bounds[2] + 1, bounds[3] + 1))
 
     def vector_operation(self, event, x, y):
         if self.is_dragging_point and self.selected_vector_obj:
