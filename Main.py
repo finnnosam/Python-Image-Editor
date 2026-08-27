@@ -597,11 +597,32 @@ class PaintApp:
         self.ui_scale = 1.5
 
         self.build_ui()
+        # Tk does not normally move keyboard focus when a label, frame, or
+        # canvas background is clicked. Treat those clicks as "click away"
+        # so entries commit through their existing <FocusOut> handlers.
+        self.root.bind_all("<Button-1>", self._commit_active_entry, add="+")
         self.apply_ui_scale(self.ui_scale)  # A: apply 1.5× on launch
         self.refresh_layers()
         self.redraw()
         self.update_title()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _commit_active_entry(self, event):
+        """Commit and unfocus an entry when the user clicks outside it."""
+        focused = self.root.focus_get()
+        if focused is None or focused.winfo_class() not in {
+                "Entry", "TEntry", "Spinbox", "TSpinbox"}:
+            return
+
+        clicked = event.widget
+        while clicked is not None:
+            if clicked == focused:
+                return
+            clicked = getattr(clicked, "master", None)
+
+        # Moving focus fires the field's FocusOut callback synchronously,
+        # which validates and applies the edited value.
+        self.root.focus_set()
 
     def build_ui(self):
         # ── Top bar: file & edit actions ──────────────────────────────────
