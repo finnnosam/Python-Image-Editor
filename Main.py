@@ -13,6 +13,44 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+
+def _brush_shape_mask(image, bounds, paint_mask, antialias=False):
+    """Return the clipped document box and coverage mask for a brush shape."""
+    padding = 1 if antialias else 0
+    left = max(0, math.floor(bounds[0]) - padding)
+    top = max(0, math.floor(bounds[1]) - padding)
+    right = min(image.width, math.ceil(bounds[2]) + 1 + padding)
+    bottom = min(image.height, math.ceil(bounds[3]) + 1 + padding)
+    if right <= left or bottom <= top:
+        return None, None
+
+    size = (right - left, bottom - top)
+    # Tiny brushes need finer subpixel precision; larger stamps use 4x to
+    # keep interactive painting responsive.
+    scale = (64 if max(size) <= 6 else 4) if antialias else 1
+    mask = Image.new("L", (size[0] * scale, size[1] * scale), 0)
+    paint_mask(ImageDraw.Draw(mask), left, top, scale)
+    if antialias:
+        # BOX computes area coverage.  LANCZOS looks smooth too, but its
+        # ringing can create faint pixels outside the actual brush footprint.
+        mask = mask.resize(size, Image.Resampling.BOX)
+    return (left, top, right, bottom), mask
+
+
+def _composite_brush_shape(image, bounds, color, paint_mask, antialias=False):
+    """Source-over composite a solid brush color through a shape mask."""
+    box, mask = _brush_shape_mask(
+        image, bounds, paint_mask, antialias=antialias)
+    if box is None:
+        return None
+
+    source = Image.new("RGBA", mask.size, color)
+    source_alpha = source.getchannel("A")
+    source.putalpha(ImageChops.multiply(source_alpha, mask))
+    image.alpha_composite(source, (box[0], box[1]))
+    return box
+
+
 class VectorObject:
     """Base class for vector objects"""
     def __init__(self, color="#000000", width=2):
@@ -506,6 +544,8 @@ class PaintApp:
         self.secondary_color = "#ffffff"
         self.primary_opacity = 255
         self.secondary_opacity = 255
+        self._stroke_base_image = None
+        self._stroke_coverage = None
         self.active_color_slot = "primary"
         self.picker_hue = 0.0
         self._color_controls_updating = False
@@ -623,6 +663,22 @@ class PaintApp:
                 "<Leave>",
                 lambda event: self.tool_hint_var.set(self.tool.title()))
             self.tool_buttons[tool] = button
+        self.brush_build_up_var = tk.BooleanVar(value=False)
+        self.brush_antialias_var = tk.BooleanVar(value=True)
+        self.brush_settings_frame = tk.Frame(tool_frame)
+        self.brush_settings_frame.grid(row=0, column=1, sticky="w", padx=(4, 0))
+        tk.Checkbutton(
+            self.brush_settings_frame,
+            text="Build up",
+            variable=self.brush_build_up_var,
+            anchor="w",
+        ).pack(anchor="w")
+        tk.Checkbutton(
+            self.brush_settings_frame,
+            text="Anti-alias",
+            variable=self.brush_antialias_var,
+            anchor="w",
+        ).pack(anchor="w")
         tk.Label(left, textvariable=self.tool_hint_var).pack(pady=(2, 0))
 
         # ── Color Selector ─────────────────────────────────────────────
@@ -1506,6 +1562,7 @@ class PaintApp:
         self.notify_globe_document_changed()
 
     def set_tool(self, tool):
+        self._finish_raster_stroke()
         self.tool = tool
         if hasattr(self, "tool_buttons"):
             for name, button in self.tool_buttons.items():
@@ -1870,6 +1927,7 @@ class PaintApp:
 
     def start_raster_draw(self, event):
         self.snapshot()
+        self._prepare_raster_stroke()
         self.last_x, self.last_y = self.image_coords(event.x, event.y)
         # Stamp the initial point immediately so a click/tap without any
         # motion produces a dot, just as it does in the globe view.
@@ -1946,6 +2004,7 @@ class PaintApp:
         (such as the globe window).
         """
         self.snapshot()
+        self._prepare_raster_stroke()
         self.last_x = x
         self.last_y = y
         self.last_button = button
@@ -1957,6 +2016,46 @@ class PaintApp:
         """
         self.last_x = None
         self.last_y = None
+        self._finish_raster_stroke()
+
+    def _prepare_raster_stroke(self):
+        """Capture the state needed to cap opacity within one brush gesture."""
+        self._stroke_base_image = None
+        self._stroke_coverage = None
+        if (self.tool == "brush" and
+                not self.brush_build_up_var.get() and self.undo_stack):
+            snapshot_layers, snapshot_active = self.undo_stack[-1]
+            if snapshot_active == self.active_layer:
+                self._stroke_base_image = snapshot_layers[snapshot_active].image
+                self._stroke_coverage = Image.new(
+                    "L", (self.doc_w, self.doc_h), 0)
+
+    def _finish_raster_stroke(self):
+        self._stroke_base_image = None
+        self._stroke_coverage = None
+
+    def _paint_brush_shape(self, layer, bounds, color, paint_mask):
+        """Paint one dab, optionally capping coverage for the current stroke."""
+        antialias = self.brush_antialias_var.get()
+        if self._stroke_base_image is None or self._stroke_coverage is None:
+            return _composite_brush_shape(
+                layer.image, bounds, color, paint_mask,
+                antialias=antialias)
+
+        box, dab_mask = _brush_shape_mask(
+            layer.image, bounds, paint_mask, antialias=antialias)
+        if box is None:
+            return None
+        coverage = self._stroke_coverage.crop(box)
+        coverage = ImageChops.lighter(coverage, dab_mask)
+        self._stroke_coverage.paste(coverage, (box[0], box[1]))
+
+        result = self._stroke_base_image.crop(box)
+        source = Image.new("RGBA", coverage.size, color)
+        source.putalpha(ImageChops.multiply(source.getchannel("A"), coverage))
+        result.alpha_composite(source)
+        layer.image.paste(result, (box[0], box[1]))
+        return box
 
 
     def raster_paint_image(self, x, y):
@@ -2049,13 +2148,25 @@ class PaintApp:
         layer = self.layers[self.active_layer]
         for offset in (-self.doc_w, 0, self.doc_w):
             shifted = [(x + offset, y) for x, y in polygon]
-            layer.draw.polygon(
-                shifted,
-                fill=color,
-            )
             xs = [point[0] for point in shifted]
             ys = [point[1] for point in shifted]
-            layer.update_mipmaps((min(xs), min(ys), max(xs) + 1, max(ys) + 1))
+            bounds = (min(xs), min(ys), max(xs), max(ys))
+            if self.tool == "eraser":
+                layer.draw.polygon(shifted, fill=color)
+                dirty_box = (bounds[0], bounds[1],
+                             bounds[2] + 1, bounds[3] + 1)
+            else:
+                dirty_box = self._paint_brush_shape(
+                    layer,
+                    bounds,
+                    color,
+                    lambda draw, left, top, scale, points=shifted: draw.polygon(
+                        [((x - left + 0.5) * scale,
+                          (y - top + 0.5) * scale)
+                         for x, y in points], fill=255),
+                )
+            if dirty_box is not None:
+                layer.update_mipmaps(dirty_box)
 
         self.last_x, self.last_y = center_x, center_y
         if refresh:
@@ -2101,16 +2212,64 @@ class PaintApp:
         # one pixel (and diameter N spans N pixels), rather than N + 1.
         raster_radius = max(0, radius - 0.5)
         if raster_radius == 0:
+            # A 1 px anti-aliased brush is still a geometric disc centered at
+            # the pointer's fractional document coordinate.  Snapping it to a
+            # point first would throw away the subpixel position and give the
+            # main pixel the same alpha everywhere along a stroke.
+            if self.tool != "eraser" and self.brush_antialias_var.get():
+                bounds = (x - radius, y - radius,
+                          x + radius, y + radius)
+                dirty_box = self._paint_brush_shape(
+                    layer,
+                    bounds,
+                    color,
+                    lambda draw, left, top, scale: draw.ellipse(
+                        ((bounds[0] - left + 0.5) * scale,
+                         (bounds[1] - top + 0.5) * scale,
+                         (bounds[2] - left + 0.5) * scale - 1,
+                         (bounds[3] - top + 0.5) * scale - 1),
+                        fill=255, outline=255),
+                )
+                if dirty_box is not None:
+                    layer.update_mipmaps(dirty_box)
+                return
+
             px, py = round(x), round(y)
-            layer.draw.point((px, py), fill=color)
-            layer.update_mipmaps((px, py, px + 1, py + 1))
+            if self.tool == "eraser":
+                layer.draw.point((px, py), fill=color)
+                dirty_box = (px, py, px + 1, py + 1)
+            else:
+                dirty_box = self._paint_brush_shape(
+                    layer,
+                    (px, py, px, py),
+                    color,
+                    lambda draw, left, top, scale: draw.rectangle(
+                        ((px - left) * scale, (py - top) * scale,
+                         (px - left + 1) * scale - 1,
+                         (py - top + 1) * scale - 1), fill=255),
+                )
+            if dirty_box is not None:
+                layer.update_mipmaps(dirty_box)
             return
         bounds = (x - raster_radius, y - raster_radius,
                   x + raster_radius, y + raster_radius)
-        layer.draw.ellipse(bounds,
-                           fill=color, outline=color)
-        layer.update_mipmaps((bounds[0], bounds[1],
-                              bounds[2] + 1, bounds[3] + 1))
+        if self.tool == "eraser":
+            layer.draw.ellipse(bounds, fill=color, outline=color)
+            dirty_box = (bounds[0], bounds[1], bounds[2] + 1, bounds[3] + 1)
+        else:
+            dirty_box = self._paint_brush_shape(
+                layer,
+                bounds,
+                color,
+                lambda draw, left, top, scale: draw.ellipse(
+                    ((bounds[0] - left + 0.5) * scale,
+                     (bounds[1] - top + 0.5) * scale,
+                     (bounds[2] - left + 0.5) * scale - 1,
+                     (bounds[3] - top + 0.5) * scale - 1),
+                    fill=255, outline=255),
+            )
+        if dirty_box is not None:
+            layer.update_mipmaps(dirty_box)
 
     def vector_operation(self, event, x, y):
         if self.is_dragging_point and self.selected_vector_obj:
@@ -2234,6 +2393,7 @@ class PaintApp:
         if current_layer.is_raster:
             self.last_x = None
             self.last_y = None
+            self._finish_raster_stroke()
         else:  # vector layer
             if self.is_dragging_point:
                 self.is_dragging_point = False
