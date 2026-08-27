@@ -426,11 +426,12 @@ class Layer:
         self.name = name
         self.visible = True
         self.opacity = 100
-        self.layer_type = layer_type  # "raster", "mask", or "vector"
+        self.layer_type = layer_type  # "raster" or "vector"
+        self.masked = False
         self.width = width
         self.height = height
         
-        if layer_type in ("raster", "mask"):
+        if layer_type == "raster":
             self.image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
             self.draw = ImageDraw.Draw(self.image)
             self.vector_data = None
@@ -451,7 +452,7 @@ class Layer:
 
     @property
     def is_raster(self):
-        return self.layer_type in ("raster", "mask")
+        return self.layer_type == "raster"
 
     def get_mipmap(self, level):
         """Return a cached 2**level reduction of this layer."""
@@ -853,14 +854,12 @@ class PaintApp:
             self.layer_style.lookup(
                 "Treeview", "foreground", ("selected",)) or "#ffffff")
         self.layer_selected_raster_color = "#c94f4f"
-        self.layer_selected_mask_color = "#242424"
         self.layer_list = ttk.Treeview(
             right, show="tree", selectmode="browse", style="Layer.Treeview")
         self.layer_list.pack(fill="both", expand=True, padx=4)
         self.layer_list.column("#0", stretch=True, width=220)
         self.layer_list.tag_configure("raster", background="#f7dddd")
         self.layer_list.tag_configure("vector", background="#dcecff")
-        self.layer_list.tag_configure("mask", background="#B7B7B7")
         self.layer_list.bind("<<TreeviewSelect>>", self.select_layer)
         self.layer_list.bind("<Button-1>",         self.on_layer_pointer_down)
         self.layer_list.bind("<Button-3>",         self.show_layer_properties)
@@ -1392,6 +1391,7 @@ class PaintApp:
             n = Layer(self.doc_w, self.doc_h, l.name, l.layer_type)
             n.visible = l.visible
             n.opacity = l.opacity
+            n.masked = l.masked
             n.image = l.image.copy()
             n.draw = ImageDraw.Draw(n.image)
             n.reset_mipmaps()
@@ -1459,6 +1459,7 @@ class PaintApp:
                     'name': layer.name,
                     'visible': layer.visible,
                     'opacity': layer.opacity,
+                    'masked': layer.masked,
                     'layer_type': layer.layer_type,
                     'image_data': img_base64,
                     'width': self.doc_w,
@@ -1526,13 +1527,17 @@ class PaintApp:
             with Image.open(io.BytesIO(img_bytes)) as source:
                 img = source.convert("RGBA")
 
+            saved_type = layer_info.get('layer_type', 'raster')
+            # Mask used to be a dedicated raster layer type. Treat legacy
+            # mask layers as ordinary raster layers with per-layer masking.
+            layer_type = 'raster' if saved_type == 'mask' else saved_type
             layer = Layer(project_data['document_width'],
                           project_data['document_height'],
-                          layer_info['name'],
-                          layer_info.get('layer_type', 'raster'))
+                          layer_info['name'], layer_type)
             layer.image = img
             layer.visible = layer_info['visible']
             layer.opacity = max(0, min(100, int(layer_info.get('opacity', 100))))
+            layer.masked = bool(layer_info.get('masked', saved_type == 'mask'))
             layer.draw = ImageDraw.Draw(layer.image)
             layer.reset_mipmaps()
 
@@ -1655,7 +1660,6 @@ class PaintApp:
         layer_type = self.layers[self.active_layer].layer_type
         selected_color = {
             "raster": self.layer_selected_raster_color,
-            "mask": self.layer_selected_mask_color,
             "vector": self.layer_selected_vector_color,
         }[layer_type]
         self.layer_style.map(
@@ -1674,7 +1678,7 @@ class PaintApp:
         layer = self.layers[layer_index]
         original_name = layer.name
         original_opacity = layer.opacity
-        original_type = layer.layer_type
+        original_masked = layer.masked
         self.active_layer = layer_index
         self.layer_list.selection_set(row)
         self.layer_list.focus(row)
@@ -1695,17 +1699,11 @@ class PaintApp:
         name_entry = ttk.Entry(body, textvariable=name_var, width=30)
         name_entry.grid(row=0, column=1, columnspan=2, sticky="ew", pady=(0, 10))
 
-        type_var = None
-        if layer.is_raster:
-            ttk.Label(body, text="Type:").grid(
-                row=1, column=0, sticky="w", padx=(0, 8), pady=(0, 10))
-            type_var = tk.StringVar(
-                value="Mask" if layer.layer_type == "mask" else "Raster")
-            type_picker = ttk.Combobox(
-                body, textvariable=type_var, values=("Raster", "Mask"),
-                state="readonly", width=12)
-            type_picker.grid(
-                row=1, column=1, columnspan=2, sticky="w", pady=(0, 10))
+        masked_var = tk.BooleanVar(value=layer.masked)
+        masked_check = ttk.Checkbutton(
+            body, text="Masked by layers underneath", variable=masked_var)
+        masked_check.grid(
+            row=1, column=1, columnspan=3, sticky="w", pady=(0, 10))
 
         ttk.Label(body, text="Opacity:").grid(
             row=2, column=0, sticky="w", padx=(0, 8))
@@ -1775,6 +1773,13 @@ class PaintApp:
         opacity_var.trace_add("write", number_changed)
         name_var.trace_add("write", name_changed)
 
+        def masked_changed():
+            layer.masked = masked_var.get()
+            self.refresh_layers()
+            schedule_preview()
+
+        masked_check.configure(command=masked_changed)
+
         def accept(_event=None):
             name = name_var.get().strip()
             if not name:
@@ -1793,26 +1798,16 @@ class PaintApp:
 
             # The controls have already previewed their values. Temporarily
             # restore the originals so Undo records the pre-dialog state.
-            new_type = (type_var.get().lower()
-                        if type_var is not None else original_type)
+            new_masked = masked_var.get()
             layer.name = original_name
             layer.opacity = original_opacity
-            layer.layer_type = original_type
+            layer.masked = original_masked
             if layer.vector_data:
                 layer.vector_data.name = original_name
             self.snapshot()
             layer.name = name
             layer.opacity = opacity
-            layer.layer_type = new_type
-            if (new_type == "mask" and original_type != "mask" and
-                    any(other is not layer and other.layer_type == "mask"
-                        for other in self.layers)):
-                messagebox.showwarning(
-                    "Multiple Masks",
-                    "This project already has a mask layer. Multiple masks "
-                    "are allowed, but their opacity caps will all apply to "
-                    "the final image.",
-                    parent=dialog)
+            layer.masked = new_masked
             if layer.vector_data:
                 layer.vector_data.name = name
             self.refresh_layers()
@@ -1827,7 +1822,7 @@ class PaintApp:
                 preview_after_id = None
             layer.name = original_name
             layer.opacity = original_opacity
-            layer.layer_type = original_type
+            layer.masked = original_masked
             if layer.vector_data:
                 layer.vector_data.name = original_name
             self.refresh_layers()
@@ -1858,9 +1853,8 @@ class PaintApp:
         for i in range(len(self.layers) - 1, -1, -1):
             l = self.layers[i]
             self.layer_list.insert(
-                "", "end", text=l.name,
-                image=self.layer_row_icons[
-                    (l.visible, "raster" if l.layer_type == "mask" else l.layer_type)],
+                "", "end", text=f"{l.name}{' [Masked]' if l.masked else ''}",
+                image=self.layer_row_icons[(l.visible, l.layer_type)],
                 tags=(l.layer_type,))
 
         self.update_layer_selection_style()
@@ -2332,14 +2326,17 @@ class PaintApp:
         # layer for the duration of the drag.
         preview_composite = Image.new(
             "RGBA", (self.doc_w, self.doc_h), (0, 0, 0, 0))
+        underlying_alpha = Image.new("L", (self.doc_w, self.doc_h), 0)
         for candidate in self.layers:
             if not candidate.visible:
                 continue
             candidate_image = preview_img if candidate is layer else candidate.image
-            preview_composite.alpha_composite(
-                candidate.image_with_opacity(candidate_image))
-
-        self.apply_visible_masks(preview_composite)
+            rendered = candidate.image_with_opacity(candidate_image)
+            rendered = self._cap_masked_layer(
+                candidate, rendered, underlying_alpha)
+            preview_composite.alpha_composite(rendered)
+            underlying_alpha = ImageChops.lighter(
+                underlying_alpha, rendered.getchannel("A"))
 
         self.display_image(preview_composite)
 
@@ -2476,21 +2473,28 @@ class PaintApp:
 
     def composite_image(self):
         result = Image.new("RGBA", (self.doc_w, self.doc_h), self.bg_color)
+        underlying_alpha = Image.new("L", (self.doc_w, self.doc_h), 0)
         for layer in self.layers:
             if layer.visible:
                 if layer.layer_type == "vector" and layer.vector_data:
                     layer.render_vector()
-                result.alpha_composite(layer.image_with_opacity())
-        self.apply_visible_masks(result)
+                rendered = layer.image_with_opacity()
+                rendered = self._cap_masked_layer(
+                    layer, rendered, underlying_alpha)
+                result.alpha_composite(rendered)
+                underlying_alpha = ImageChops.lighter(
+                    underlying_alpha, rendered.getchannel("A"))
         return result
 
-    def apply_visible_masks(self, image):
-        """Cap the composite alpha with every visible document mask."""
-        for layer in self.layers:
-            if not layer.visible or layer.layer_type != "mask":
-                continue
-            mask_alpha = layer.image_with_opacity().getchannel("A")
-            image.putalpha(ImageChops.darker(image.getchannel("A"), mask_alpha))
+    @staticmethod
+    def _cap_masked_layer(layer, rendered, underlying_alpha):
+        """Cap one masked layer by the strongest visible layer below it."""
+        if not layer.masked:
+            return rendered
+        capped = rendered.copy()
+        capped.putalpha(ImageChops.darker(
+            rendered.getchannel("A"), underlying_alpha))
+        return capped
 
     def composite_region(self, box, output_size=None):
         """Composite only a document-space rectangle for interactive display.
@@ -2527,7 +2531,7 @@ class PaintApp:
         # checkerboard after compositing the layers; beginning with an opaque
         # white image would permanently cover that backdrop.
         result = Image.new("RGBA", size, (0, 0, 0, 0))
-        rendered_masks = []
+        underlying_alpha = Image.new("L", size, 0)
         for layer in self.layers:
             if layer.visible:
                 source = layer.get_mipmap(level)
@@ -2537,11 +2541,11 @@ class PaintApp:
                     size, Image.Transform.EXTENT, extent,
                     resample=Image.Resampling.NEAREST)
                 rendered = layer.image_with_opacity(rendered)
-                if layer.layer_type == "mask":
-                    rendered_masks.append(rendered.getchannel("A"))
+                rendered = self._cap_masked_layer(
+                    layer, rendered, underlying_alpha)
                 result.alpha_composite(rendered)
-        for mask_alpha in rendered_masks:
-            result.putalpha(ImageChops.darker(result.getchannel("A"), mask_alpha))
+                underlying_alpha = ImageChops.lighter(
+                    underlying_alpha, rendered.getchannel("A"))
         return result
 
     def get_checker_backdrop_pil(self, cw, ch):
