@@ -37,6 +37,25 @@ def _brush_shape_mask(image, bounds, paint_mask, antialias=False):
     return (left, top, right, bottom), mask
 
 
+def _brush_ellipse_box(bounds, left, top, scale):
+    """Return a Pillow-safe local ellipse box for a brush dab.
+
+    A two-pixel brush has a half-pixel raster radius, so without
+    antialiasing its transformed endpoints should be identical. Floating
+    point rounding can instead leave x1 or y1 infinitesimally below x0/y0,
+    which Pillow rejects as an inverted ellipse.
+    """
+    x0 = (bounds[0] - left + 0.5) * scale
+    y0 = (bounds[1] - top + 0.5) * scale
+    # Pillow includes both endpoints. At scale 1 that inclusive far edge is
+    # what gives a diameter-N brush N pixels. Supersampled masks, however,
+    # need the final subpixel removed before being reduced to document size.
+    far_edge_adjustment = 1 if scale > 1 else 0
+    x1 = ((bounds[2] - left + 0.5) * scale - far_edge_adjustment)
+    y1 = ((bounds[3] - top + 0.5) * scale - far_edge_adjustment)
+    return (x0, y0, max(x0, x1), max(y0, y1))
+
+
 def _composite_brush_shape(image, bounds, color, paint_mask, antialias=False):
     """Source-over composite a solid brush color through a shape mask."""
     box, mask = _brush_shape_mask(
@@ -53,9 +72,10 @@ def _composite_brush_shape(image, bounds, color, paint_mask, antialias=False):
 
 class VectorObject:
     """Base class for vector objects"""
-    def __init__(self, color="#000000", width=2):
+    def __init__(self, color="#000000", width=2, antialias=True):
         self.color = color
         self.width = width
+        self.antialias = antialias
         self.selected = False
         
     def to_dict(self):
@@ -63,7 +83,8 @@ class VectorObject:
         return {
             'type': self.__class__.__name__,
             'color': self.color,
-            'width': self.width
+            'width': self.width,
+            'antialias': self.antialias,
         }
     
     @classmethod
@@ -83,8 +104,8 @@ class VectorObject:
 
 class Line(VectorObject):
     def __init__(self, x1=0, y1=0, x2=100, y2=100, color="#000000", width=2,
-                 curve=None, space="flat"):
-        super().__init__(color, width)
+                 curve=None, space="flat", antialias=True):
+        super().__init__(color, width, antialias)
         self.x1 = x1
         self.y1 = y1
         self.x2 = x2
@@ -108,7 +129,7 @@ class Line(VectorObject):
     def from_dict(cls, data):
         return cls(data['x1'], data['y1'], data['x2'], data['y2'],
                    data['color'], data['width'], data.get('curve'),
-                   data.get('space', 'flat'))
+                   data.get('space', 'flat'), data.get('antialias', True))
     
     def sampled_points(self, document_width=1024, document_height=512, steps=32):
         """Return map points. Globe lines follow the shortest great-circle arc."""
@@ -161,8 +182,8 @@ class Line(VectorObject):
 class Shape(VectorObject):
     """A closed/open preset made exclusively from Line primitives."""
     def __init__(self, lines=None, color="#000000", width=2, fill=None,
-                 filled_side="inside", preset="custom"):
-        super().__init__(color, width)
+                 filled_side="inside", preset="custom", antialias=True):
+        super().__init__(color, width, antialias)
         self.lines = lines or []
         self.fill = fill
         self.filled_side = filled_side
@@ -170,6 +191,7 @@ class Shape(VectorObject):
         self._spherical_fill_cache = None
         for line in self.lines:
             line.color, line.width = color, width
+            line.antialias = antialias
 
     def to_dict(self):
         data = super().to_dict()
@@ -182,19 +204,24 @@ class Shape(VectorObject):
         lines = [Line.from_dict({k: v for k, v in item.items() if k != 'type'})
                  for item in data.get('lines', [])]
         return cls(lines, data['color'], data['width'], data.get('fill'),
-                   data.get('filled_side', 'inside'), data.get('preset', 'custom'))
+                   data.get('filled_side', 'inside'), data.get('preset', 'custom'),
+                   data.get('antialias', True))
 
     @classmethod
     def from_legacy_rectangle(cls, data):
         x, y, w, h = data['x'], data['y'], data['w'], data['h']
+        antialias = data.get('antialias', True)
         vertices = [(x, y), (x+w, y), (x+w, y+h), (x, y+h)]
-        lines = [Line(*vertices[i], *vertices[(i+1) % 4], data['color'], data['width'])
+        lines = [Line(*vertices[i], *vertices[(i+1) % 4], data['color'],
+                      data['width'], antialias=antialias)
                  for i in range(4)]
-        return cls(lines, data['color'], data['width'], data.get('fill'), preset='rect')
+        return cls(lines, data['color'], data['width'], data.get('fill'),
+                   preset='rect', antialias=antialias)
 
     @classmethod
     def from_legacy_ellipse(cls, data):
         cx, cy, rx, ry = data['x'], data['y'], data['rx'], data['ry']
+        antialias = data.get('antialias', True)
         k = 0.5522847498
         vertices = [(cx+rx,cy),(cx,cy+ry),(cx-rx,cy),(cx,cy-ry)]
         controls = [(cx+rx,cy+k*ry,cx+k*rx,cy+ry),
@@ -202,8 +229,10 @@ class Shape(VectorObject):
                     (cx-rx,cy-k*ry,cx-k*rx,cy-ry),
                     (cx+k*rx,cy-ry,cx+rx,cy-k*ry)]
         lines = [Line(*vertices[i], *vertices[(i+1) % 4], data['color'],
-                      data['width'], curve=controls[i]) for i in range(4)]
-        return cls(lines, data['color'], data['width'], data.get('fill'), preset='ellipse')
+                      data['width'], curve=controls[i], antialias=antialias)
+                 for i in range(4)]
+        return cls(lines, data['color'], data['width'], data.get('fill'),
+                   preset='ellipse', antialias=antialias)
 
     def _outline(self, width, height):
         points = []
@@ -294,8 +323,14 @@ class Shape(VectorObject):
                     document_width, document_height), fill=self.fill)
             else:
                 draw.polygon(points, fill=self.fill)
-        for line in self.lines:
-            line.draw(draw, document_width, document_height)
+        # Stroke the complete outline once. Drawing each constituent segment
+        # separately makes shared endpoints overlap, producing visibly thicker
+        # corners and uneven joins.
+        if len(points) >= 2:
+            for offset in offsets:
+                draw.line(
+                    [(x + offset, y) for x, y in points],
+                    fill=self.color, width=self.width, joint="curve")
 
     def get_points(self):
         return [(line.x1, line.y1) for line in self.lines]
@@ -373,6 +408,74 @@ class Ellipse(VectorObject):
         return [(self.x - self.rx, self.y), (self.x + self.rx, self.y), 
                 (self.x, self.y - self.ry), (self.x, self.y + self.ry)]
 
+
+def _draw_vector_path(image, points, color, width, antialias=True):
+    """Stroke a path with consistent geometry and optional edge smoothing."""
+    if len(points) < 2:
+        return
+
+    padding = width / 2 + 2
+    left = max(0, math.floor(min(x for x, _ in points) - padding))
+    top = max(0, math.floor(min(y for _, y in points) - padding))
+    right = min(image.width, math.ceil(max(x for x, _ in points) + padding + 1))
+    bottom = min(image.height, math.ceil(max(y for _, y in points) + padding + 1))
+    if right <= left or bottom <= top:
+        return
+
+    tile_width, tile_height = right - left, bottom - top
+    # Supersampling stabilizes shallow lines in both modes. Aliased vectors
+    # retain hard pixel edges by using nearest-neighbor reduction.
+    # factor only for exceptionally large paths so a document-sized ellipse
+    # cannot allocate an excessive temporary image.
+    scale = 8 if antialias else 4
+    while scale > 2 and tile_width * tile_height * scale * scale > 32_000_000:
+        scale -= 1
+
+    tile = Image.new("RGBA", (tile_width * scale, tile_height * scale),
+                     (0, 0, 0, 0))
+    scaled_points = [((x - left) * scale, (y - top) * scale)
+                     for x, y in points]
+    ImageDraw.Draw(tile).line(
+        scaled_points, fill=color, width=max(1, round(width * scale)),
+        joint="curve")
+    resampling = (Image.Resampling.LANCZOS if antialias
+                  else Image.Resampling.NEAREST)
+    tile = tile.resize((tile_width, tile_height), resampling)
+    image.alpha_composite(tile, (left, top))
+
+
+def render_vector_object(image, obj, document_width, document_height):
+    """Render one vector object with an anti-aliased, uniform-width stroke."""
+    if isinstance(obj, Line):
+        points = obj.sampled_points(document_width, document_height)
+        offsets = (-document_width, 0, document_width) \
+            if obj.space == "globe" else (0,)
+        for offset in offsets:
+            _draw_vector_path(
+                image, [(x + offset, y) for x, y in points],
+                obj.color, obj.width, obj.antialias)
+        return
+
+    if isinstance(obj, Shape):
+        points = obj._outline(document_width, document_height)
+        globe = any(line.space == "globe" for line in obj.lines)
+        if obj.fill and len(points) >= 3 and obj.filled_side == "inside":
+            draw = ImageDraw.Draw(image)
+            if globe:
+                draw.bitmap((0, 0), obj._spherical_fill_mask(
+                    document_width, document_height), fill=obj.fill)
+            else:
+                draw.polygon(points, fill=obj.fill)
+        offsets = (-document_width, 0, document_width) if globe else (0,)
+        for offset in offsets:
+            _draw_vector_path(
+                image, [(x + offset, y) for x, y in points],
+                obj.color, obj.width, obj.antialias)
+        return
+
+    # Compatibility for any legacy in-memory vector object.
+    obj.draw(ImageDraw.Draw(image), document_width, document_height)
+
 class VectorLayer:
     def __init__(self, name, width, height):
         self.name = name
@@ -390,9 +493,9 @@ class VectorLayer:
         if obj in self.objects:
             self.objects.remove(obj)
             
-    def render(self, draw):
+    def render(self, image):
         for obj in self.objects:
-            obj.draw(draw, self.width, self.height)
+            render_vector_object(image, obj, self.width, self.height)
             
     def get_object_at(self, x, y, tolerance=10):
         """Find object at position (for selection)"""
@@ -497,7 +600,7 @@ class Layer:
             # Clear the image
             self.image = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
             self.draw = ImageDraw.Draw(self.image)
-            self.vector_data.render(self.draw)
+            self.vector_data.render(self.image)
             self.reset_mipmaps()
 
     def image_with_opacity(self, image=None):
@@ -775,7 +878,7 @@ class PaintApp:
 
         tk.Label(self.size_frame, text="Size:").pack(side="left")
 
-        self.size_var = tk.StringVar(value="20")
+        self.size_var = tk.StringVar(value="2")
         self.size_entry = tk.Entry(
             self.size_frame, width=6, textvariable=self.size_var)
         self.size_entry.pack(side="left", padx=4)
@@ -790,7 +893,7 @@ class PaintApp:
                     val = 100
                 self.size_var.set(str(val))
             except ValueError:
-                self.size_var.set("20")  # revert to default on invalid input
+                self.size_var.set("2")  # revert to default on invalid input
 
         self.size_entry.bind("<Return>", update_size)
         self.size_entry.bind("<FocusOut>", update_size)
@@ -2082,7 +2185,10 @@ class PaintApp:
             self.last_x = x
             self.last_y = y
 
-        radius = int(self.size_var.get()) / 2
+        # The entry is validated on Return/focus-out, but painting can begin
+        # while it temporarily contains 0 during editing.  Keep every dab at
+        # least one pixel wide so Pillow never receives an inverted ellipse.
+        radius = max(0.5, int(self.size_var.get()) / 2)
 
         if self.tool == "eraser":
             color = (0, 0, 0, 0)
@@ -2130,7 +2236,7 @@ class PaintApp:
         if not self.can_paint_from_globe():
             return
 
-        radius = int(self.size_var.get()) / 2
+        radius = max(0.5, int(self.size_var.get()) / 2)
         color = ((0, 0, 0, 0) if self.tool == "eraser" else
                  self._color_with_opacity(
                      "primary" if self.last_button == 1 else "secondary"))
@@ -2222,6 +2328,9 @@ class PaintApp:
 
     def draw_circle(self, x, y, radius, color):
         layer = self.layers[self.active_layer]
+        # Also enforce the invariant here for callers that supply a radius
+        # directly instead of reading the validated size control.
+        radius = max(0.5, radius)
         # Pillow includes both ends of an ellipse's bounding box. Reduce the
         # raster radius by half a pixel so a requested diameter of 1 paints
         # one pixel (and diameter N spans N pixels), rather than N + 1.
@@ -2239,10 +2348,7 @@ class PaintApp:
                     bounds,
                     color,
                     lambda draw, left, top, scale: draw.ellipse(
-                        ((bounds[0] - left + 0.5) * scale,
-                         (bounds[1] - top + 0.5) * scale,
-                         (bounds[2] - left + 0.5) * scale - 1,
-                         (bounds[3] - top + 0.5) * scale - 1),
+                        _brush_ellipse_box(bounds, left, top, scale),
                         fill=255, outline=255),
                 )
                 if dirty_box is not None:
@@ -2277,10 +2383,7 @@ class PaintApp:
                 bounds,
                 color,
                 lambda draw, left, top, scale: draw.ellipse(
-                    ((bounds[0] - left + 0.5) * scale,
-                     (bounds[1] - top + 0.5) * scale,
-                     (bounds[2] - left + 0.5) * scale - 1,
-                     (bounds[3] - top + 0.5) * scale - 1),
+                    _brush_ellipse_box(bounds, left, top, scale),
                     fill=255, outline=255),
             )
         if dirty_box is not None:
@@ -2305,21 +2408,11 @@ class PaintApp:
         layer = self.layers[self.active_layer]
         
         preview_img = layer.image.copy()
-        preview_draw = ImageDraw.Draw(preview_img)
-        
-        if self.tool == "line":
-            preview_draw.line([(x1, y1), (x2, y2)],
-                              fill=self._color_with_opacity("primary"), width=2)
-        elif self.tool == "rect":
-            bounds = [(min(x1, x2), min(y1, y2)),
-                      (max(x1, x2), max(y1, y2))]
-            preview_draw.rectangle(bounds,
-                                   outline=self._color_with_opacity("primary"), width=2)
-        elif self.tool == "ellipse":
-            bounds = [(min(x1, x2), min(y1, y2)),
-                      (max(x1, x2), max(y1, y2))]
-            preview_draw.ellipse(bounds,
-                                outline=self._color_with_opacity("primary"), width=2)
+        preview_object = self.make_vector_object(
+            self.tool, [(x1, y1), (x2, y2)], "flat")
+        if preview_object:
+            render_vector_object(
+                preview_img, preview_object, self.doc_w, self.doc_h)
 
         # Preview the active vector layer in its normal place in the complete
         # layer stack.  Displaying preview_img directly hides every raster
@@ -2346,27 +2439,52 @@ class PaintApp:
         if layer.layer_type != "vector":
             return
         
-        # Use primary color for vector objects
-        obj = None
-        if self.tool == "line":
-            obj = Line(x1, y1, x2, y2,
-                       self._color_with_opacity("primary"), 2)
-        elif self.tool in ("rect", "ellipse"):
-            obj = self.make_shape_preset(self.tool, [(x1, y1), (x2, y2)], "flat")
+        obj = self.make_vector_object(
+            self.tool, [(x1, y1), (x2, y2)], "flat")
         
         if obj:
             layer.vector_data.add_object(obj)
 
+    def vector_line_width(self):
+        """Return the shared Size control as a valid vector stroke width."""
+        try:
+            return max(1, min(100, int(self.size_var.get())))
+        except (tk.TclError, ValueError):
+            return 2
+
+    def vector_antialias_enabled(self):
+        """Capture the shared Anti-alias toggle for a new vector object."""
+        try:
+            return bool(self.brush_antialias_var.get())
+        except (tk.TclError, AttributeError):
+            return True
+
+    def make_vector_object(self, preset, points, space="flat"):
+        """Build the same vector object for previews and finalized gestures."""
+        if len(points) < 2:
+            return None
+        if preset == "line":
+            return Line(*points[0], *points[-1],
+                        self._color_with_opacity("primary"),
+                        self.vector_line_width(), space=space,
+                        antialias=self.vector_antialias_enabled())
+        if preset in ("rect", "ellipse"):
+            return self.make_shape_preset(preset, points, space)
+        return None
+
     def make_shape_preset(self, preset, points, space="flat"):
         """Turn a UI shape preset into lines; presets are never special render objects."""
-        color, width = self._color_with_opacity("primary"), 2
+        color = self._color_with_opacity("primary")
+        width = self.vector_line_width()
+        antialias = self.vector_antialias_enabled()
         if preset == "rect":
             if len(points) == 2:
                 (x1, y1), (x2, y2) = points
                 vertices = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
             else:
                 vertices = points[:4]
-            lines = [Line(*vertices[i], *vertices[(i + 1) % 4], color, width, space=space)
+            lines = [Line(*vertices[i], *vertices[(i + 1) % 4], color, width,
+                          space=space, antialias=antialias)
                      for i in range(4)]
         else:
             if space == "flat":
@@ -2380,25 +2498,25 @@ class PaintApp:
                             (cx-rx,cy-k*ry,cx-k*rx,cy-ry),
                             (cx+k*rx,cy-ry,cx+rx,cy-k*ry)]
                 lines = [Line(*verts[i], *verts[(i+1)%4], color, width,
-                              curve=controls[i], space=space) for i in range(4)]
+                              curve=controls[i], space=space,
+                              antialias=antialias) for i in range(4)]
             else:
                 vertices = points
                 lines = [Line(*vertices[i], *vertices[(i+1)%len(vertices)], color,
-                              width, space=space) for i in range(len(vertices))]
+                              width, space=space, antialias=antialias)
+                         for i in range(len(vertices))]
         # The secondary colour represents the shape's filled (inside) side.
         return Shape(lines, color, width,
-                     self._color_with_opacity("secondary"), "inside", preset)
+                     self._color_with_opacity("secondary"), "inside", preset,
+                     antialias)
 
     def create_globe_vector(self, preset, image_points):
         if not self.can_draw_vector_from_globe() or len(image_points) < 2:
             return
         self.snapshot()
-        if preset == "line":
-            obj = Line(*image_points[0], *image_points[-1],
-                       self._color_with_opacity("primary"), 2,
-                       space="globe")
-        else:
-            obj = self.make_shape_preset(preset, image_points, "globe")
+        obj = self.make_vector_object(preset, image_points, "globe")
+        if obj is None:
+            return
         self.layers[self.active_layer].vector_data.add_object(obj)
         self.layers[self.active_layer].render_vector()
         self.request_redraw()
