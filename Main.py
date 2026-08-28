@@ -757,6 +757,8 @@ class PaintApp:
         tool_frame.pack(fill="x", padx=4)
 
         tools = [
+            ("Pan",        "pan",         None),
+            ("Color Picker", "color picker", None),
             ("Brush",      "brush",       "brush.png"),
             ("Eraser",     "eraser",      "eraser.png"),
             ("Vector Edit", "vector edit", "vector-edit.png"),
@@ -767,11 +769,32 @@ class PaintApp:
         icon_dir = Path(__file__).resolve().parent / "icons"
         self.tool_icons = {}
         self.tool_buttons = {}
+        self.tools_by_layer_type = {
+            "raster": ("pan", "color picker", "brush", "eraser"),
+            "vector": ("pan", "color picker", "vector edit", "line", "rect", "ellipse"),
+        }
         self.tool_hint_var = tk.StringVar(value="Brush")
         for index, (label, tool, filename) in enumerate(tools):
-            with Image.open(icon_dir / filename) as icon_image:
-                icon_image = icon_image.convert("RGBA").resize(
-                    (32, 32), Image.Resampling.LANCZOS)
+            if filename is None:
+                icon_image = Image.new("RGBA", (32, 32), (0, 0, 0, 0))
+                icon_draw = ImageDraw.Draw(icon_image)
+                if tool == "pan":
+                    icon_draw.line((6, 16, 26, 16), fill="#202020", width=3)
+                    icon_draw.line((16, 6, 16, 26), fill="#202020", width=3)
+                    icon_draw.polygon((3, 16, 9, 11, 9, 21), fill="#202020")
+                    icon_draw.polygon((29, 16, 23, 11, 23, 21), fill="#202020")
+                    icon_draw.polygon((16, 3, 11, 9, 21, 9), fill="#202020")
+                    icon_draw.polygon((16, 29, 11, 23, 21, 23), fill="#202020")
+                else:
+                    icon_draw.line((8, 25, 23, 10), fill="#202020", width=5)
+                    icon_draw.line((11, 28, 26, 13), fill="#d8d8d8", width=3)
+                    icon_draw.polygon((22, 5, 28, 11, 24, 15, 18, 9),
+                                      fill="#202020")
+                    icon_draw.rectangle((5, 25, 10, 29), outline="#202020")
+            else:
+                with Image.open(icon_dir / filename) as source_image:
+                    icon_image = source_image.convert("RGBA").resize(
+                        (32, 32), Image.Resampling.LANCZOS)
             icon = ImageTk.PhotoImage(icon_image)
             self.tool_icons[tool] = icon
             button = tk.Button(
@@ -780,7 +803,7 @@ class PaintApp:
                 relief="sunken" if tool == self.tool else "raised",
                 takefocus=True)
             # Column 1 is intentionally left open for per-tool settings.
-            button.grid(row=index, column=0, padx=2, pady=2)
+            button.grid(row=index, column=0, padx=2, pady=2, sticky="w")
             button.bind(
                 "<Enter>",
                 lambda event, name=label: self.tool_hint_var.set(name))
@@ -791,7 +814,11 @@ class PaintApp:
         self.brush_build_up_var = tk.BooleanVar(value=False)
         self.brush_antialias_var = tk.BooleanVar(value=True)
         self.brush_settings_frame = tk.Frame(tool_frame)
-        self.brush_settings_frame.grid(row=0, column=1, sticky="w", padx=(4, 0))
+        # The two controls span the Brush and Eraser rows. Keeping them out of
+        # one individual row prevents the tool buttons below from jumping when
+        # this panel is shown or hidden.
+        self.brush_settings_frame.grid(
+            row=2, column=1, rowspan=2, sticky="nw", padx=(4, 0))
         tk.Checkbutton(
             self.brush_settings_frame,
             text="Build up",
@@ -802,6 +829,29 @@ class PaintApp:
             self.brush_settings_frame,
             text="Anti-alias",
             variable=self.brush_antialias_var,
+            anchor="w",
+        ).pack(anchor="w")
+
+        self.picker_sample_area_var = tk.BooleanVar(value=False)
+        self.picker_settings_frame = tk.Frame(tool_frame)
+        self.picker_settings_frame.grid(
+            row=1, column=1, sticky="w", padx=(4, 0))
+        tk.Checkbutton(
+            self.picker_settings_frame,
+            text="Sample area",
+            variable=self.picker_sample_area_var,
+            command=self.update_tool_settings_visibility,
+            anchor="w",
+        ).pack(anchor="w")
+
+        self.vector_antialias_var = tk.BooleanVar(value=True)
+        self.vector_settings_frame = tk.Frame(tool_frame)
+        self.vector_settings_frame.grid(
+            row=5, column=1, rowspan=3, sticky="nw", padx=(4, 0))
+        tk.Checkbutton(
+            self.vector_settings_frame,
+            text="Anti-alias",
+            variable=self.vector_antialias_var,
             anchor="w",
         ).pack(anchor="w")
         tk.Label(left, textvariable=self.tool_hint_var).pack(pady=(2, 0))
@@ -874,7 +924,11 @@ class PaintApp:
         # Size is shared by tools, so it remains below the tool column.  The
         # second column stays available for future per-tool settings.
         self.size_frame = tk.Frame(tool_frame)
-        self.size_frame.grid(row=len(tools), column=0, padx=2, pady=(6, 2))
+        # Span both columns so this wider row does not widen the button column
+        # and push the adjacent per-tool settings to the right.
+        self.size_frame.grid(
+            row=len(tools), column=0, columnspan=2, sticky="w",
+            padx=2, pady=(6, 2))
 
         tk.Label(self.size_frame, text="Size:").pack(side="left")
 
@@ -931,6 +985,8 @@ class PaintApp:
         self.canvas.bind("<MouseWheel>",      self.on_mousewheel)  # Plain scroll for panning
         self.canvas.bind("<Control-MouseWheel>", self.zoom_mouse)  # Ctrl+scroll for zoom
         # Hotkeys
+        self.canvas.bind("p", lambda e: self.set_tool("pan"))
+        self.canvas.bind("i", lambda e: self.set_tool("color picker"))
         self.canvas.bind("b", lambda e: self.set_tool("brush"))
         self.canvas.bind("e", lambda e: self.set_tool("eraser"))
         self.canvas.bind("v", lambda e: self.set_tool("vector edit"))
@@ -1693,16 +1749,75 @@ class PaintApp:
         self.notify_globe_document_changed()
 
     def set_tool(self, tool):
+        if (hasattr(self, "tools_by_layer_type") and self.layers and
+                tool not in self.tools_by_layer_type[
+                    self.layers[self.active_layer].layer_type]):
+            return
         self._finish_raster_stroke()
         self.tool = tool
+        if hasattr(self, "canvas"):
+            cursor = "fleur" if tool == "pan" else "crosshair"
+            try:
+                self.canvas.configure(cursor=cursor)
+            except tk.TclError:
+                self.canvas.configure(cursor="crosshair")
         if hasattr(self, "tool_buttons"):
             for name, button in self.tool_buttons.items():
                 button.configure(relief="sunken" if name == tool else "raised")
             self.tool_hint_var.set(tool.title())
+        self.update_tool_settings_visibility()
         # Reset vector drawing state
         self.vector_start_x = None
         self.vector_start_y = None
         self.current_vector_obj = None
+        self.request_redraw()
+
+    def update_tools_for_active_layer(self):
+        """Show and select only tools supported by the active layer type."""
+        if not hasattr(self, "tool_buttons") or not self.layers:
+            return
+
+        layer_type = self.layers[self.active_layer].layer_type
+        available_tools = self.tools_by_layer_type[layer_type]
+        for name, button in self.tool_buttons.items():
+            if name in available_tools:
+                button.grid()
+            else:
+                button.grid_remove()
+
+        if self.tool not in available_tools:
+            self.set_tool(available_tools[0])
+        else:
+            self.update_tool_settings_visibility()
+
+    def update_tool_settings_visibility(self):
+        """Show settings that are meaningful for the currently selected tool."""
+        if not hasattr(self, "size_frame"):
+            return
+
+        if self.tool == "color picker":
+            self.picker_settings_frame.grid()
+        else:
+            self.picker_settings_frame.grid_remove()
+
+        if (self.tool in ("brush", "eraser") and self.layers and
+                self.layers[self.active_layer].is_raster):
+            self.brush_settings_frame.grid()
+        else:
+            self.brush_settings_frame.grid_remove()
+
+        if self.tool in ("line", "rect", "ellipse"):
+            self.vector_settings_frame.grid()
+        else:
+            self.vector_settings_frame.grid_remove()
+
+        uses_size = (self.tool != "pan" and
+                     (self.tool != "color picker" or
+                      self.picker_sample_area_var.get()))
+        if uses_size:
+            self.size_frame.grid()
+        else:
+            self.size_frame.grid_remove()
         self.request_redraw()
 
     def add_layer(self, layer_type="raster"):
@@ -1758,6 +1873,7 @@ class PaintApp:
             display_index = self.layer_list.index(sel[0])
             self.active_layer = len(self.layers) - 1 - display_index
             self.update_layer_selection_style()
+            self.update_tools_for_active_layer()
             self.request_redraw()
 
     def update_layer_selection_style(self):
@@ -1788,6 +1904,7 @@ class PaintApp:
         self.layer_list.selection_set(row)
         self.layer_list.focus(row)
         self.update_layer_selection_style()
+        self.update_tools_for_active_layer()
 
         dialog = tk.Toplevel(self.root)
         dialog.title("Layer Properties")
@@ -1963,6 +2080,7 @@ class PaintApp:
                 tags=(l.layer_type,))
 
         self.update_layer_selection_style()
+        self.update_tools_for_active_layer()
         
         display_index = len(self.layers) - 1 - self.active_layer
         rows = self.layer_list.get_children()
@@ -1992,6 +2110,7 @@ class PaintApp:
         self.layer_list.focus(row)
         self.active_layer = len(self.layers) - 1 - display_index
         self.update_layer_selection_style()
+        self.update_tools_for_active_layer()
         self.drag_start_index = display_index
         self.drag_start_y = event.y
         self.snapshot()  # snapshot once at the start of the drag
@@ -2045,6 +2164,12 @@ class PaintApp:
         self.mouse_x = event.x
         self.mouse_y = event.y
         self.last_button = event.num  # Track which button (1=left, 3=right)
+        if self.tool == "pan":
+            self.start_pan(event)
+            return
+        if self.tool == "color picker":
+            self.pick_color(event)
+            return
         x, y = self.image_coords(event.x, event.y)
         current_layer = self.layers[self.active_layer]
         
@@ -2085,6 +2210,12 @@ class PaintApp:
         # so keep the brush outline position current during a stroke too.
         self.mouse_x = event.x
         self.mouse_y = event.y
+        if self.tool == "pan":
+            self.pan(event)
+            return
+        if self.tool == "color picker":
+            self.pick_color(event)
+            return
         x, y = self.image_coords(event.x, event.y)
         current_layer = self.layers[self.active_layer]
         
@@ -2150,7 +2281,7 @@ class PaintApp:
         """Capture the state needed to cap opacity within one brush gesture."""
         self._stroke_base_image = None
         self._stroke_coverage = None
-        if (self.tool == "brush" and
+        if (self.tool in ("brush", "eraser") and
                 not self.brush_build_up_var.get() and self.undo_stack):
             snapshot_layers, snapshot_active = self.undo_stack[-1]
             if snapshot_active == self.active_layer:
@@ -2182,6 +2313,39 @@ class PaintApp:
         source = Image.new("RGBA", coverage.size, color)
         source.putalpha(ImageChops.multiply(source.getchannel("A"), coverage))
         result.alpha_composite(source)
+        layer.image.paste(result, (box[0], box[1]))
+        return box
+
+    def _erase_brush_shape(self, layer, bounds, paint_mask):
+        """Erase through a hard or anti-aliased mask with stroke buildup rules."""
+        box, dab_mask = _brush_shape_mask(
+            layer.image, bounds, paint_mask,
+            antialias=self.brush_antialias_var.get())
+        if box is None:
+            return None
+
+        # Eraser strength follows the opacity of the color slot associated
+        # with the mouse button, just like Brush chooses its paint opacity.
+        eraser_opacity = (self.primary_opacity if self.last_button == 1
+                          else self.secondary_opacity)
+        if eraser_opacity < 255:
+            dab_mask = dab_mask.point(
+                lambda value: (value * eraser_opacity + 127) // 255)
+
+        if self._stroke_base_image is not None and self._stroke_coverage is not None:
+            coverage = self._stroke_coverage.crop(box)
+            coverage = ImageChops.lighter(coverage, dab_mask)
+            self._stroke_coverage.paste(coverage, (box[0], box[1]))
+            result = self._stroke_base_image.crop(box)
+            source_alpha = result.getchannel("A")
+            result.putalpha(ImageChops.multiply(
+                source_alpha, ImageOps.invert(coverage)))
+        else:
+            result = layer.image.crop(box)
+            source_alpha = result.getchannel("A")
+            result.putalpha(ImageChops.multiply(
+                source_alpha, ImageOps.invert(dab_mask)))
+
         layer.image.paste(result, (box[0], box[1]))
         return box
 
@@ -2283,9 +2447,14 @@ class PaintApp:
             ys = [point[1] for point in shifted]
             bounds = (min(xs), min(ys), max(xs), max(ys))
             if self.tool == "eraser":
-                layer.draw.polygon(shifted, fill=color)
-                dirty_box = (bounds[0], bounds[1],
-                             bounds[2] + 1, bounds[3] + 1)
+                dirty_box = self._erase_brush_shape(
+                    layer,
+                    bounds,
+                    lambda draw, left, top, scale, points=shifted: draw.polygon(
+                        [((x - left + 0.5) * scale,
+                          (y - top + 0.5) * scale)
+                         for x, y in points], fill=255),
+                )
             else:
                 dirty_box = self._paint_brush_shape(
                     layer,
@@ -2350,25 +2519,32 @@ class PaintApp:
             # the pointer's fractional document coordinate.  Snapping it to a
             # point first would throw away the subpixel position and give the
             # main pixel the same alpha everywhere along a stroke.
-            if self.tool != "eraser" and self.brush_antialias_var.get():
+            if self.brush_antialias_var.get():
                 bounds = (x - radius, y - radius,
                           x + radius, y + radius)
-                dirty_box = self._paint_brush_shape(
-                    layer,
-                    bounds,
-                    color,
-                    lambda draw, left, top, scale: draw.ellipse(
-                        _brush_ellipse_box(bounds, left, top, scale),
-                        fill=255, outline=255),
-                )
+                paint_mask = lambda draw, left, top, scale: draw.ellipse(
+                    _brush_ellipse_box(bounds, left, top, scale),
+                    fill=255, outline=255)
+                if self.tool == "eraser":
+                    dirty_box = self._erase_brush_shape(
+                        layer, bounds, paint_mask)
+                else:
+                    dirty_box = self._paint_brush_shape(
+                        layer, bounds, color, paint_mask)
                 if dirty_box is not None:
                     layer.update_mipmaps(dirty_box)
                 return
 
             px, py = round(x), round(y)
             if self.tool == "eraser":
-                layer.draw.point((px, py), fill=color)
-                dirty_box = (px, py, px + 1, py + 1)
+                dirty_box = self._erase_brush_shape(
+                    layer,
+                    (px, py, px, py),
+                    lambda draw, left, top, scale: draw.rectangle(
+                        ((px - left) * scale, (py - top) * scale,
+                         (px - left + 1) * scale - 1,
+                         (py - top + 1) * scale - 1), fill=255),
+                )
             else:
                 dirty_box = self._paint_brush_shape(
                     layer,
@@ -2385,8 +2561,13 @@ class PaintApp:
         bounds = (x - raster_radius, y - raster_radius,
                   x + raster_radius, y + raster_radius)
         if self.tool == "eraser":
-            layer.draw.ellipse(bounds, fill=color, outline=color)
-            dirty_box = (bounds[0], bounds[1], bounds[2] + 1, bounds[3] + 1)
+            dirty_box = self._erase_brush_shape(
+                layer,
+                bounds,
+                lambda draw, left, top, scale: draw.ellipse(
+                    _brush_ellipse_box(bounds, left, top, scale),
+                    fill=255, outline=255),
+            )
         else:
             dirty_box = self._paint_brush_shape(
                 layer,
@@ -2463,9 +2644,9 @@ class PaintApp:
             return 2
 
     def vector_antialias_enabled(self):
-        """Capture the shared Anti-alias toggle for a new vector object."""
+        """Capture the vector Anti-alias toggle for a new vector object."""
         try:
-            return bool(self.brush_antialias_var.get())
+            return bool(self.vector_antialias_var.get())
         except (tk.TclError, AttributeError):
             return True
 
@@ -2533,6 +2714,8 @@ class PaintApp:
         self.notify_globe_document_changed()
 
     def on_mouse_up(self, event):
+        if self.tool in ("pan", "color picker"):
+            return
         x, y = self.image_coords(event.x, event.y)
         current_layer = self.layers[self.active_layer]
         
@@ -2565,6 +2748,61 @@ class PaintApp:
         self.pan_x = event.x
         self.pan_y = event.y
         self.request_redraw()
+
+    def pick_color(self, event):
+        """Sample one document pixel into the left or right color slot."""
+        image_x, image_y = self.image_coords(event.x, event.y)
+        pixel_x, pixel_y = math.floor(image_x), math.floor(image_y)
+        if not (0 <= pixel_x < self.doc_w and 0 <= pixel_y < self.doc_h):
+            return
+
+        composite = bool(event.state & 0x4)
+        if composite:  # Ctrl: sample the final visible composite.
+            for layer in self.layers:
+                if layer.visible and layer.layer_type == "vector" and layer.vector_data:
+                    layer.render_vector()
+        else:
+            layer = self.layers[self.active_layer]
+            if layer.layer_type == "vector" and layer.vector_data:
+                layer.render_vector()
+
+        if self.picker_sample_area_var.get():
+            diameter = max(1, int(self.size_var.get()))
+            radius = diameter / 2
+            center_x, center_y = pixel_x + 0.5, pixel_y + 0.5
+            left = max(0, math.floor(center_x - radius))
+            top = max(0, math.floor(center_y - radius))
+            right = min(self.doc_w, math.ceil(center_x + radius))
+            bottom = min(self.doc_h, math.ceil(center_y + radius))
+            box = (left, top, right, bottom)
+            source = (self.composite_region(box) if composite
+                      else layer.image.crop(box))
+            totals = [0, 0, 0, 0]
+            count = 0
+            radius_squared = radius * radius
+            for y in range(top, bottom):
+                for x in range(left, right):
+                    if ((x + 0.5 - center_x) ** 2 +
+                            (y + 0.5 - center_y) ** 2 > radius_squared):
+                        continue
+                    sample = source.getpixel((x - left, y - top))
+                    for channel in range(4):
+                        totals[channel] += sample[channel]
+                    count += 1
+            rgba = tuple(round(total / count) for total in totals)
+        elif composite:
+            rgba = self.composite_region(
+                (pixel_x, pixel_y, pixel_x + 1, pixel_y + 1)).getpixel((0, 0))
+        else:
+            rgba = layer.image.getpixel((pixel_x, pixel_y))
+
+        self.active_color_slot = (
+            "secondary" if self.last_button == 3 else "primary")
+        if self.active_color_slot == "primary":
+            self.primary_opacity = rgba[3]
+        else:
+            self.secondary_opacity = rgba[3]
+        self._set_selected_color(self._rgb_to_hex(rgba[:3]))
 
     def zoom_mouse(self, event):
         old = self.zoom
@@ -2797,6 +3035,35 @@ class PaintApp:
 
         # Draw brush cursor for raster layers
         current_layer = self.layers[self.active_layer]
+        if self.tool == "color picker":
+            if self.picker_sample_area_var.get():
+                image_x, image_y = self.image_coords(self.mouse_x, self.mouse_y)
+                pixel_x, pixel_y = math.floor(image_x), math.floor(image_y)
+                if 0 <= pixel_x < self.doc_w and 0 <= pixel_y < self.doc_h:
+                    diameter = max(1, round(int(self.size_var.get()) * self.zoom))
+                    if diameter != self._brush_cursor_diameter:
+                        cursor_image = self._brush_cursor_source.resize(
+                            (diameter, diameter), Image.Resampling.LANCZOS)
+                        self._brush_cursor_tkimg = ImageTk.PhotoImage(cursor_image)
+                        self._brush_cursor_diameter = diameter
+                    center_x, center_y = self.screen_coords(
+                        pixel_x + 0.5, pixel_y + 0.5)
+                    self.canvas.create_image(
+                        center_x, center_y, image=self._brush_cursor_tkimg,
+                        anchor="center", tags=("overlay",))
+            else:
+                image_x, image_y = self.image_coords(self.mouse_x, self.mouse_y)
+                pixel_x, pixel_y = math.floor(image_x), math.floor(image_y)
+                if 0 <= pixel_x < self.doc_w and 0 <= pixel_y < self.doc_h:
+                    x0, y0 = self.screen_coords(pixel_x, pixel_y)
+                    x1, y1 = self.screen_coords(pixel_x + 1, pixel_y + 1)
+                    self.canvas.create_rectangle(
+                        x0, y0, x1, y1, outline="black", width=3,
+                        tags=("overlay",))
+                    self.canvas.create_rectangle(
+                        x0, y0, x1, y1, outline="white", width=1,
+                        tags=("overlay",))
+
         if (current_layer.is_raster and
                 self.tool in ("brush", "eraser") and
                 0 <= self.mouse_x < cw and 0 <= self.mouse_y < ch):
