@@ -913,7 +913,9 @@ class PaintApp:
         self.active_view = None
 
         flat_view = tk.Frame(self.view_host)
-        self.canvas = tk.Canvas(flat_view, bg="gray25")
+        # Use a centered plus pointer so brush/eraser strokes land at the
+        # intersection while the separate overlay still shows brush size.
+        self.canvas = tk.Canvas(flat_view, bg="gray25", cursor="crosshair")
         self.canvas.pack(fill="both", expand=True)
         self.register_view("main", "Main", flat_view, closable=False)
 
@@ -2027,6 +2029,14 @@ class PaintApp:
         return ((sx - self.offset_x) / self.zoom,
                 (sy - self.offset_y) / self.zoom)
 
+    def raster_image_coords(self, sx, sy):
+        """Map a screen point to Pillow's pixel-centre coordinate system."""
+        x, y = self.image_coords(sx, sy)
+        # image_coords() maps to pixel boundaries (pixel 0 spans 0..1), while
+        # Pillow's raster primitives address pixel centres at integer values.
+        # Without this conversion every dab is biased half a pixel right/down.
+        return x - 0.5, y - 0.5
+
     def screen_coords(self, ix, iy):
         return (ix * self.zoom + self.offset_x,
                 iy * self.zoom + self.offset_y)
@@ -2046,7 +2056,7 @@ class PaintApp:
     def start_raster_draw(self, event):
         self.snapshot()
         self._prepare_raster_stroke()
-        self.last_x, self.last_y = self.image_coords(event.x, event.y)
+        self.last_x, self.last_y = self.raster_image_coords(event.x, event.y)
         # Stamp the initial point immediately so a click/tap without any
         # motion produces a dot, just as it does in the globe view.
         self.raster_paint_image(self.last_x, self.last_y)
@@ -2296,7 +2306,7 @@ class PaintApp:
 
     def raster_paint(self, event):
 
-        x, y = self.image_coords(
+        x, y = self.raster_image_coords(
             event.x,
             event.y
         )
@@ -2706,11 +2716,21 @@ class PaintApp:
         # Static checkerboard backdrop - only behind the document's on-screen
         # footprint (so the canvas's own blank-area color still shows through
         # everywhere else), and it never pans/zooms with the content.
-        doc_sx = max(0, int(self.offset_x + left * self.zoom))
-        doc_sy = max(0, int(self.offset_y + top * self.zoom))
-        crop = img.crop((int(left), int(top), int(right), int(bottom)))
-        sw = max(1, int((right - left) * self.zoom))
-        sh = max(1, int((bottom - top) * self.zoom))
+        # Crop on document-pixel boundaries and position that same boundary
+        # through the screen transform.  Mixing a truncated source crop with
+        # the fractional visible bounds shifts painted pixels away from the
+        # pointer after panning or at fractional zoom levels.
+        crop_left = max(0, math.floor(left))
+        crop_top = max(0, math.floor(top))
+        crop_right = min(self.doc_w, math.ceil(right))
+        crop_bottom = min(self.doc_h, math.ceil(bottom))
+        sx = self.offset_x + crop_left * self.zoom
+        sy = self.offset_y + crop_top * self.zoom
+        doc_sx = math.floor(sx)
+        doc_sy = math.floor(sy)
+        crop = img.crop((crop_left, crop_top, crop_right, crop_bottom))
+        sw = max(1, round((crop_right - crop_left) * self.zoom))
+        sh = max(1, round((crop_bottom - crop_top) * self.zoom))
         crop = crop.resize((sw, sh), Image.Resampling.NEAREST)
 
         # Keep the backdrop and document in one tracked canvas item.  The old
@@ -2721,8 +2741,6 @@ class PaintApp:
         checker.alpha_composite(crop)
         self.tkimg = ImageTk.PhotoImage(checker.convert("RGB"))
         
-        sx = self.offset_x + left * self.zoom
-        sy = self.offset_y + top * self.zoom
         self._canvas_image_id = self.canvas.create_image(
             sx, sy, image=self.tkimg, anchor="nw")
 
@@ -2751,20 +2769,23 @@ class PaintApp:
         # Static checkerboard backdrop - only behind the document's on-screen
         # footprint, leaving the canvas's own blank-area color visible
         # elsewhere. Never pans/zooms with the content.
-        doc_sx = max(0, int(self.offset_x + left * self.zoom))
-        doc_sy = max(0, int(self.offset_y + top * self.zoom))
-        sw = max(1, int((right - left) * self.zoom))
-        sh = max(1, int((bottom - top) * self.zoom))
-        crop_box = (int(left), int(top), int(right), int(bottom))
+        crop_left = max(0, math.floor(left))
+        crop_top = max(0, math.floor(top))
+        crop_right = min(self.doc_w, math.ceil(right))
+        crop_bottom = min(self.doc_h, math.ceil(bottom))
+        sx = self.offset_x + crop_left * self.zoom
+        sy = self.offset_y + crop_top * self.zoom
+        doc_sx = math.floor(sx)
+        doc_sy = math.floor(sy)
+        sw = max(1, round((crop_right - crop_left) * self.zoom))
+        sh = max(1, round((crop_bottom - crop_top) * self.zoom))
+        crop_box = (crop_left, crop_top, crop_right, crop_bottom)
         crop = self.composite_region(crop_box, (sw, sh))
 
         checker = self.get_checker_backdrop_pil(cw, ch).crop(
             (doc_sx, doc_sy, doc_sx + sw, doc_sy + sh))
         checker.alpha_composite(crop)
         self.tkimg = ImageTk.PhotoImage(checker.convert("RGB"))
-
-        sx = self.offset_x + left * self.zoom
-        sy = self.offset_y + top * self.zoom
 
         if self._canvas_image_id is None:
             self._canvas_image_id = self.canvas.create_image(
