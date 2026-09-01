@@ -692,6 +692,8 @@ class PaintApp:
         self.selected_vector_obj = None
         self.selected_point_index = None
         self.is_dragging_point = False
+        self.selection_start = None
+        self.selection_bounds = None
 
         # Drag and drop variables
         self.drag_start_index = None
@@ -757,6 +759,7 @@ class PaintApp:
         tool_frame.pack(fill="x", padx=4)
 
         tools = [
+            ("Selection",  "selection",   None),
             ("Pan",        "pan",         None),
             ("Color Picker", "color picker", None),
             ("Brush",      "brush",       "brush.png"),
@@ -770,7 +773,7 @@ class PaintApp:
         self.tool_icons = {}
         self.tool_buttons = {}
         self.tools_by_layer_type = {
-            "raster": ("pan", "color picker", "brush", "eraser"),
+            "raster": ("selection", "pan", "color picker", "brush", "eraser"),
             "vector": ("pan", "color picker", "vector edit", "line", "rect", "ellipse"),
         }
         self.tool_hint_var = tk.StringVar(value="Brush")
@@ -778,7 +781,18 @@ class PaintApp:
             if filename is None:
                 icon_image = Image.new("RGBA", (32, 32), (0, 0, 0, 0))
                 icon_draw = ImageDraw.Draw(icon_image)
-                if tool == "pan":
+                if tool == "selection":
+                    icon_draw.rectangle(
+                        (5, 6, 27, 25), outline="#202020", width=2)
+                    icon_draw.rectangle(
+                        (8, 9, 24, 22), outline="#d8d8d8", width=1)
+                    # Small gaps suggest a marquee without depending on a
+                    # platform-specific dashed-line renderer.
+                    for x, y in ((5, 6), (16, 6), (27, 6), (5, 16),
+                                 (27, 16), (5, 25), (16, 25), (27, 25)):
+                        icon_draw.rectangle(
+                            (x - 1, y - 1, x + 1, y + 1), fill="#f2f2f2")
+                elif tool == "pan":
                     icon_draw.line((6, 16, 26, 16), fill="#202020", width=3)
                     icon_draw.line((16, 6, 16, 26), fill="#202020", width=3)
                     icon_draw.polygon((3, 16, 9, 11, 9, 21), fill="#202020")
@@ -802,8 +816,10 @@ class PaintApp:
                 command=lambda t=tool: self.set_tool(t),
                 relief="sunken" if tool == self.tool else "raised",
                 takefocus=True)
-            # Column 1 is intentionally left open for per-tool settings.
-            button.grid(row=index, column=0, padx=2, pady=2, sticky="w")
+            if tool == "selection":
+                button.grid(row=0, column=1, padx=2, pady=2, sticky="w")
+            else:
+                button.grid(row=index - 1, column=0, padx=2, pady=2, sticky="w")
             button.bind(
                 "<Enter>",
                 lambda event, name=label: self.tool_hint_var.set(name))
@@ -813,47 +829,8 @@ class PaintApp:
             self.tool_buttons[tool] = button
         self.brush_build_up_var = tk.BooleanVar(value=False)
         self.brush_antialias_var = tk.BooleanVar(value=True)
-        self.brush_settings_frame = tk.Frame(tool_frame)
-        # The two controls span the Brush and Eraser rows. Keeping them out of
-        # one individual row prevents the tool buttons below from jumping when
-        # this panel is shown or hidden.
-        self.brush_settings_frame.grid(
-            row=2, column=1, rowspan=2, sticky="nw", padx=(4, 0))
-        tk.Checkbutton(
-            self.brush_settings_frame,
-            text="Build up",
-            variable=self.brush_build_up_var,
-            anchor="w",
-        ).pack(anchor="w")
-        tk.Checkbutton(
-            self.brush_settings_frame,
-            text="Anti-alias",
-            variable=self.brush_antialias_var,
-            anchor="w",
-        ).pack(anchor="w")
-
         self.picker_sample_area_var = tk.BooleanVar(value=False)
-        self.picker_settings_frame = tk.Frame(tool_frame)
-        self.picker_settings_frame.grid(
-            row=1, column=1, sticky="w", padx=(4, 0))
-        tk.Checkbutton(
-            self.picker_settings_frame,
-            text="Sample area",
-            variable=self.picker_sample_area_var,
-            command=self.update_tool_settings_visibility,
-            anchor="w",
-        ).pack(anchor="w")
-
         self.vector_antialias_var = tk.BooleanVar(value=True)
-        self.vector_settings_frame = tk.Frame(tool_frame)
-        self.vector_settings_frame.grid(
-            row=5, column=1, rowspan=3, sticky="nw", padx=(4, 0))
-        tk.Checkbutton(
-            self.vector_settings_frame,
-            text="Anti-alias",
-            variable=self.vector_antialias_var,
-            anchor="w",
-        ).pack(anchor="w")
         tk.Label(left, textvariable=self.tool_hint_var).pack(pady=(2, 0))
 
         # ── Color Selector ─────────────────────────────────────────────
@@ -921,21 +898,7 @@ class PaintApp:
 
         self._sync_picker_to_active_color()
 
-        # Size is shared by tools, so it remains below the tool column.  The
-        # second column stays available for future per-tool settings.
-        self.size_frame = tk.Frame(tool_frame)
-        # Span both columns so this wider row does not widen the button column
-        # and push the adjacent per-tool settings to the right.
-        self.size_frame.grid(
-            row=len(tools), column=0, columnspan=2, sticky="w",
-            padx=2, pady=(6, 2))
-
-        tk.Label(self.size_frame, text="Size:").pack(side="left")
-
         self.size_var = tk.StringVar(value="2")
-        self.size_entry = tk.Entry(
-            self.size_frame, width=6, textvariable=self.size_var)
-        self.size_entry.pack(side="left", padx=4)
 
         # Update size when Enter is pressed or focus is lost
         def update_size(event=None):
@@ -943,14 +906,27 @@ class PaintApp:
                 val = int(self.size_var.get())
                 if val < 1:
                     val = 1
-                elif val > 100:
-                    val = 100
+                elif val > 999:
+                    val = 999
                 self.size_var.set(str(val))
             except ValueError:
                 self.size_var.set("2")  # revert to default on invalid input
 
-        self.size_entry.bind("<Return>", update_size)
-        self.size_entry.bind("<FocusOut>", update_size)
+        def adjust_size(delta):
+            """Adjust tool size by delta while preserving its valid range."""
+            try:
+                current = int(self.size_var.get())
+            except ValueError:
+                current = 2
+            self.size_var.set(str(max(1, min(999, current + delta))))
+            self.request_redraw()
+
+        def adjust_size_with_control(delta):
+            def handler(event):
+                adjust_size(delta * 5)
+                # Suppress the button's normal command for this click.
+                return "break"
+            return handler
 
         # ── Centre: reusable view workspace ──────────────────────────────
         # Tools and layers live outside this frame, so every view shares them.
@@ -959,6 +935,72 @@ class PaintApp:
 
         self.view_tabs = tk.Frame(self.view_workspace, bd=1, relief="raised")
         self.view_tabs.pack(side="top", fill="x")
+
+        # Keep tool settings in a stable horizontal strip below the view tabs.
+        # The fixed-height outer frame remains visible even for tools without
+        # options, preventing the canvas from changing size as tools change.
+        self.tool_settings_bar = tk.Frame(
+            self.view_workspace, height=44, bd=1, relief="groove")
+        self.tool_settings_bar.pack(side="top", fill="x")
+        self.tool_settings_bar.pack_propagate(False)
+        tk.Label(
+            self.tool_settings_bar, text="Tool settings:",
+            font=("TkDefaultFont", 9, "bold")
+        ).pack(side="left", padx=(8, 10))
+
+        self.size_frame = tk.Frame(self.tool_settings_bar)
+        self.size_label = tk.Label(self.size_frame, text="Size:")
+        self.size_label.pack(side="left")
+        self.size_entry = tk.Entry(
+            self.size_frame, width=6, textvariable=self.size_var)
+        self.size_entry.pack(side="left", padx=(4, 3))
+        self.size_entry.bind("<Return>", update_size)
+        self.size_entry.bind("<FocusOut>", update_size)
+        self.size_minus_button = tk.Button(
+            self.size_frame, text="−", width=2,
+            command=lambda: adjust_size(-1))
+        self.size_minus_button.pack(side="left")
+        self.size_minus_button.bind(
+            "<Control-Button-1>", adjust_size_with_control(-1))
+        self.size_plus_button = tk.Button(
+            self.size_frame, text="+", width=2,
+            command=lambda: adjust_size(1))
+        self.size_plus_button.pack(side="left", padx=(2, 10))
+        self.size_plus_button.bind(
+            "<Control-Button-1>", adjust_size_with_control(1))
+
+        def scroll_size(event):
+            if event.delta:
+                adjust_size(1 if event.delta > 0 else -1)
+            return "break"
+
+        for widget in (self.size_frame, self.size_label, self.size_entry,
+                       self.size_minus_button, self.size_plus_button):
+            widget.bind("<MouseWheel>", scroll_size)
+
+        self.brush_settings_frame = tk.Frame(self.tool_settings_bar)
+        tk.Checkbutton(
+            self.brush_settings_frame, text="Build up",
+            variable=self.brush_build_up_var
+        ).pack(side="left", padx=(0, 8))
+        tk.Checkbutton(
+            self.brush_settings_frame, text="Anti-alias",
+            variable=self.brush_antialias_var
+        ).pack(side="left")
+
+        self.picker_settings_frame = tk.Frame(self.tool_settings_bar)
+        tk.Checkbutton(
+            self.picker_settings_frame, text="Sample area",
+            variable=self.picker_sample_area_var,
+            command=self.update_tool_settings_visibility
+        ).pack(side="left")
+
+        self.vector_settings_frame = tk.Frame(self.tool_settings_bar)
+        tk.Checkbutton(
+            self.vector_settings_frame, text="Anti-alias",
+            variable=self.vector_antialias_var
+        ).pack(side="left")
+
         self.view_host = tk.Frame(self.view_workspace)
         self.view_host.pack(side="top", fill="both", expand=True)
 
@@ -986,6 +1028,7 @@ class PaintApp:
         self.canvas.bind("<Control-MouseWheel>", self.zoom_mouse)  # Ctrl+scroll for zoom
         # Hotkeys
         self.canvas.bind("p", lambda e: self.set_tool("pan"))
+        self.canvas.bind("s", lambda e: self.set_tool("selection"))
         self.canvas.bind("i", lambda e: self.set_tool("color picker"))
         self.canvas.bind("b", lambda e: self.set_tool("brush"))
         self.canvas.bind("e", lambda e: self.set_tool("eraser"))
@@ -993,10 +1036,17 @@ class PaintApp:
         self.canvas.bind("l", lambda e: self.set_tool("line"))
         self.canvas.bind("r", lambda e: self.set_tool("rect"))
         self.canvas.bind("o", lambda e: self.set_tool("ellipse"))
+        self.canvas.bind("<KeyPress-plus>", lambda e: adjust_size(1))
+        self.canvas.bind("<KeyPress-equal>", lambda e: adjust_size(1))
+        self.canvas.bind("<Shift-KeyPress-equal>", lambda e: adjust_size(1))
+        self.canvas.bind("<KeyPress-minus>", lambda e: adjust_size(-1))
+        self.canvas.bind("<KeyPress-KP_Add>", lambda e: adjust_size(1))
+        self.canvas.bind("<KeyPress-KP_Subtract>", lambda e: adjust_size(-1))
         self.canvas.bind("<Control-z>", lambda e: self.undo())
         self.canvas.bind("<Control-s>", lambda e: self.save_project())
         self.canvas.bind("<Control-n>", lambda e: self.new_project())
         self.canvas.focus_set()
+        self.update_tool_settings_visibility()
         self.switch_view("main")
 
         # ── Right panel: layers ───────────────────────────────────────────
@@ -1795,29 +1845,23 @@ class PaintApp:
         if not hasattr(self, "size_frame"):
             return
 
-        if self.tool == "color picker":
-            self.picker_settings_frame.grid()
-        else:
-            self.picker_settings_frame.grid_remove()
+        for frame in (self.size_frame, self.picker_settings_frame,
+                      self.brush_settings_frame, self.vector_settings_frame):
+            frame.pack_forget()
 
-        if (self.tool in ("brush", "eraser") and self.layers and
-                self.layers[self.active_layer].is_raster):
-            self.brush_settings_frame.grid()
-        else:
-            self.brush_settings_frame.grid_remove()
-
-        if self.tool in ("line", "rect", "ellipse"):
-            self.vector_settings_frame.grid()
-        else:
-            self.vector_settings_frame.grid_remove()
-
-        uses_size = (self.tool != "pan" and
+        uses_size = (self.tool not in ("pan", "selection") and
                      (self.tool != "color picker" or
                       self.picker_sample_area_var.get()))
         if uses_size:
-            self.size_frame.grid()
-        else:
-            self.size_frame.grid_remove()
+            self.size_frame.pack(side="left")
+
+        if self.tool == "color picker":
+            self.picker_settings_frame.pack(side="left")
+        elif (self.tool in ("brush", "eraser") and self.layers and
+              self.layers[self.active_layer].is_raster):
+            self.brush_settings_frame.pack(side="left")
+        elif self.tool in ("line", "rect", "ellipse"):
+            self.vector_settings_frame.pack(side="left")
         self.request_redraw()
 
     def add_layer(self, layer_type="raster"):
@@ -2171,6 +2215,12 @@ class PaintApp:
             self.pick_color(event)
             return
         x, y = self.image_coords(event.x, event.y)
+        if self.tool == "selection":
+            if event.num == 1:
+                self.selection_start = (x, y)
+                self.selection_bounds = (x, y, x, y)
+                self.request_redraw()
+            return
         current_layer = self.layers[self.active_layer]
         
         if current_layer.is_raster:
@@ -2217,6 +2267,12 @@ class PaintApp:
             self.pick_color(event)
             return
         x, y = self.image_coords(event.x, event.y)
+        if self.tool == "selection":
+            if self.selection_start is not None:
+                start_x, start_y = self.selection_start
+                self.selection_bounds = (start_x, start_y, x, y)
+                self.request_redraw()
+            return
         current_layer = self.layers[self.active_layer]
         
         if current_layer.is_raster:
@@ -2293,18 +2349,82 @@ class PaintApp:
         self._stroke_base_image = None
         self._stroke_coverage = None
 
+    def _selection_pixel_box(self):
+        """Return the active selection as an integer pixel-boundary box."""
+        if self.selection_bounds is None:
+            return None
+
+        left, top, right, bottom = self.selection_bounds
+        # A pixel belongs to the selection when its center lies within the
+        # marquee. This keeps clipping aligned with the displayed boundary at
+        # every zoom level, including selections made at fractional positions.
+        return (math.ceil(left - 0.5), math.ceil(top - 0.5),
+                math.floor(right - 0.5) + 1,
+                math.floor(bottom - 0.5) + 1)
+
+    def _selection_mask_for_box(self, box):
+        """Build a selection mask local to a document-space patch box."""
+        mask = Image.new("L", (box[2] - box[0], box[3] - box[1]), 0)
+        selection_box = self._selection_pixel_box()
+        if selection_box is None:
+            return Image.new("L", mask.size, 255)
+
+        clip_left = max(box[0], selection_box[0])
+        clip_top = max(box[1], selection_box[1])
+        clip_right = min(box[2], selection_box[2])
+        clip_bottom = min(box[3], selection_box[3])
+        if clip_right > clip_left and clip_bottom > clip_top:
+            ImageDraw.Draw(mask).rectangle(
+                (clip_left - box[0], clip_top - box[1],
+                 clip_right - box[0] - 1, clip_bottom - box[1] - 1),
+                fill=255)
+        return mask
+
+    def apply_raster_result(self, layer, result, box=None, mask=None):
+        """Apply a raster tool's result through the active selection.
+
+        This is the common write boundary for raster tools and image-wide
+        functions. ``result`` may be a full document image or a patch matching
+        ``box``. An optional tool mask is combined with the selection mask.
+        New raster operations should use this method instead of writing or
+        pasting directly into ``layer.image``.
+        """
+        if box is None:
+            box = (0, 0, self.doc_w, self.doc_h)
+        expected_size = (box[2] - box[0], box[3] - box[1])
+        if result.size != expected_size:
+            raise ValueError("Raster result size must match its destination box")
+
+        write_mask = self._selection_mask_for_box(box)
+        if mask is not None:
+            if mask.size != expected_size:
+                raise ValueError("Raster edit mask must match its destination box")
+            write_mask = ImageChops.multiply(write_mask, mask.convert("L"))
+        layer.image.paste(result, (box[0], box[1]), write_mask)
+        return write_mask.getbbox() is not None
+
+    def _clip_raster_mask_to_selection(self, box, mask):
+        """Restrict a raster tool mask to the active selection."""
+        return ImageChops.multiply(mask, self._selection_mask_for_box(box))
+
     def _paint_brush_shape(self, layer, bounds, color, paint_mask):
         """Paint one dab, optionally capping coverage for the current stroke."""
         antialias = self.brush_antialias_var.get()
-        if self._stroke_base_image is None or self._stroke_coverage is None:
-            return _composite_brush_shape(
-                layer.image, bounds, color, paint_mask,
-                antialias=antialias)
-
         box, dab_mask = _brush_shape_mask(
             layer.image, bounds, paint_mask, antialias=antialias)
         if box is None:
             return None
+        dab_mask = self._clip_raster_mask_to_selection(box, dab_mask)
+
+        if self._stroke_base_image is None or self._stroke_coverage is None:
+            source = Image.new("RGBA", dab_mask.size, color)
+            source.putalpha(ImageChops.multiply(
+                source.getchannel("A"), dab_mask))
+            result = layer.image.crop(box)
+            result.alpha_composite(source)
+            self.apply_raster_result(layer, result, box)
+            return box
+
         coverage = self._stroke_coverage.crop(box)
         coverage = ImageChops.lighter(coverage, dab_mask)
         self._stroke_coverage.paste(coverage, (box[0], box[1]))
@@ -2313,7 +2433,7 @@ class PaintApp:
         source = Image.new("RGBA", coverage.size, color)
         source.putalpha(ImageChops.multiply(source.getchannel("A"), coverage))
         result.alpha_composite(source)
-        layer.image.paste(result, (box[0], box[1]))
+        self.apply_raster_result(layer, result, box)
         return box
 
     def _erase_brush_shape(self, layer, bounds, paint_mask):
@@ -2323,6 +2443,7 @@ class PaintApp:
             antialias=self.brush_antialias_var.get())
         if box is None:
             return None
+        dab_mask = self._clip_raster_mask_to_selection(box, dab_mask)
 
         # Eraser strength follows the opacity of the color slot associated
         # with the mouse button, just like Brush chooses its paint opacity.
@@ -2346,7 +2467,7 @@ class PaintApp:
             result.putalpha(ImageChops.multiply(
                 source_alpha, ImageOps.invert(dab_mask)))
 
-        layer.image.paste(result, (box[0], box[1]))
+        self.apply_raster_result(layer, result, box)
         return box
 
 
@@ -2639,7 +2760,7 @@ class PaintApp:
     def vector_line_width(self):
         """Return the shared Size control as a valid vector stroke width."""
         try:
-            return max(1, min(100, int(self.size_var.get())))
+            return max(1, min(999, int(self.size_var.get())))
         except (tk.TclError, ValueError):
             return 2
 
@@ -2717,6 +2838,21 @@ class PaintApp:
         if self.tool in ("pan", "color picker"):
             return
         x, y = self.image_coords(event.x, event.y)
+        if self.tool == "selection":
+            if self.selection_start is not None:
+                start_x, start_y = self.selection_start
+                left, right = sorted((start_x, x))
+                top, bottom = sorted((start_y, y))
+                left = max(0, min(self.doc_w, left))
+                right = max(0, min(self.doc_w, right))
+                top = max(0, min(self.doc_h, top))
+                bottom = max(0, min(self.doc_h, bottom))
+                self.selection_bounds = ((left, top, right, bottom)
+                                         if right - left >= 1 and bottom - top >= 1
+                                         else None)
+                self.selection_start = None
+                self.request_redraw()
+            return
         current_layer = self.layers[self.active_layer]
         
         if current_layer.is_raster:
@@ -3087,6 +3223,21 @@ class PaintApp:
                     self.canvas.create_rectangle(sx - 3, sy - 3, sx + 3, sy + 3,
                                                outline="cyan", fill="cyan", width=1,
                                                tags=("overlay",))
+
+        # A raster selection is document-space state, so it stays aligned as
+        # the canvas pans and zooms. Draw a contrasting marquee over the image.
+        if current_layer.is_raster and self.selection_bounds is not None:
+            left, top, right, bottom = self.selection_bounds
+            x0, y0 = self.screen_coords(left, top)
+            x1, y1 = self.screen_coords(right, bottom)
+            x0, x1 = sorted((x0, x1))
+            y0, y1 = sorted((y0, y1))
+            self.canvas.create_rectangle(
+                x0, y0, x1, y1, outline="black", width=3,
+                dash=(4, 4), tags=("overlay",))
+            self.canvas.create_rectangle(
+                x0, y0, x1, y1, outline="white", width=1,
+                dash=(4, 4), tags=("overlay",))
 
 
 if __name__ == "__main__":
