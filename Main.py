@@ -694,17 +694,25 @@ class PaintApp:
         self.is_dragging_point = False
         self.selection_start = None
         self.selection_bounds = None
+        self.selection_mask = Image.new("L", (self.doc_w, self.doc_h), 0)
+        self.selection_operation = None
+        self.selection_base_mask = None
+        self.selection_edges = []
         self.selection_dash_offset = 0
         self.selection_animation_id = None
         self.move_start = None
         self.move_source_box = None
         self.move_pixels = None
+        self.move_mask = None
         self.move_base_image = None
         self.move_selection_bounds = None
         self.move_offset = (0, 0)
         self.move_drag_origin_offset = (0, 0)
         self.selection_move_start = None
         self.selection_move_bounds = None
+        self.selection_move_mask = None
+        self.selection_brush_last = None
+        self.selection_brush_remove = False
 
         # Drag and drop variables
         self.drag_start_index = None
@@ -771,6 +779,7 @@ class PaintApp:
 
         tools = [
             ("Selection",  "selection",   None),
+            ("Brush Selection", "brush selection", None),
             ("Move",       "move",        None),
             ("Move Selection", "move selection", None),
             ("Pan",        "pan",         None),
@@ -786,8 +795,9 @@ class PaintApp:
         self.tool_icons = {}
         self.tool_buttons = {}
         self.tools_by_layer_type = {
-            "raster": ("selection", "move", "move selection", "pan",
-                       "color picker", "brush", "eraser"),
+            "raster": ("selection", "move", "move selection",
+                       "brush selection", "pan", "color picker", "brush",
+                       "eraser"),
             "vector": ("pan", "color picker", "vector edit", "line", "rect", "ellipse"),
         }
         self.tool_hint_var = tk.StringVar(value="Brush")
@@ -818,6 +828,11 @@ class PaintApp:
                     icon_draw.line((16, 17, 27, 28), fill="#787878", width=2)
                     icon_draw.polygon(
                         (28, 29, 21, 27, 27, 21), fill="#787878")
+                elif tool == "brush selection":
+                    icon_draw.ellipse(
+                        (5, 5, 25, 25), outline="#202020", width=2)
+                    icon_draw.ellipse((11, 11, 19, 19), fill="#787878")
+                    icon_draw.line((22, 22, 28, 28), fill="#202020", width=3)
                 elif tool == "pan":
                     icon_draw.line((6, 16, 26, 16), fill="#202020", width=3)
                     icon_draw.line((16, 6, 16, 26), fill="#202020", width=3)
@@ -845,11 +860,13 @@ class PaintApp:
             if tool == "selection":
                 button.grid(row=0, column=1, padx=2, pady=2, sticky="w")
             elif tool == "move":
-                button.grid(row=1, column=1, padx=2, pady=2, sticky="w")
-            elif tool == "move selection":
                 button.grid(row=2, column=1, padx=2, pady=2, sticky="w")
+            elif tool == "move selection":
+                button.grid(row=3, column=1, padx=2, pady=2, sticky="w")
+            elif tool == "brush selection":
+                button.grid(row=1, column=1, padx=2, pady=2, sticky="w")
             else:
-                button.grid(row=index - 3, column=0, padx=2, pady=2, sticky="w")
+                button.grid(row=index - 4, column=0, padx=2, pady=2, sticky="w")
             button.bind(
                 "<Enter>",
                 lambda event, name=label: self.tool_hint_var.set(name))
@@ -1058,7 +1075,7 @@ class PaintApp:
         self.canvas.bind("<Control-MouseWheel>", self.zoom_mouse)  # Ctrl+scroll for zoom
         # Hotkeys
         self.canvas.bind("p", lambda e: self.set_tool("pan"))
-        self.canvas.bind("s", lambda e: self.set_tool("selection"))
+        self.canvas.bind("s", self.select_selection_tool)
         self.canvas.bind("m", self.select_move_tool)
         self.canvas.bind("i", lambda e: self.set_tool("color picker"))
         self.canvas.bind("b", lambda e: self.set_tool("brush"))
@@ -1671,6 +1688,8 @@ class PaintApp:
         self.active_layer = 0
         self.current_file = None
         self.undo_stack = []
+        self.selection_mask = Image.new("L", (self.doc_w, self.doc_h), 0)
+        self._update_selection_geometry()
         self.refresh_layers()
         self.redraw()
         self.update_title()
@@ -1829,6 +1848,8 @@ class PaintApp:
     def _finish_open(self):
         """Refresh shared UI state after either kind of file is opened."""
         self.undo_stack = []
+        self.selection_mask = Image.new("L", (self.doc_w, self.doc_h), 0)
+        self._update_selection_geometry()
         self.refresh_layers()
         self.redraw()
         self.update_title()
@@ -1843,6 +1864,8 @@ class PaintApp:
         if tool != self.tool:
             self._finish_selection_move()
             self._finish_selection_boundary_move()
+            self.selection_brush_last = None
+            self.selection_brush_remove = False
         self.tool = tool
         if hasattr(self, "canvas"):
             cursor = ("fleur" if tool in ("pan", "move", "move selection")
@@ -1865,6 +1888,12 @@ class PaintApp:
     def select_move_tool(self, event=None):
         """Select Move, or Move Selection when Move is already active."""
         next_tool = "move selection" if self.tool == "move" else "move"
+        self.set_tool(next_tool)
+
+    def select_selection_tool(self, event=None):
+        """Select Selection, or Brush Selection when it is already active."""
+        next_tool = ("brush selection" if self.tool == "selection"
+                     else "selection")
         self.set_tool(next_tool)
 
     def update_tools_for_active_layer(self):
@@ -2270,9 +2299,15 @@ class PaintApp:
             return
         x, y = self.image_coords(event.x, event.y)
         if self.tool == "selection":
-            if event.num == 1:
+            control_down = bool(event.state & 0x4)
+            operation = ("subtract" if control_down and event.num == 3 else
+                         "add" if control_down and event.num == 1 else
+                         "replace" if event.num == 1 else None)
+            if operation is not None:
                 self.selection_start = (x, y)
                 self.selection_bounds = (x, y, x, y)
+                self.selection_operation = operation
+                self.selection_base_mask = self.selection_mask.copy()
                 self._ensure_selection_animation()
                 self.request_redraw()
             return
@@ -2283,6 +2318,13 @@ class PaintApp:
         if self.tool == "move selection":
             if event.num == 1:
                 self._start_selection_boundary_move(x, y)
+            return
+        if self.tool == "brush selection":
+            if event.num in (1, 3):
+                self.selection_brush_remove = event.num == 3
+                self.selection_brush_last = self.raster_image_coords(
+                    event.x, event.y)
+                self._paint_selection_brush(*self.selection_brush_last)
             return
         current_layer = self.layers[self.active_layer]
         
@@ -2341,6 +2383,11 @@ class PaintApp:
             return
         if self.tool == "move selection":
             self._update_selection_boundary_move(x, y)
+            return
+        if self.tool == "brush selection":
+            if self.selection_brush_last is not None:
+                brush_x, brush_y = self.raster_image_coords(event.x, event.y)
+                self._paint_selection_brush(brush_x, brush_y)
             return
         current_layer = self.layers[self.active_layer]
         
@@ -2428,8 +2475,7 @@ class PaintApp:
         """Capture the selected raster pixels for an interactive move."""
         if self.selection_bounds is None:
             return
-        left, top, right, bottom = self.selection_bounds
-        if not (left <= x <= right and top <= y <= bottom):
+        if not self._point_in_selection(x, y):
             return
 
         # A released move remains floating. Starting another drag reuses the
@@ -2454,8 +2500,12 @@ class PaintApp:
         self.move_start = (x, y)
         self.move_source_box = box
         self.move_pixels = layer.image.crop(box)
+        self.move_mask = self.selection_mask.crop(box)
+        moved_alpha = ImageChops.multiply(
+            self.move_pixels.getchannel("A"), self.move_mask)
+        self.move_pixels.putalpha(moved_alpha)
         self.move_base_image = layer.image.copy()
-        self.move_base_image.paste((0, 0, 0, 0), box)
+        self.move_base_image.paste((0, 0, 0, 0), box, self.move_mask)
         self.move_selection_bounds = self.selection_bounds
         self.move_offset = (0, 0)
         self.move_drag_origin_offset = (0, 0)
@@ -2479,9 +2529,10 @@ class PaintApp:
             self.move_pixels, (source_left + dx, source_top + dy))
         layer.reset_mipmaps()
 
-        left, top, right, bottom = self.move_selection_bounds
-        self.selection_bounds = (left + dx, top + dy,
-                                 right + dx, bottom + dy)
+        self.selection_mask = Image.new("L", (self.doc_w, self.doc_h), 0)
+        self.selection_mask.paste(
+            self.move_mask, (source_left + dx, source_top + dy))
+        self._update_selection_geometry()
         self.move_offset = (dx, dy)
         self.request_redraw()
 
@@ -2499,6 +2550,7 @@ class PaintApp:
         self.move_start = None
         self.move_source_box = None
         self.move_pixels = None
+        self.move_mask = None
         self.move_base_image = None
         self.move_selection_bounds = None
         self.move_offset = (0, 0)
@@ -2513,10 +2565,10 @@ class PaintApp:
         """Begin moving only the selection marquee, leaving pixels untouched."""
         if self.selection_bounds is None:
             return
-        left, top, right, bottom = self.selection_bounds
-        if left <= x <= right and top <= y <= bottom:
+        if self._point_in_selection(x, y):
             self.selection_move_start = (x, y)
             self.selection_move_bounds = self.selection_bounds
+            self.selection_move_mask = self.selection_mask.copy()
 
     def _update_selection_boundary_move(self, x, y):
         """Move the selection rectangle within the document bounds."""
@@ -2527,14 +2579,57 @@ class PaintApp:
         dy = round(y - self.selection_move_start[1])
         dx = max(-left, min(self.doc_w - right, dx))
         dy = max(-top, min(self.doc_h - bottom, dy))
-        self.selection_bounds = (left + dx, top + dy,
-                                 right + dx, bottom + dy)
+        self.selection_mask = Image.new("L", (self.doc_w, self.doc_h), 0)
+        self.selection_mask.paste(
+            self.selection_move_mask, (round(dx), round(dy)))
+        self._update_selection_geometry()
         self.request_redraw()
 
     def _finish_selection_boundary_move(self):
         """Finish moving the marquee without changing document pixels."""
         self.selection_move_start = None
         self.selection_move_bounds = None
+        self.selection_move_mask = None
+
+    def _paint_selection_brush(self, x, y):
+        """Add an interpolated circular brush stroke to the selection mask."""
+        try:
+            radius = max(0.5, min(999, int(self.size_var.get())) / 2)
+        except ValueError:
+            radius = 1
+        last_x, last_y = self.selection_brush_last or (x, y)
+        dx, dy = x - last_x, y - last_y
+        distance = math.hypot(dx, dy)
+        steps = max(1, math.ceil(distance / max(1, radius * 0.25)))
+
+        for index in range(steps + 1):
+            amount = index / steps
+            center_x = last_x + dx * amount
+            center_y = last_y + dy * amount
+            raster_radius = max(0, radius - 0.5)
+            bounds = (center_x - raster_radius,
+                      center_y - raster_radius,
+                      center_x + raster_radius,
+                      center_y + raster_radius)
+            box, dab = _brush_shape_mask(
+                self.selection_mask, bounds,
+                lambda draw, left, top, scale, shape=bounds: draw.ellipse(
+                    _brush_ellipse_box(shape, left, top, scale),
+                    fill=255, outline=255),
+                antialias=False)
+            if box is not None:
+                existing = self.selection_mask.crop(box)
+                if self.selection_brush_remove:
+                    combined = ImageChops.multiply(
+                        existing, ImageOps.invert(dab))
+                else:
+                    combined = ImageChops.lighter(existing, dab)
+                self.selection_mask.paste(combined, (box[0], box[1]))
+
+        self.selection_brush_last = (x, y)
+        self._update_selection_geometry()
+        self._ensure_selection_animation()
+        self.request_redraw()
 
     def _animate_selection_marquee(self):
         """Advance the selection dashes without rerendering the document."""
@@ -2556,14 +2651,14 @@ class PaintApp:
         if (self.selection_bounds is None or not self.layers or
                 not self.layers[self.active_layer].is_raster):
             return
-        left, top, right, bottom = self.selection_bounds
-        x0, y0 = self.screen_coords(left, top)
-        x1, y1 = self.screen_coords(right, bottom)
-        x0, x1 = sorted((x0, x1))
-        y0, y1 = sorted((y0, y1))
         tags = ("overlay", "selection_marquee")
-        self.canvas.create_rectangle(
-            x0, y0, x1, y1, outline="black", width=3, tags=tags)
+        edges = list(self.selection_edges)
+        if self.selection_start is not None:
+            left, top, right, bottom = self.selection_bounds
+            edges.extend(((left, top, right, top),
+                          (right, top, right, bottom),
+                          (right, bottom, left, bottom),
+                          (left, bottom, left, top)))
 
         # Draw the bright portions as actual moving segments rather than a
         # Tk dash pattern. Windows Tk can cache dashed rectangles and ignore
@@ -2591,18 +2686,16 @@ class PaintApp:
                         fill="white", width=1, tags=tags)
                 distance += period
 
-        # Orient all four edges clockwise so the segments visibly circulate.
-        draw_moving_edge(x0, y0, x1, y0)
-        draw_moving_edge(x1, y0, x1, y1)
-        draw_moving_edge(x1, y1, x0, y1)
-        draw_moving_edge(x0, y1, x0, y0)
+        for left, top, right, bottom in edges:
+            x0, y0 = self.screen_coords(left, top)
+            x1, y1 = self.screen_coords(right, bottom)
+            self.canvas.create_line(
+                x0, y0, x1, y1, fill="black", width=3, tags=tags)
+            draw_moving_edge(x0, y0, x1, y1)
 
-    def _selection_pixel_box(self):
-        """Return the active selection as an integer pixel-boundary box."""
-        if self.selection_bounds is None:
-            return None
-
-        left, top, right, bottom = self.selection_bounds
+    def _pixel_box_from_bounds(self, bounds):
+        """Convert continuous document bounds to selected pixel boundaries."""
+        left, top, right, bottom = bounds
         # A pixel belongs to the selection when its center lies within the
         # marquee. This keeps clipping aligned with the displayed boundary at
         # every zoom level, including selections made at fractional positions.
@@ -2610,23 +2703,62 @@ class PaintApp:
                 math.floor(right - 0.5) + 1,
                 math.floor(bottom - 0.5) + 1)
 
+    def _update_selection_geometry(self):
+        """Cache the exact outline segments for the current selection mask."""
+        self.selection_bounds = self.selection_mask.getbbox()
+        self.selection_edges = []
+        if self.selection_bounds is None:
+            return
+        left, top, right, bottom = self.selection_bounds
+        selected = np.asarray(
+            self.selection_mask.crop(self.selection_bounds), dtype=np.uint8) > 0
+        height, width = selected.shape
+
+        def add_runs(values, make_segment):
+            start = None
+            for index, value in enumerate(np.append(values, False)):
+                if value and start is None:
+                    start = index
+                elif not value and start is not None:
+                    self.selection_edges.append(make_segment(start, index))
+                    start = None
+
+        for row in range(height + 1):
+            above = selected[row - 1] if row > 0 else np.zeros(width, bool)
+            below = selected[row] if row < height else np.zeros(width, bool)
+            add_runs(
+                above != below,
+                lambda start, end, y=top + row:
+                    (left + start, y, left + end, y))
+        for column in range(width + 1):
+            before = (selected[:, column - 1] if column > 0
+                      else np.zeros(height, bool))
+            after = (selected[:, column] if column < width
+                     else np.zeros(height, bool))
+            add_runs(
+                before != after,
+                lambda start, end, x=left + column:
+                    (x, top + start, x, top + end))
+
+    def _selection_pixel_box(self):
+        """Return the active selection's exact nonempty pixel extent."""
+        if self.selection_mask.size != (self.doc_w, self.doc_h):
+            self.selection_mask = Image.new("L", (self.doc_w, self.doc_h), 0)
+        return self.selection_mask.getbbox()
+
+    def _point_in_selection(self, x, y):
+        """Return whether a document point lies in an actually selected pixel."""
+        pixel_x, pixel_y = math.floor(x), math.floor(y)
+        return (0 <= pixel_x < self.doc_w and 0 <= pixel_y < self.doc_h and
+                self.selection_mask.getpixel((pixel_x, pixel_y)) > 0)
+
     def _selection_mask_for_box(self, box):
         """Build a selection mask local to a document-space patch box."""
         mask = Image.new("L", (box[2] - box[0], box[3] - box[1]), 0)
         selection_box = self._selection_pixel_box()
         if selection_box is None:
             return Image.new("L", mask.size, 255)
-
-        clip_left = max(box[0], selection_box[0])
-        clip_top = max(box[1], selection_box[1])
-        clip_right = min(box[2], selection_box[2])
-        clip_bottom = min(box[3], selection_box[3])
-        if clip_right > clip_left and clip_bottom > clip_top:
-            ImageDraw.Draw(mask).rectangle(
-                (clip_left - box[0], clip_top - box[1],
-                 clip_right - box[0] - 1, clip_bottom - box[1] - 1),
-                fill=255)
-        return mask
+        return self.selection_mask.crop(box)
 
     def apply_raster_result(self, layer, result, box=None, mask=None):
         """Apply a raster tool's result through the active selection.
@@ -3095,10 +3227,30 @@ class PaintApp:
                 right = max(0, min(self.doc_w, right))
                 top = max(0, min(self.doc_h, top))
                 bottom = max(0, min(self.doc_h, bottom))
-                self.selection_bounds = ((left, top, right, bottom)
-                                         if right - left >= 1 and bottom - top >= 1
-                                         else None)
+                if right - left >= 1 and bottom - top >= 1:
+                    rectangle = Image.new(
+                        "L", (self.doc_w, self.doc_h), 0)
+                    pixel_box = self._pixel_box_from_bounds(
+                        (left, top, right, bottom))
+                    if pixel_box[2] > pixel_box[0] and pixel_box[3] > pixel_box[1]:
+                        ImageDraw.Draw(rectangle).rectangle(
+                            (pixel_box[0], pixel_box[1],
+                             pixel_box[2] - 1, pixel_box[3] - 1), fill=255)
+                    if self.selection_operation == "add":
+                        self.selection_mask = ImageChops.lighter(
+                            self.selection_base_mask, rectangle)
+                    elif self.selection_operation == "subtract":
+                        self.selection_mask = ImageChops.multiply(
+                            self.selection_base_mask, ImageOps.invert(rectangle))
+                    else:
+                        self.selection_mask = rectangle
+                elif self.selection_operation == "replace":
+                    self.selection_mask = Image.new(
+                        "L", (self.doc_w, self.doc_h), 0)
+                self._update_selection_geometry()
                 self.selection_start = None
+                self.selection_operation = None
+                self.selection_base_mask = None
                 self.request_redraw()
             return
         if self.tool == "move":
@@ -3108,6 +3260,10 @@ class PaintApp:
         if self.tool == "move selection":
             self._update_selection_boundary_move(x, y)
             self._finish_selection_boundary_move()
+            return
+        if self.tool == "brush selection":
+            self.selection_brush_last = None
+            self.selection_brush_remove = False
             return
         current_layer = self.layers[self.active_layer]
         
@@ -3457,7 +3613,7 @@ class PaintApp:
                         tags=("overlay",))
 
         if (current_layer.is_raster and
-                self.tool in ("brush", "eraser") and
+                self.tool in ("brush", "eraser", "brush selection") and
                 0 <= self.mouse_x < cw and 0 <= self.mouse_y < ch):
             diameter = max(1, round(int(self.size_var.get()) * self.zoom))
             if diameter != self._brush_cursor_diameter:
