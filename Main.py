@@ -1091,6 +1091,8 @@ class PaintApp:
         self.canvas.bind("<KeyPress-KP_Add>", lambda e: adjust_size(1))
         self.canvas.bind("<KeyPress-KP_Subtract>", lambda e: adjust_size(-1))
         self.canvas.bind("<Control-z>", lambda e: self.undo())
+        self.canvas.bind("<Control-a>", self.select_all)
+        self.canvas.bind("<Control-b>", self.zoom_to_selection)
         self.canvas.bind("<Control-s>", lambda e: self.save_project())
         self.canvas.bind("<Control-n>", lambda e: self.new_project())
         self.canvas.focus_set()
@@ -1895,6 +1897,40 @@ class PaintApp:
         next_tool = ("brush selection" if self.tool == "selection"
                      else "selection")
         self.set_tool(next_tool)
+
+    def select_all(self, event=None):
+        """Select every pixel in the document."""
+        self._finish_selection_move()
+        self._finish_selection_boundary_move()
+        self.selection_brush_last = None
+        self.selection_mask = Image.new(
+            "L", (self.doc_w, self.doc_h), 255)
+        self._update_selection_geometry()
+        self._ensure_selection_animation()
+        self.request_redraw()
+        return "break"
+
+    def zoom_to_selection(self, event=None):
+        """Fit the selection, or the full document when empty, in the canvas."""
+        bounds = self._selection_pixel_box()
+        if bounds is None:
+            bounds = (0, 0, self.doc_w, self.doc_h)
+        left, top, right, bottom = bounds
+        width = max(1, right - left)
+        height = max(1, bottom - top)
+        canvas_width = max(1, self.canvas.winfo_width())
+        canvas_height = max(1, self.canvas.winfo_height())
+        margin = 20
+        usable_width = max(1, canvas_width - margin * 2)
+        usable_height = max(1, canvas_height - margin * 2)
+        self.zoom = max(
+            0.01, min(20, usable_width / width, usable_height / height))
+        center_x = (left + right) / 2
+        center_y = (top + bottom) / 2
+        self.offset_x = canvas_width / 2 - center_x * self.zoom
+        self.offset_y = canvas_height / 2 - center_y * self.zoom
+        self.request_redraw()
+        return "break"
 
     def update_tools_for_active_layer(self):
         """Show and select only tools supported by the active layer type."""
