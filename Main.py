@@ -694,6 +694,17 @@ class PaintApp:
         self.is_dragging_point = False
         self.selection_start = None
         self.selection_bounds = None
+        self.selection_dash_offset = 0
+        self.selection_animation_id = None
+        self.move_start = None
+        self.move_source_box = None
+        self.move_pixels = None
+        self.move_base_image = None
+        self.move_selection_bounds = None
+        self.move_offset = (0, 0)
+        self.move_drag_origin_offset = (0, 0)
+        self.selection_move_start = None
+        self.selection_move_bounds = None
 
         # Drag and drop variables
         self.drag_start_index = None
@@ -760,6 +771,8 @@ class PaintApp:
 
         tools = [
             ("Selection",  "selection",   None),
+            ("Move",       "move",        None),
+            ("Move Selection", "move selection", None),
             ("Pan",        "pan",         None),
             ("Color Picker", "color picker", None),
             ("Brush",      "brush",       "brush.png"),
@@ -773,7 +786,8 @@ class PaintApp:
         self.tool_icons = {}
         self.tool_buttons = {}
         self.tools_by_layer_type = {
-            "raster": ("selection", "pan", "color picker", "brush", "eraser"),
+            "raster": ("selection", "move", "move selection", "pan",
+                       "color picker", "brush", "eraser"),
             "vector": ("pan", "color picker", "vector edit", "line", "rect", "ellipse"),
         }
         self.tool_hint_var = tk.StringVar(value="Brush")
@@ -792,6 +806,18 @@ class PaintApp:
                                  (27, 16), (5, 25), (16, 25), (27, 25)):
                         icon_draw.rectangle(
                             (x - 1, y - 1, x + 1, y + 1), fill="#f2f2f2")
+                elif tool == "move":
+                    icon_draw.rectangle(
+                        (5, 5, 20, 20), outline="#202020", width=2)
+                    icon_draw.line((14, 14, 27, 27), fill="#202020", width=3)
+                    icon_draw.polygon(
+                        (28, 28, 20, 26, 26, 20), fill="#202020")
+                elif tool == "move selection":
+                    icon_draw.rectangle(
+                        (4, 5, 20, 21), outline="#202020", width=2)
+                    icon_draw.line((16, 17, 27, 28), fill="#787878", width=2)
+                    icon_draw.polygon(
+                        (28, 29, 21, 27, 27, 21), fill="#787878")
                 elif tool == "pan":
                     icon_draw.line((6, 16, 26, 16), fill="#202020", width=3)
                     icon_draw.line((16, 6, 16, 26), fill="#202020", width=3)
@@ -818,8 +844,12 @@ class PaintApp:
                 takefocus=True)
             if tool == "selection":
                 button.grid(row=0, column=1, padx=2, pady=2, sticky="w")
+            elif tool == "move":
+                button.grid(row=1, column=1, padx=2, pady=2, sticky="w")
+            elif tool == "move selection":
+                button.grid(row=2, column=1, padx=2, pady=2, sticky="w")
             else:
-                button.grid(row=index - 1, column=0, padx=2, pady=2, sticky="w")
+                button.grid(row=index - 3, column=0, padx=2, pady=2, sticky="w")
             button.bind(
                 "<Enter>",
                 lambda event, name=label: self.tool_hint_var.set(name))
@@ -1029,6 +1059,7 @@ class PaintApp:
         # Hotkeys
         self.canvas.bind("p", lambda e: self.set_tool("pan"))
         self.canvas.bind("s", lambda e: self.set_tool("selection"))
+        self.canvas.bind("m", self.select_move_tool)
         self.canvas.bind("i", lambda e: self.set_tool("color picker"))
         self.canvas.bind("b", lambda e: self.set_tool("brush"))
         self.canvas.bind("e", lambda e: self.set_tool("eraser"))
@@ -1567,6 +1598,9 @@ class PaintApp:
             if not messagebox.askyesno("Unsaved Changes",
                                        "You have unsaved changes. Quit anyway?"):
                 return
+        if self.selection_animation_id is not None:
+            self.root.after_cancel(self.selection_animation_id)
+            self.selection_animation_id = None
         self.mipmap_executor.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
 
@@ -1614,6 +1648,8 @@ class PaintApp:
             self.undo_stack.pop(0)
 
     def undo(self):
+        self._finish_selection_move()
+        self._finish_selection_boundary_move()
         if not self.undo_stack:
             messagebox.showinfo("Undo", "Nothing to undo")
             return
@@ -1804,9 +1840,13 @@ class PaintApp:
                     self.layers[self.active_layer].layer_type]):
             return
         self._finish_raster_stroke()
+        if tool != self.tool:
+            self._finish_selection_move()
+            self._finish_selection_boundary_move()
         self.tool = tool
         if hasattr(self, "canvas"):
-            cursor = "fleur" if tool == "pan" else "crosshair"
+            cursor = ("fleur" if tool in ("pan", "move", "move selection")
+                      else "crosshair")
             try:
                 self.canvas.configure(cursor=cursor)
             except tk.TclError:
@@ -1821,6 +1861,11 @@ class PaintApp:
         self.vector_start_y = None
         self.current_vector_obj = None
         self.request_redraw()
+
+    def select_move_tool(self, event=None):
+        """Select Move, or Move Selection when Move is already active."""
+        next_tool = "move selection" if self.tool == "move" else "move"
+        self.set_tool(next_tool)
 
     def update_tools_for_active_layer(self):
         """Show and select only tools supported by the active layer type."""
@@ -1849,7 +1894,8 @@ class PaintApp:
                       self.brush_settings_frame, self.vector_settings_frame):
             frame.pack_forget()
 
-        uses_size = (self.tool not in ("pan", "selection") and
+        uses_size = (self.tool not in
+                     ("pan", "selection", "move", "move selection") and
                      (self.tool != "color picker" or
                       self.picker_sample_area_var.get()))
         if uses_size:
@@ -1865,6 +1911,8 @@ class PaintApp:
         self.request_redraw()
 
     def add_layer(self, layer_type="raster"):
+        self._finish_selection_move()
+        self._finish_selection_boundary_move()
         self.snapshot()
         name = f"{layer_type.capitalize()} Layer {len([l for l in self.layers if l.layer_type == layer_type]) + 1}"
         self.layers.append(Layer(self.doc_w, self.doc_h, name, layer_type))
@@ -1876,6 +1924,8 @@ class PaintApp:
     def delete_layer(self):
         if len(self.layers) == 1:
             return
+        self._finish_selection_move()
+        self._finish_selection_boundary_move()
         self.snapshot()
         del self.layers[self.active_layer]
         self.active_layer = max(0, self.active_layer - 1)
@@ -1915,7 +1965,11 @@ class PaintApp:
         sel = self.layer_list.selection()
         if sel:
             display_index = self.layer_list.index(sel[0])
-            self.active_layer = len(self.layers) - 1 - display_index
+            selected_layer = len(self.layers) - 1 - display_index
+            if selected_layer != self.active_layer:
+                self._finish_selection_move()
+                self._finish_selection_boundary_move()
+            self.active_layer = selected_layer
             self.update_layer_selection_style()
             self.update_tools_for_active_layer()
             self.request_redraw()
@@ -2219,7 +2273,16 @@ class PaintApp:
             if event.num == 1:
                 self.selection_start = (x, y)
                 self.selection_bounds = (x, y, x, y)
+                self._ensure_selection_animation()
                 self.request_redraw()
+            return
+        if self.tool == "move":
+            if event.num == 1:
+                self._start_selection_move(x, y)
+            return
+        if self.tool == "move selection":
+            if event.num == 1:
+                self._start_selection_boundary_move(x, y)
             return
         current_layer = self.layers[self.active_layer]
         
@@ -2272,6 +2335,12 @@ class PaintApp:
                 start_x, start_y = self.selection_start
                 self.selection_bounds = (start_x, start_y, x, y)
                 self.request_redraw()
+            return
+        if self.tool == "move":
+            self._update_selection_move(x, y)
+            return
+        if self.tool == "move selection":
+            self._update_selection_boundary_move(x, y)
             return
         current_layer = self.layers[self.active_layer]
         
@@ -2348,6 +2417,185 @@ class PaintApp:
     def _finish_raster_stroke(self):
         self._stroke_base_image = None
         self._stroke_coverage = None
+
+    def _ensure_selection_animation(self):
+        """Start the marquee timer if it is not already running."""
+        if self.selection_animation_id is None:
+            self.selection_animation_id = self.root.after(
+                70, self._animate_selection_marquee)
+
+    def _start_selection_move(self, x, y):
+        """Capture the selected raster pixels for an interactive move."""
+        if self.selection_bounds is None:
+            return
+        left, top, right, bottom = self.selection_bounds
+        if not (left <= x <= right and top <= y <= bottom):
+            return
+
+        # A released move remains floating. Starting another drag reuses the
+        # original pixels and cleared base, preserving one continuous edit.
+        if self.move_pixels is not None:
+            self.move_start = (x, y)
+            self.move_drag_origin_offset = self.move_offset
+            return
+
+        box = self._selection_pixel_box()
+        if box is None:
+            return
+        box = (max(0, box[0]), max(0, box[1]),
+               min(self.doc_w, box[2]), min(self.doc_h, box[3]))
+        if box[2] <= box[0] or box[3] <= box[1]:
+            return
+
+        layer = self.layers[self.active_layer]
+        if not layer.is_raster:
+            return
+        self.snapshot()
+        self.move_start = (x, y)
+        self.move_source_box = box
+        self.move_pixels = layer.image.crop(box)
+        self.move_base_image = layer.image.copy()
+        self.move_base_image.paste((0, 0, 0, 0), box)
+        self.move_selection_bounds = self.selection_bounds
+        self.move_offset = (0, 0)
+        self.move_drag_origin_offset = (0, 0)
+
+    def _update_selection_move(self, x, y):
+        """Preview selected pixels at the current drag position."""
+        if self.move_start is None:
+            return
+        source_left, source_top, source_right, source_bottom = \
+            self.move_source_box
+        dx = (self.move_drag_origin_offset[0] +
+              round(x - self.move_start[0]))
+        dy = (self.move_drag_origin_offset[1] +
+              round(y - self.move_start[1]))
+        dx = max(-source_left, min(self.doc_w - source_right, dx))
+        dy = max(-source_top, min(self.doc_h - source_bottom, dy))
+
+        layer = self.layers[self.active_layer]
+        layer.image.paste(self.move_base_image)
+        layer.image.alpha_composite(
+            self.move_pixels, (source_left + dx, source_top + dy))
+        layer.reset_mipmaps()
+
+        left, top, right, bottom = self.move_selection_bounds
+        self.selection_bounds = (left + dx, top + dy,
+                                 right + dx, bottom + dy)
+        self.move_offset = (dx, dy)
+        self.request_redraw()
+
+    def _release_selection_move(self):
+        """End one drag while keeping the selected pixels floating."""
+        if self.move_pixels is not None:
+            self.move_start = None
+            self.move_drag_origin_offset = self.move_offset
+
+    def _finish_selection_move(self):
+        """Finish an interactive move and release its temporary images."""
+        if self.move_pixels is None:
+            return
+        moved = self.move_offset != (0, 0)
+        self.move_start = None
+        self.move_source_box = None
+        self.move_pixels = None
+        self.move_base_image = None
+        self.move_selection_bounds = None
+        self.move_offset = (0, 0)
+        self.move_drag_origin_offset = (0, 0)
+        if not moved and self.undo_stack:
+            # Avoid adding an undo step for a click without movement.
+            self.undo_stack.pop()
+        if moved:
+            self.notify_globe_document_changed()
+
+    def _start_selection_boundary_move(self, x, y):
+        """Begin moving only the selection marquee, leaving pixels untouched."""
+        if self.selection_bounds is None:
+            return
+        left, top, right, bottom = self.selection_bounds
+        if left <= x <= right and top <= y <= bottom:
+            self.selection_move_start = (x, y)
+            self.selection_move_bounds = self.selection_bounds
+
+    def _update_selection_boundary_move(self, x, y):
+        """Move the selection rectangle within the document bounds."""
+        if self.selection_move_start is None:
+            return
+        left, top, right, bottom = self.selection_move_bounds
+        dx = round(x - self.selection_move_start[0])
+        dy = round(y - self.selection_move_start[1])
+        dx = max(-left, min(self.doc_w - right, dx))
+        dy = max(-top, min(self.doc_h - bottom, dy))
+        self.selection_bounds = (left + dx, top + dy,
+                                 right + dx, bottom + dy)
+        self.request_redraw()
+
+    def _finish_selection_boundary_move(self):
+        """Finish moving the marquee without changing document pixels."""
+        self.selection_move_start = None
+        self.selection_move_bounds = None
+
+    def _animate_selection_marquee(self):
+        """Advance the selection dashes without rerendering the document."""
+        self.selection_animation_id = None
+        if self.selection_bounds is None:
+            return
+        self.selection_dash_offset = (self.selection_dash_offset + 1) % 10
+        try:
+            # Recreate only the lightweight outline items so the animation is
+            # independent of Tk's platform-specific dashed-line repainting.
+            self.canvas.delete("selection_marquee")
+            self._draw_selection_marquee()
+        except tk.TclError:
+            return
+        self._ensure_selection_animation()
+
+    def _draw_selection_marquee(self):
+        """Draw the active selection outline over the current raster view."""
+        if (self.selection_bounds is None or not self.layers or
+                not self.layers[self.active_layer].is_raster):
+            return
+        left, top, right, bottom = self.selection_bounds
+        x0, y0 = self.screen_coords(left, top)
+        x1, y1 = self.screen_coords(right, bottom)
+        x0, x1 = sorted((x0, x1))
+        y0, y1 = sorted((y0, y1))
+        tags = ("overlay", "selection_marquee")
+        self.canvas.create_rectangle(
+            x0, y0, x1, y1, outline="black", width=3, tags=tags)
+
+        # Draw the bright portions as actual moving segments rather than a
+        # Tk dash pattern. Windows Tk can cache dashed rectangles and ignore
+        # dashoffset changes, whereas changing line coordinates always paints.
+        dash_length = 6
+        period = 10
+
+        def draw_moving_edge(start_x, start_y, end_x, end_y):
+            dx = end_x - start_x
+            dy = end_y - start_y
+            length = math.hypot(dx, dy)
+            if length <= 0:
+                return
+            unit_x, unit_y = dx / length, dy / length
+            distance = self.selection_dash_offset - period
+            while distance < length:
+                segment_start = max(0, distance)
+                segment_end = min(length, distance + dash_length)
+                if segment_end > segment_start:
+                    self.canvas.create_line(
+                        start_x + unit_x * segment_start,
+                        start_y + unit_y * segment_start,
+                        start_x + unit_x * segment_end,
+                        start_y + unit_y * segment_end,
+                        fill="white", width=1, tags=tags)
+                distance += period
+
+        # Orient all four edges clockwise so the segments visibly circulate.
+        draw_moving_edge(x0, y0, x1, y0)
+        draw_moving_edge(x1, y0, x1, y1)
+        draw_moving_edge(x1, y1, x0, y1)
+        draw_moving_edge(x0, y1, x0, y0)
 
     def _selection_pixel_box(self):
         """Return the active selection as an integer pixel-boundary box."""
@@ -2853,6 +3101,14 @@ class PaintApp:
                 self.selection_start = None
                 self.request_redraw()
             return
+        if self.tool == "move":
+            self._update_selection_move(x, y)
+            self._release_selection_move()
+            return
+        if self.tool == "move selection":
+            self._update_selection_boundary_move(x, y)
+            self._finish_selection_boundary_move()
+            return
         current_layer = self.layers[self.active_layer]
         
         if current_layer.is_raster:
@@ -3227,17 +3483,7 @@ class PaintApp:
         # A raster selection is document-space state, so it stays aligned as
         # the canvas pans and zooms. Draw a contrasting marquee over the image.
         if current_layer.is_raster and self.selection_bounds is not None:
-            left, top, right, bottom = self.selection_bounds
-            x0, y0 = self.screen_coords(left, top)
-            x1, y1 = self.screen_coords(right, bottom)
-            x0, x1 = sorted((x0, x1))
-            y0, y1 = sorted((y0, y1))
-            self.canvas.create_rectangle(
-                x0, y0, x1, y1, outline="black", width=3,
-                dash=(4, 4), tags=("overlay",))
-            self.canvas.create_rectangle(
-                x0, y0, x1, y1, outline="white", width=1,
-                dash=(4, 4), tags=("overlay",))
+            self._draw_selection_marquee()
 
 
 if __name__ == "__main__":
