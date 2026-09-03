@@ -755,6 +755,7 @@ class PaintApp:
         self.clone_stroke_source = None
         self.clone_stroke_base = None
         self.clone_stroke_coverage = None
+        self.bucket_pending = None
 
         # Drag and drop variables
         self.drag_start_index = None
@@ -768,6 +769,11 @@ class PaintApp:
         # canvas background is clicked. Treat those clicks as "click away"
         # so entries commit through their existing <FocusOut> handlers.
         self.root.bind_all("<Button-1>", self._commit_active_entry, add="+")
+        self.root.bind_all(
+            "<Button-1>", self._commit_pending_bucket_on_click, add="+")
+        self.root.bind_all(
+            "<Button-3>", self._commit_pending_bucket_on_click, add="+")
+        self.root.bind_all("<Return>", self._finish_bucket_preview, add="+")
         self.apply_ui_scale(self.ui_scale)  # A: apply 1.5× on launch
         self.refresh_layers()
         self.redraw()
@@ -790,6 +796,19 @@ class PaintApp:
         # Moving focus fires the field's FocusOut callback synchronously,
         # which validates and applies the edited value.
         self.root.focus_set()
+
+    def _commit_pending_bucket_on_click(self, event):
+        """Commit a bucket preview when clicking outside its settings."""
+        if self.bucket_pending is None:
+            return
+        if event.serial == self.bucket_pending.get("event_serial"):
+            return
+        clicked = event.widget
+        while clicked is not None:
+            if clicked == self.bucket_settings_frame:
+                return
+            clicked = getattr(clicked, "master", None)
+        self._finish_bucket_preview()
 
     def build_ui(self):
         # ── Top bar: file & edit actions ──────────────────────────────────
@@ -829,6 +848,7 @@ class PaintApp:
             ("Brush",      "brush",       "brush.png"),
             ("Eraser",     "eraser",      "eraser.png"),
             ("Clone",      "clone",       None),
+            ("Paint Bucket", "paint bucket", None),
             ("Vector Edit", "vector edit", "vector-edit.png"),
             ("Line",       "line",        "line.png"),
             ("Rectangle",  "rect",        "rect.png"),
@@ -840,7 +860,7 @@ class PaintApp:
         self.tools_by_layer_type = {
             "raster": ("selection", "move", "move selection",
                        "brush selection", "pan", "color picker", "brush",
-                       "eraser", "clone"),
+                       "eraser", "clone", "paint bucket"),
             "vector": ("pan", "color picker", "vector edit", "line", "rect", "ellipse"),
         }
         self.tool_hint_var = tk.StringVar(value="Brush")
@@ -881,6 +901,12 @@ class PaintApp:
                     icon_draw.ellipse((13, 13, 26, 26), outline="#787878", width=2)
                     icon_draw.line((17, 9, 23, 15), fill="#202020", width=2)
                     icon_draw.polygon((25, 17, 19, 15, 23, 11), fill="#202020")
+                elif tool == "paint bucket":
+                    icon_draw.polygon(
+                        (7, 12, 17, 5, 26, 15, 16, 24),
+                        outline="#202020", fill="#d8d8d8")
+                    icon_draw.line((9, 12, 18, 21), fill="#202020", width=2)
+                    icon_draw.ellipse((22, 23, 27, 29), fill="#202020")
                 elif tool == "pan":
                     icon_draw.line((6, 16, 26, 16), fill="#202020", width=3)
                     icon_draw.line((16, 6, 16, 26), fill="#202020", width=3)
@@ -924,15 +950,21 @@ class PaintApp:
             self.tool_buttons[tool] = button
         self.brush_build_up_var = tk.BooleanVar(value=False)
         self.brush_antialias_var = tk.BooleanVar(value=True)
-        self.brush_hardness_var = tk.StringVar(value="75")
+        self.brush_hardness_var = tk.IntVar(value=75)
         self.brush_spacing_var = tk.StringVar(value="12.5")
-        self.clone_antialias_var = tk.BooleanVar(value=True)
-        self.clone_build_up_var = tk.BooleanVar(value=False)
-        self.clone_hardness_var = tk.StringVar(value="75")
-        self.clone_spacing_var = tk.StringVar(value="12.5")
+        # Same-named tool options are universal. Each tool presents its own
+        # relevant controls, but all of those controls reference these shared
+        # variables and therefore stay synchronized automatically.
+        self.clone_antialias_var = self.brush_antialias_var
+        self.clone_build_up_var = self.brush_build_up_var
+        self.clone_hardness_var = self.brush_hardness_var
+        self.clone_spacing_var = self.brush_spacing_var
+        self.bucket_antialias_var = self.brush_antialias_var
+        self.bucket_hardness_var = self.brush_hardness_var
+        self.bucket_tolerance_var = tk.IntVar(value=0)
         self.picker_sample_area_var = tk.BooleanVar(value=False)
-        self.vector_antialias_var = tk.BooleanVar(value=True)
-        self.vector_hardness_var = tk.StringVar(value="75")
+        self.vector_antialias_var = self.brush_antialias_var
+        self.vector_hardness_var = self.brush_hardness_var
         tk.Label(left, textvariable=self.tool_hint_var).pack(pady=(2, 0))
 
         # ── Color Selector ─────────────────────────────────────────────
@@ -1091,11 +1123,14 @@ class PaintApp:
         ).pack(side="left")
         tk.Label(self.brush_settings_frame, text="Hardness:").pack(
             side="left", padx=(10, 3))
-        self.brush_hardness_entry = tk.Entry(
-            self.brush_settings_frame, width=4,
-            textvariable=self.brush_hardness_var)
-        self.brush_hardness_entry.pack(side="left")
-        tk.Label(self.brush_settings_frame, text="%").pack(side="left")
+        tk.Scale(
+            self.brush_settings_frame, from_=0, to=100, orient="horizontal",
+            length=110, variable=self.brush_hardness_var
+        ).pack(side="left")
+        tk.Button(
+            self.brush_settings_frame, text="Reset",
+            command=lambda: self.brush_hardness_var.set(75)
+        ).pack(side="left", padx=(3, 0))
 
         self.clone_settings_frame = tk.Frame(self.tool_settings_bar)
         tk.Checkbutton(
@@ -1108,11 +1143,43 @@ class PaintApp:
         ).pack(side="left")
         tk.Label(self.clone_settings_frame, text="Hardness:").pack(
             side="left", padx=(10, 3))
-        self.clone_hardness_entry = tk.Entry(
-            self.clone_settings_frame, width=4,
-            textvariable=self.clone_hardness_var)
-        self.clone_hardness_entry.pack(side="left")
-        tk.Label(self.clone_settings_frame, text="%").pack(side="left")
+        tk.Scale(
+            self.clone_settings_frame, from_=0, to=100, orient="horizontal",
+            length=110, variable=self.clone_hardness_var
+        ).pack(side="left")
+        tk.Button(
+            self.clone_settings_frame, text="Reset",
+            command=lambda: self.clone_hardness_var.set(75)
+        ).pack(side="left", padx=(3, 0))
+
+        self.bucket_settings_frame = tk.Frame(self.tool_settings_bar)
+        tk.Checkbutton(
+            self.bucket_settings_frame, text="Anti-alias",
+            variable=self.bucket_antialias_var,
+            command=self._refresh_bucket_preview
+        ).pack(side="left")
+        tk.Label(self.bucket_settings_frame, text="Hardness:").pack(
+            side="left", padx=(10, 3))
+        tk.Scale(
+            self.bucket_settings_frame, from_=0, to=100, orient="horizontal",
+            length=110, variable=self.bucket_hardness_var,
+            command=lambda value: self._refresh_bucket_preview()
+        ).pack(side="left")
+        tk.Button(
+            self.bucket_settings_frame, text="Reset",
+            command=self._reset_bucket_hardness
+        ).pack(side="left", padx=(3, 0))
+        tk.Label(self.bucket_settings_frame, text="Tolerance:").pack(
+            side="left", padx=(10, 3))
+        tk.Scale(
+            self.bucket_settings_frame, from_=0, to=100, orient="horizontal",
+            length=110, variable=self.bucket_tolerance_var,
+            command=lambda value: self._refresh_bucket_preview()
+        ).pack(side="left")
+        tk.Button(
+            self.bucket_settings_frame, text="Reset",
+            command=self._reset_bucket_tolerance
+        ).pack(side="left", padx=(3, 0))
         tk.Label(self.clone_settings_frame, text="Spacing:").pack(
             side="left", padx=(10, 3))
         self.clone_spacing_entry = tk.Entry(
@@ -1142,27 +1209,15 @@ class PaintApp:
         ).pack(side="left")
         tk.Label(self.vector_settings_frame, text="Hardness:").pack(
             side="left", padx=(10, 3))
-        self.vector_hardness_entry = tk.Entry(
-            self.vector_settings_frame, width=4,
-            textvariable=self.vector_hardness_var)
-        self.vector_hardness_entry.pack(side="left")
-        tk.Label(self.vector_settings_frame, text="%").pack(side="left")
-
-        def validate_hardness(variable):
-            try:
-                value = max(0, min(100, int(variable.get())))
-            except ValueError:
-                value = 75
-            variable.set(str(value))
-
-        for entry, variable in (
-                (self.brush_hardness_entry, self.brush_hardness_var),
-                (self.clone_hardness_entry, self.clone_hardness_var),
-                (self.vector_hardness_entry, self.vector_hardness_var)):
-            entry.bind("<Return>", lambda event, var=variable:
-                       validate_hardness(var))
-            entry.bind("<FocusOut>", lambda event, var=variable:
-                       validate_hardness(var))
+        tk.Scale(
+            self.vector_settings_frame, from_=0, to=100,
+            orient="horizontal", length=110,
+            variable=self.vector_hardness_var
+        ).pack(side="left")
+        tk.Button(
+            self.vector_settings_frame, text="Reset",
+            command=lambda: self.vector_hardness_var.set(75)
+        ).pack(side="left", padx=(3, 0))
 
         def validate_spacing(variable):
             try:
@@ -1213,6 +1268,7 @@ class PaintApp:
         self.canvas.bind("b", lambda e: self.set_tool("brush"))
         self.canvas.bind("e", lambda e: self.set_tool("eraser"))
         self.canvas.bind("c", lambda e: self.set_tool("clone"))
+        self.canvas.bind("f", lambda e: self.set_tool("paint bucket"))
         self.canvas.bind("v", lambda e: self.set_tool("vector edit"))
         self.canvas.bind("l", lambda e: self.set_tool("line"))
         self.canvas.bind("r", lambda e: self.set_tool("rect"))
@@ -1802,6 +1858,7 @@ class PaintApp:
             self.undo_stack.pop(0)
 
     def undo(self):
+        self._finish_bucket_preview()
         self._finish_clone_stroke()
         self._finish_selection_move()
         self._finish_selection_boundary_move()
@@ -1821,6 +1878,7 @@ class PaintApp:
             if not messagebox.askyesno("Unsaved Changes", 
                                        "You have unsaved changes. Create new project anyway?"):
                 return
+        self._finish_bucket_preview()
         
         self.layers = [Layer(self.doc_w, self.doc_h, "Background", "raster")]
         self.active_layer = 0
@@ -1836,6 +1894,7 @@ class PaintApp:
         self.notify_globe_document_changed()
 
     def save_project(self):
+        self._finish_bucket_preview()
         if self.current_file:
             self._save_to_file(self.current_file)
         else:
@@ -2004,6 +2063,7 @@ class PaintApp:
             return
         self._finish_raster_stroke()
         if tool != self.tool:
+            self._finish_bucket_preview()
             self._finish_clone_stroke()
             self._finish_selection_move()
             self._finish_selection_boundary_move()
@@ -2041,6 +2101,7 @@ class PaintApp:
 
     def select_all(self, event=None):
         """Select every pixel in the document."""
+        self._finish_bucket_preview()
         self._finish_selection_move()
         self._finish_selection_boundary_move()
         self.selection_brush_last = None
@@ -2098,11 +2159,12 @@ class PaintApp:
 
         for frame in (self.size_frame, self.picker_settings_frame,
                       self.brush_settings_frame, self.clone_settings_frame,
-                      self.vector_settings_frame):
+                      self.bucket_settings_frame, self.vector_settings_frame):
             frame.pack_forget()
 
         uses_size = (self.tool not in
-                     ("pan", "selection", "move", "move selection") and
+                     ("pan", "selection", "move", "move selection",
+                      "paint bucket") and
                      (self.tool != "color picker" or
                       self.picker_sample_area_var.get()))
         if uses_size:
@@ -2116,6 +2178,9 @@ class PaintApp:
         elif (self.tool == "clone" and self.layers and
               self.layers[self.active_layer].is_raster):
             self.clone_settings_frame.pack(side="left")
+        elif (self.tool == "paint bucket" and self.layers and
+              self.layers[self.active_layer].is_raster):
+            self.bucket_settings_frame.pack(side="left")
         elif self.tool in ("line", "rect", "ellipse"):
             self.vector_settings_frame.pack(side="left")
         self.request_redraw()
@@ -2534,6 +2599,13 @@ class PaintApp:
                 self.clone_last = (clone_x, clone_y)
                 self._paint_clone(clone_x, clone_y)
             return
+        if self.tool == "paint bucket":
+            if self.bucket_pending is not None:
+                self._finish_bucket_preview()
+                return
+            self._begin_bucket_preview(
+                math.floor(x), math.floor(y), event.num, event.serial)
+            return
         current_layer = self.layers[self.active_layer]
         
         if current_layer.is_raster:
@@ -2601,6 +2673,8 @@ class PaintApp:
             if self.clone_last is not None:
                 clone_x, clone_y = self.raster_image_coords(event.x, event.y)
                 self._paint_clone(clone_x, clone_y)
+            return
+        if self.tool == "paint bucket":
             return
         current_layer = self.layers[self.active_layer]
         
@@ -2703,6 +2777,106 @@ class PaintApp:
             return max(0.1, min(1000, float(self.clone_spacing_var.get())))
         except (tk.TclError, ValueError):
             return 12.5
+
+    def bucket_hardness(self):
+        try:
+            return max(0, min(100, int(self.bucket_hardness_var.get())))
+        except (tk.TclError, ValueError):
+            return 75
+
+    def bucket_tolerance(self):
+        try:
+            return max(0, min(100, int(self.bucket_tolerance_var.get())))
+        except (tk.TclError, ValueError):
+            return 0
+
+    def _reset_bucket_hardness(self):
+        self.bucket_hardness_var.set(75)
+        self._refresh_bucket_preview()
+
+    def _reset_bucket_tolerance(self):
+        self.bucket_tolerance_var.set(0)
+        self._refresh_bucket_preview()
+
+    def _begin_bucket_preview(self, pixel_x, pixel_y, button, event_serial=None):
+        """Start an undoable bucket preview from an untouched source image."""
+        if not (0 <= pixel_x < self.doc_w and 0 <= pixel_y < self.doc_h):
+            return
+        layer = self.layers[self.active_layer]
+        if not layer.is_raster:
+            return
+        self.snapshot()
+        self.bucket_pending = {
+            "layer_index": self.active_layer,
+            "original": layer.image.copy(),
+            "pixel_x": pixel_x,
+            "pixel_y": pixel_y,
+            "button": button,
+            "event_serial": event_serial,
+        }
+        self._refresh_bucket_preview()
+
+    def _refresh_bucket_preview(self):
+        """Recalculate a pending fill after one of its settings changes."""
+        if self.bucket_pending is None:
+            return
+        pending = self.bucket_pending
+        layer = self.layers[pending["layer_index"]]
+        layer.image.paste(pending["original"])
+        layer.reset_mipmaps()
+        pixel_x, pixel_y = pending["pixel_x"], pending["pixel_y"]
+
+        pixels = np.asarray(pending["original"])
+        target = pixels[pixel_y, pixel_x]
+        tolerance = self.bucket_tolerance()
+        if tolerance == 0:
+            matches = np.all(pixels == target, axis=2)
+        elif tolerance == 100:
+            matches = np.ones((self.doc_h, self.doc_w), dtype=bool)
+        else:
+            differences = (pixels.astype(np.int32) -
+                           target.astype(np.int32))
+            distance_squared = np.sum(
+                differences * differences, axis=2)
+            maximum_distance = math.sqrt(4 * 255 * 255)
+            threshold = maximum_distance * tolerance / 100
+            matches = distance_squared <= threshold * threshold
+        flood_source = Image.fromarray(
+            np.where(matches, 0, 255).astype(np.uint8)).copy()
+        ImageDraw.floodfill(flood_source, (pixel_x, pixel_y), 128)
+        fill_mask = flood_source.point(
+            lambda value: 255 if value == 128 else 0)
+
+        if self.bucket_antialias_var.get():
+            fill_mask = fill_mask.filter(ImageFilter.GaussianBlur(0.65))
+            fill_mask = _apply_hardness_to_alpha(
+                fill_mask, self.bucket_hardness(), 2)
+        fill_mask = self._clip_raster_mask_to_selection(
+            (0, 0, self.doc_w, self.doc_h), fill_mask)
+        dirty_box = fill_mask.getbbox()
+        if dirty_box is None:
+            self.request_redraw()
+            return
+
+        local_mask = fill_mask.crop(dirty_box)
+        color = self._color_with_opacity(
+            "primary" if pending["button"] == 1 else "secondary")
+        source = Image.new("RGBA", local_mask.size, color)
+        source.putalpha(ImageChops.multiply(
+            source.getchannel("A"), local_mask))
+        result = layer.image.crop(dirty_box)
+        result.alpha_composite(source)
+        self.apply_raster_result(layer, result, dirty_box)
+        layer.update_mipmaps(dirty_box)
+        self.request_redraw()
+
+    def _finish_bucket_preview(self, event=None):
+        """Commit the currently displayed bucket preview."""
+        if self.bucket_pending is None:
+            return
+        self.bucket_pending = None
+        self.notify_globe_document_changed()
+        return "break"
 
     def _stamp_clone(self, x, y):
         """Copy one source-aligned circular sample to the destination."""
@@ -3619,6 +3793,8 @@ class PaintApp:
             return
         if self.tool == "clone":
             self._finish_clone_stroke()
+            return
+        if self.tool == "paint bucket":
             return
         current_layer = self.layers[self.active_layer]
         
