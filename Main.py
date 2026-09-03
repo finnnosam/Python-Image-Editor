@@ -1,7 +1,7 @@
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import ttk
-from PIL import Image, ImageChops, ImageDraw, ImageTk, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageTk, ImageOps, ImageFilter
 import numpy as np
 import math
 import colorsys
@@ -14,9 +14,28 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
-def _brush_shape_mask(image, bounds, paint_mask, antialias=False):
+def _apply_hardness_to_alpha(alpha, hardness, softness_scale):
+    """Adjust edge falloff while keeping 75% bit-identical to current output."""
+    hardness = max(0, min(100, int(hardness)))
+    if hardness == 75:
+        return alpha
+    if hardness < 75:
+        blur_radius = softness_scale * (75 - hardness) / 75
+        return alpha.filter(ImageFilter.GaussianBlur(blur_radius))
+    if hardness == 100:
+        return alpha.point(lambda value: 255 if value >= 128 else 0)
+    exponent = 1 / (1 + 3 * (hardness - 75) / 25)
+    return alpha.point(
+        lambda value: round(255 * ((value / 255) ** exponent)))
+
+
+def _brush_shape_mask(image, bounds, paint_mask, antialias=False,
+                      hardness=75):
     """Return the clipped document box and coverage mask for a brush shape."""
-    padding = 1 if antialias else 0
+    softness_scale = max(bounds[2] - bounds[0], bounds[3] - bounds[1]) * 0.25
+    blur_radius = (softness_scale * (75 - hardness) / 75
+                   if antialias and hardness < 75 else 0)
+    padding = (1 + math.ceil(blur_radius * 3)) if antialias else 0
     left = max(0, math.floor(bounds[0]) - padding)
     top = max(0, math.floor(bounds[1]) - padding)
     right = min(image.width, math.ceil(bounds[2]) + 1 + padding)
@@ -34,6 +53,7 @@ def _brush_shape_mask(image, bounds, paint_mask, antialias=False):
         # BOX computes area coverage.  LANCZOS looks smooth too, but its
         # ringing can create faint pixels outside the actual brush footprint.
         mask = mask.resize(size, Image.Resampling.BOX)
+        mask = _apply_hardness_to_alpha(mask, hardness, softness_scale)
     return (left, top, right, bottom), mask
 
 
@@ -72,10 +92,11 @@ def _composite_brush_shape(image, bounds, color, paint_mask, antialias=False):
 
 class VectorObject:
     """Base class for vector objects"""
-    def __init__(self, color="#000000", width=2, antialias=True):
+    def __init__(self, color="#000000", width=2, antialias=True, hardness=75):
         self.color = color
         self.width = width
         self.antialias = antialias
+        self.hardness = hardness
         self.selected = False
         
     def to_dict(self):
@@ -85,6 +106,7 @@ class VectorObject:
             'color': self.color,
             'width': self.width,
             'antialias': self.antialias,
+            'hardness': self.hardness,
         }
     
     @classmethod
@@ -104,8 +126,8 @@ class VectorObject:
 
 class Line(VectorObject):
     def __init__(self, x1=0, y1=0, x2=100, y2=100, color="#000000", width=2,
-                 curve=None, space="flat", antialias=True):
-        super().__init__(color, width, antialias)
+                 curve=None, space="flat", antialias=True, hardness=75):
+        super().__init__(color, width, antialias, hardness)
         self.x1 = x1
         self.y1 = y1
         self.x2 = x2
@@ -129,7 +151,8 @@ class Line(VectorObject):
     def from_dict(cls, data):
         return cls(data['x1'], data['y1'], data['x2'], data['y2'],
                    data['color'], data['width'], data.get('curve'),
-                   data.get('space', 'flat'), data.get('antialias', True))
+                   data.get('space', 'flat'), data.get('antialias', True),
+                   data.get('hardness', 75))
     
     def sampled_points(self, document_width=1024, document_height=512, steps=32):
         """Return map points. Globe lines follow the shortest great-circle arc."""
@@ -182,8 +205,9 @@ class Line(VectorObject):
 class Shape(VectorObject):
     """A closed/open preset made exclusively from Line primitives."""
     def __init__(self, lines=None, color="#000000", width=2, fill=None,
-                 filled_side="inside", preset="custom", antialias=True):
-        super().__init__(color, width, antialias)
+                 filled_side="inside", preset="custom", antialias=True,
+                 hardness=75):
+        super().__init__(color, width, antialias, hardness)
         self.lines = lines or []
         self.fill = fill
         self.filled_side = filled_side
@@ -192,6 +216,7 @@ class Shape(VectorObject):
         for line in self.lines:
             line.color, line.width = color, width
             line.antialias = antialias
+            line.hardness = hardness
 
     def to_dict(self):
         data = super().to_dict()
@@ -205,23 +230,25 @@ class Shape(VectorObject):
                  for item in data.get('lines', [])]
         return cls(lines, data['color'], data['width'], data.get('fill'),
                    data.get('filled_side', 'inside'), data.get('preset', 'custom'),
-                   data.get('antialias', True))
+                   data.get('antialias', True), data.get('hardness', 75))
 
     @classmethod
     def from_legacy_rectangle(cls, data):
         x, y, w, h = data['x'], data['y'], data['w'], data['h']
         antialias = data.get('antialias', True)
+        hardness = data.get('hardness', 75)
         vertices = [(x, y), (x+w, y), (x+w, y+h), (x, y+h)]
         lines = [Line(*vertices[i], *vertices[(i+1) % 4], data['color'],
-                      data['width'], antialias=antialias)
+                      data['width'], antialias=antialias, hardness=hardness)
                  for i in range(4)]
         return cls(lines, data['color'], data['width'], data.get('fill'),
-                   preset='rect', antialias=antialias)
+                   preset='rect', antialias=antialias, hardness=hardness)
 
     @classmethod
     def from_legacy_ellipse(cls, data):
         cx, cy, rx, ry = data['x'], data['y'], data['rx'], data['ry']
         antialias = data.get('antialias', True)
+        hardness = data.get('hardness', 75)
         k = 0.5522847498
         vertices = [(cx+rx,cy),(cx,cy+ry),(cx-rx,cy),(cx,cy-ry)]
         controls = [(cx+rx,cy+k*ry,cx+k*rx,cy+ry),
@@ -229,10 +256,11 @@ class Shape(VectorObject):
                     (cx-rx,cy-k*ry,cx-k*rx,cy-ry),
                     (cx+k*rx,cy-ry,cx+rx,cy-k*ry)]
         lines = [Line(*vertices[i], *vertices[(i+1) % 4], data['color'],
-                      data['width'], curve=controls[i], antialias=antialias)
+                      data['width'], curve=controls[i], antialias=antialias,
+                      hardness=hardness)
                  for i in range(4)]
         return cls(lines, data['color'], data['width'], data.get('fill'),
-                   preset='ellipse', antialias=antialias)
+                   preset='ellipse', antialias=antialias, hardness=hardness)
 
     def _outline(self, width, height):
         points = []
@@ -409,12 +437,15 @@ class Ellipse(VectorObject):
                 (self.x, self.y - self.ry), (self.x, self.y + self.ry)]
 
 
-def _draw_vector_path(image, points, color, width, antialias=True):
+def _draw_vector_path(image, points, color, width, antialias=True, hardness=75):
     """Stroke a path with consistent geometry and optional edge smoothing."""
     if len(points) < 2:
         return
 
-    padding = width / 2 + 2
+    softness_scale = width * 0.25
+    blur_radius = (softness_scale * (75 - hardness) / 75
+                   if antialias and hardness < 75 else 0)
+    padding = width / 2 + 2 + math.ceil(blur_radius * 3)
     left = max(0, math.floor(min(x for x, _ in points) - padding))
     top = max(0, math.floor(min(y for _, y in points) - padding))
     right = min(image.width, math.ceil(max(x for x, _ in points) + padding + 1))
@@ -441,6 +472,9 @@ def _draw_vector_path(image, points, color, width, antialias=True):
     resampling = (Image.Resampling.LANCZOS if antialias
                   else Image.Resampling.NEAREST)
     tile = tile.resize((tile_width, tile_height), resampling)
+    if antialias and hardness != 75:
+        tile.putalpha(_apply_hardness_to_alpha(
+            tile.getchannel("A"), hardness, softness_scale))
     image.alpha_composite(tile, (left, top))
 
 
@@ -453,7 +487,8 @@ def render_vector_object(image, obj, document_width, document_height):
         for offset in offsets:
             _draw_vector_path(
                 image, [(x + offset, y) for x, y in points],
-                obj.color, obj.width, obj.antialias)
+                obj.color, obj.width, obj.antialias,
+                getattr(obj, "hardness", 75))
         return
 
     if isinstance(obj, Shape):
@@ -470,7 +505,8 @@ def render_vector_object(image, obj, document_width, document_height):
         for offset in offsets:
             _draw_vector_path(
                 image, [(x + offset, y) for x, y in points],
-                obj.color, obj.width, obj.antialias)
+                obj.color, obj.width, obj.antialias,
+                getattr(obj, "hardness", 75))
         return
 
     # Compatibility for any legacy in-memory vector object.
@@ -876,8 +912,11 @@ class PaintApp:
             self.tool_buttons[tool] = button
         self.brush_build_up_var = tk.BooleanVar(value=False)
         self.brush_antialias_var = tk.BooleanVar(value=True)
+        self.brush_hardness_var = tk.StringVar(value="75")
+        self.brush_spacing_var = tk.StringVar(value="12.5")
         self.picker_sample_area_var = tk.BooleanVar(value=False)
         self.vector_antialias_var = tk.BooleanVar(value=True)
+        self.vector_hardness_var = tk.StringVar(value="75")
         tk.Label(left, textvariable=self.tool_hint_var).pack(pady=(2, 0))
 
         # ── Color Selector ─────────────────────────────────────────────
@@ -1034,6 +1073,20 @@ class PaintApp:
             self.brush_settings_frame, text="Anti-alias",
             variable=self.brush_antialias_var
         ).pack(side="left")
+        tk.Label(self.brush_settings_frame, text="Hardness:").pack(
+            side="left", padx=(10, 3))
+        self.brush_hardness_entry = tk.Entry(
+            self.brush_settings_frame, width=4,
+            textvariable=self.brush_hardness_var)
+        self.brush_hardness_entry.pack(side="left")
+        tk.Label(self.brush_settings_frame, text="%").pack(side="left")
+        tk.Label(self.brush_settings_frame, text="Spacing:").pack(
+            side="left", padx=(10, 3))
+        self.brush_spacing_entry = tk.Entry(
+            self.brush_settings_frame, width=5,
+            textvariable=self.brush_spacing_var)
+        self.brush_spacing_entry.pack(side="left")
+        tk.Label(self.brush_settings_frame, text="%").pack(side="left")
 
         self.picker_settings_frame = tk.Frame(self.tool_settings_bar)
         tk.Checkbutton(
@@ -1047,6 +1100,39 @@ class PaintApp:
             self.vector_settings_frame, text="Anti-alias",
             variable=self.vector_antialias_var
         ).pack(side="left")
+        tk.Label(self.vector_settings_frame, text="Hardness:").pack(
+            side="left", padx=(10, 3))
+        self.vector_hardness_entry = tk.Entry(
+            self.vector_settings_frame, width=4,
+            textvariable=self.vector_hardness_var)
+        self.vector_hardness_entry.pack(side="left")
+        tk.Label(self.vector_settings_frame, text="%").pack(side="left")
+
+        def validate_hardness(variable):
+            try:
+                value = max(0, min(100, int(variable.get())))
+            except ValueError:
+                value = 75
+            variable.set(str(value))
+
+        for entry, variable in (
+                (self.brush_hardness_entry, self.brush_hardness_var),
+                (self.vector_hardness_entry, self.vector_hardness_var)):
+            entry.bind("<Return>", lambda event, var=variable:
+                       validate_hardness(var))
+            entry.bind("<FocusOut>", lambda event, var=variable:
+                       validate_hardness(var))
+
+        def validate_brush_spacing(event=None):
+            try:
+                value = max(0.1, min(1000, float(
+                    self.brush_spacing_var.get())))
+            except ValueError:
+                value = 12.5
+            self.brush_spacing_var.set(f"{value:g}")
+
+        self.brush_spacing_entry.bind("<Return>", validate_brush_spacing)
+        self.brush_spacing_entry.bind("<FocusOut>", validate_brush_spacing)
 
         self.view_host = tk.Frame(self.view_workspace)
         self.view_host.pack(side="top", fill="both", expand=True)
@@ -1084,12 +1170,14 @@ class PaintApp:
         self.canvas.bind("l", lambda e: self.set_tool("line"))
         self.canvas.bind("r", lambda e: self.set_tool("rect"))
         self.canvas.bind("o", lambda e: self.set_tool("ellipse"))
-        self.canvas.bind("<KeyPress-plus>", lambda e: adjust_size(1))
-        self.canvas.bind("<KeyPress-equal>", lambda e: adjust_size(1))
-        self.canvas.bind("<Shift-KeyPress-equal>", lambda e: adjust_size(1))
-        self.canvas.bind("<KeyPress-minus>", lambda e: adjust_size(-1))
-        self.canvas.bind("<KeyPress-KP_Add>", lambda e: adjust_size(1))
-        self.canvas.bind("<KeyPress-KP_Subtract>", lambda e: adjust_size(-1))
+        # Bind size keys at the window level so they keep working after a
+        # settings entry or toolbar button has temporarily taken focus.
+        self.root.bind("<KeyPress-plus>", lambda e: adjust_size(1))
+        self.root.bind("<KeyPress-equal>", lambda e: adjust_size(1))
+        self.root.bind("<Shift-KeyPress-equal>", lambda e: adjust_size(1))
+        self.root.bind("<KeyPress-minus>", lambda e: adjust_size(-1))
+        self.root.bind("<KeyPress-KP_Add>", lambda e: adjust_size(1))
+        self.root.bind("<KeyPress-KP_Subtract>", lambda e: adjust_size(-1))
         self.canvas.bind("<Control-z>", lambda e: self.undo())
         self.canvas.bind("<Control-a>", self.select_all)
         self.canvas.bind("<Control-b>", self.zoom_to_selection)
@@ -2501,6 +2589,20 @@ class PaintApp:
         self._stroke_base_image = None
         self._stroke_coverage = None
 
+    def brush_hardness(self):
+        """Return the brush edge hardness as a validated percentage."""
+        try:
+            return max(0, min(100, int(self.brush_hardness_var.get())))
+        except (tk.TclError, ValueError):
+            return 75
+
+    def brush_spacing(self):
+        """Return brush stamp spacing as a percentage of its diameter."""
+        try:
+            return max(0.1, min(1000, float(self.brush_spacing_var.get())))
+        except (tk.TclError, ValueError):
+            return 12.5
+
     def _ensure_selection_animation(self):
         """Start the marquee timer if it is not already running."""
         if self.selection_animation_id is None:
@@ -2827,7 +2929,8 @@ class PaintApp:
         """Paint one dab, optionally capping coverage for the current stroke."""
         antialias = self.brush_antialias_var.get()
         box, dab_mask = _brush_shape_mask(
-            layer.image, bounds, paint_mask, antialias=antialias)
+            layer.image, bounds, paint_mask, antialias=antialias,
+            hardness=self.brush_hardness())
         if box is None:
             return None
         dab_mask = self._clip_raster_mask_to_selection(box, dab_mask)
@@ -2856,7 +2959,8 @@ class PaintApp:
         """Erase through a hard or anti-aliased mask with stroke buildup rules."""
         box, dab_mask = _brush_shape_mask(
             layer.image, bounds, paint_mask,
-            antialias=self.brush_antialias_var.get())
+            antialias=self.brush_antialias_var.get(),
+            hardness=self.brush_hardness())
         if box is None:
             return None
         dab_mask = self._clip_raster_mask_to_selection(box, dab_mask)
@@ -2912,7 +3016,7 @@ class PaintApp:
 
         dist = math.hypot(dx, dy)
 
-        spacing = max(1, radius * 0.25)
+        spacing = max(1, radius * 2 * self.brush_spacing() / 100)
         # Round upward so the distance between adjacent stamps never exceeds
         # the requested spacing. Flooring this value could leave one- or
         # two-pixel holes in thin strokes between mouse-motion events.
@@ -3187,6 +3291,13 @@ class PaintApp:
         except (tk.TclError, AttributeError):
             return True
 
+    def vector_hardness(self):
+        """Capture the vector edge hardness for a new vector object."""
+        try:
+            return max(0, min(100, int(self.vector_hardness_var.get())))
+        except (tk.TclError, ValueError):
+            return 75
+
     def make_vector_object(self, preset, points, space="flat"):
         """Build the same vector object for previews and finalized gestures."""
         if len(points) < 2:
@@ -3195,7 +3306,8 @@ class PaintApp:
             return Line(*points[0], *points[-1],
                         self._color_with_opacity("primary"),
                         self.vector_line_width(), space=space,
-                        antialias=self.vector_antialias_enabled())
+                        antialias=self.vector_antialias_enabled(),
+                        hardness=self.vector_hardness())
         if preset in ("rect", "ellipse"):
             return self.make_shape_preset(preset, points, space)
         return None
@@ -3205,6 +3317,7 @@ class PaintApp:
         color = self._color_with_opacity("primary")
         width = self.vector_line_width()
         antialias = self.vector_antialias_enabled()
+        hardness = self.vector_hardness()
         if preset == "rect":
             if len(points) == 2:
                 (x1, y1), (x2, y2) = points
@@ -3212,7 +3325,8 @@ class PaintApp:
             else:
                 vertices = points[:4]
             lines = [Line(*vertices[i], *vertices[(i + 1) % 4], color, width,
-                          space=space, antialias=antialias)
+                          space=space, antialias=antialias,
+                          hardness=hardness)
                      for i in range(4)]
         else:
             if space == "flat":
@@ -3227,16 +3341,18 @@ class PaintApp:
                             (cx+k*rx,cy-ry,cx+rx,cy-k*ry)]
                 lines = [Line(*verts[i], *verts[(i+1)%4], color, width,
                               curve=controls[i], space=space,
-                              antialias=antialias) for i in range(4)]
+                              antialias=antialias, hardness=hardness)
+                         for i in range(4)]
             else:
                 vertices = points
                 lines = [Line(*vertices[i], *vertices[(i+1)%len(vertices)], color,
-                              width, space=space, antialias=antialias)
+                              width, space=space, antialias=antialias,
+                              hardness=hardness)
                          for i in range(len(vertices))]
         # The secondary colour represents the shape's filled (inside) side.
         return Shape(lines, color, width,
                      self._color_with_opacity("secondary"), "inside", preset,
-                     antialias)
+                     antialias, hardness)
 
     def create_globe_vector(self, preset, image_points):
         if not self.can_draw_vector_from_globe() or len(image_points) < 2:

@@ -870,7 +870,9 @@ class GlobeView(tk.Frame):
         # fixed quarter-degree step oversampled ordinary brushes heavily,
         # creating many redundant PIL stamps for a single mouse event.
         radius = max(0.5, int(self.app.size_var.get()) / 2)
-        step_radians = (2 * np.pi * (radius * 0.25)) / self.texture.width
+        spacing = max(
+            1, radius * 2 * self.app.brush_spacing() / 100)
+        step_radians = (2 * np.pi * spacing) / self.texture.width
         samples = arc_to_uv(start, end, step_radians=step_radians)
 
         # The first sample is the previous event's endpoint, which has already
