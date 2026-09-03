@@ -749,6 +749,12 @@ class PaintApp:
         self.selection_move_mask = None
         self.selection_brush_last = None
         self.selection_brush_remove = False
+        self.clone_source_center = None
+        self.clone_offset = None
+        self.clone_last = None
+        self.clone_stroke_source = None
+        self.clone_stroke_base = None
+        self.clone_stroke_coverage = None
 
         # Drag and drop variables
         self.drag_start_index = None
@@ -822,6 +828,7 @@ class PaintApp:
             ("Color Picker", "color picker", None),
             ("Brush",      "brush",       "brush.png"),
             ("Eraser",     "eraser",      "eraser.png"),
+            ("Clone",      "clone",       None),
             ("Vector Edit", "vector edit", "vector-edit.png"),
             ("Line",       "line",        "line.png"),
             ("Rectangle",  "rect",        "rect.png"),
@@ -833,7 +840,7 @@ class PaintApp:
         self.tools_by_layer_type = {
             "raster": ("selection", "move", "move selection",
                        "brush selection", "pan", "color picker", "brush",
-                       "eraser"),
+                       "eraser", "clone"),
             "vector": ("pan", "color picker", "vector edit", "line", "rect", "ellipse"),
         }
         self.tool_hint_var = tk.StringVar(value="Brush")
@@ -869,6 +876,11 @@ class PaintApp:
                         (5, 5, 25, 25), outline="#202020", width=2)
                     icon_draw.ellipse((11, 11, 19, 19), fill="#787878")
                     icon_draw.line((22, 22, 28, 28), fill="#202020", width=3)
+                elif tool == "clone":
+                    icon_draw.ellipse((6, 5, 19, 18), outline="#202020", width=2)
+                    icon_draw.ellipse((13, 13, 26, 26), outline="#787878", width=2)
+                    icon_draw.line((17, 9, 23, 15), fill="#202020", width=2)
+                    icon_draw.polygon((25, 17, 19, 15, 23, 11), fill="#202020")
                 elif tool == "pan":
                     icon_draw.line((6, 16, 26, 16), fill="#202020", width=3)
                     icon_draw.line((16, 6, 16, 26), fill="#202020", width=3)
@@ -914,6 +926,10 @@ class PaintApp:
         self.brush_antialias_var = tk.BooleanVar(value=True)
         self.brush_hardness_var = tk.StringVar(value="75")
         self.brush_spacing_var = tk.StringVar(value="12.5")
+        self.clone_antialias_var = tk.BooleanVar(value=True)
+        self.clone_build_up_var = tk.BooleanVar(value=False)
+        self.clone_hardness_var = tk.StringVar(value="75")
+        self.clone_spacing_var = tk.StringVar(value="12.5")
         self.picker_sample_area_var = tk.BooleanVar(value=False)
         self.vector_antialias_var = tk.BooleanVar(value=True)
         self.vector_hardness_var = tk.StringVar(value="75")
@@ -1080,6 +1096,30 @@ class PaintApp:
             textvariable=self.brush_hardness_var)
         self.brush_hardness_entry.pack(side="left")
         tk.Label(self.brush_settings_frame, text="%").pack(side="left")
+
+        self.clone_settings_frame = tk.Frame(self.tool_settings_bar)
+        tk.Checkbutton(
+            self.clone_settings_frame, text="Build up",
+            variable=self.clone_build_up_var
+        ).pack(side="left", padx=(0, 8))
+        tk.Checkbutton(
+            self.clone_settings_frame, text="Anti-alias",
+            variable=self.clone_antialias_var
+        ).pack(side="left")
+        tk.Label(self.clone_settings_frame, text="Hardness:").pack(
+            side="left", padx=(10, 3))
+        self.clone_hardness_entry = tk.Entry(
+            self.clone_settings_frame, width=4,
+            textvariable=self.clone_hardness_var)
+        self.clone_hardness_entry.pack(side="left")
+        tk.Label(self.clone_settings_frame, text="%").pack(side="left")
+        tk.Label(self.clone_settings_frame, text="Spacing:").pack(
+            side="left", padx=(10, 3))
+        self.clone_spacing_entry = tk.Entry(
+            self.clone_settings_frame, width=5,
+            textvariable=self.clone_spacing_var)
+        self.clone_spacing_entry.pack(side="left")
+        tk.Label(self.clone_settings_frame, text="%").pack(side="left")
         tk.Label(self.brush_settings_frame, text="Spacing:").pack(
             side="left", padx=(10, 3))
         self.brush_spacing_entry = tk.Entry(
@@ -1117,22 +1157,28 @@ class PaintApp:
 
         for entry, variable in (
                 (self.brush_hardness_entry, self.brush_hardness_var),
+                (self.clone_hardness_entry, self.clone_hardness_var),
                 (self.vector_hardness_entry, self.vector_hardness_var)):
             entry.bind("<Return>", lambda event, var=variable:
                        validate_hardness(var))
             entry.bind("<FocusOut>", lambda event, var=variable:
                        validate_hardness(var))
 
-        def validate_brush_spacing(event=None):
+        def validate_spacing(variable):
             try:
                 value = max(0.1, min(1000, float(
-                    self.brush_spacing_var.get())))
+                    variable.get())))
             except ValueError:
                 value = 12.5
-            self.brush_spacing_var.set(f"{value:g}")
+            variable.set(f"{value:g}")
 
-        self.brush_spacing_entry.bind("<Return>", validate_brush_spacing)
-        self.brush_spacing_entry.bind("<FocusOut>", validate_brush_spacing)
+        for entry, variable in (
+                (self.brush_spacing_entry, self.brush_spacing_var),
+                (self.clone_spacing_entry, self.clone_spacing_var)):
+            entry.bind("<Return>", lambda event, var=variable:
+                       validate_spacing(var))
+            entry.bind("<FocusOut>", lambda event, var=variable:
+                       validate_spacing(var))
 
         self.view_host = tk.Frame(self.view_workspace)
         self.view_host.pack(side="top", fill="both", expand=True)
@@ -1166,6 +1212,7 @@ class PaintApp:
         self.canvas.bind("i", lambda e: self.set_tool("color picker"))
         self.canvas.bind("b", lambda e: self.set_tool("brush"))
         self.canvas.bind("e", lambda e: self.set_tool("eraser"))
+        self.canvas.bind("c", lambda e: self.set_tool("clone"))
         self.canvas.bind("v", lambda e: self.set_tool("vector edit"))
         self.canvas.bind("l", lambda e: self.set_tool("line"))
         self.canvas.bind("r", lambda e: self.set_tool("rect"))
@@ -1755,6 +1802,7 @@ class PaintApp:
             self.undo_stack.pop(0)
 
     def undo(self):
+        self._finish_clone_stroke()
         self._finish_selection_move()
         self._finish_selection_boundary_move()
         if not self.undo_stack:
@@ -1780,6 +1828,8 @@ class PaintApp:
         self.undo_stack = []
         self.selection_mask = Image.new("L", (self.doc_w, self.doc_h), 0)
         self._update_selection_geometry()
+        self.clone_source_center = None
+        self.clone_offset = None
         self.refresh_layers()
         self.redraw()
         self.update_title()
@@ -1940,6 +1990,8 @@ class PaintApp:
         self.undo_stack = []
         self.selection_mask = Image.new("L", (self.doc_w, self.doc_h), 0)
         self._update_selection_geometry()
+        self.clone_source_center = None
+        self.clone_offset = None
         self.refresh_layers()
         self.redraw()
         self.update_title()
@@ -1952,6 +2004,7 @@ class PaintApp:
             return
         self._finish_raster_stroke()
         if tool != self.tool:
+            self._finish_clone_stroke()
             self._finish_selection_move()
             self._finish_selection_boundary_move()
             self.selection_brush_last = None
@@ -2044,7 +2097,8 @@ class PaintApp:
             return
 
         for frame in (self.size_frame, self.picker_settings_frame,
-                      self.brush_settings_frame, self.vector_settings_frame):
+                      self.brush_settings_frame, self.clone_settings_frame,
+                      self.vector_settings_frame):
             frame.pack_forget()
 
         uses_size = (self.tool not in
@@ -2059,11 +2113,15 @@ class PaintApp:
         elif (self.tool in ("brush", "eraser") and self.layers and
               self.layers[self.active_layer].is_raster):
             self.brush_settings_frame.pack(side="left")
+        elif (self.tool == "clone" and self.layers and
+              self.layers[self.active_layer].is_raster):
+            self.clone_settings_frame.pack(side="left")
         elif self.tool in ("line", "rect", "ellipse"):
             self.vector_settings_frame.pack(side="left")
         self.request_redraw()
 
     def add_layer(self, layer_type="raster"):
+        self._finish_clone_stroke()
         self._finish_selection_move()
         self._finish_selection_boundary_move()
         self.snapshot()
@@ -2077,6 +2135,7 @@ class PaintApp:
     def delete_layer(self):
         if len(self.layers) == 1:
             return
+        self._finish_clone_stroke()
         self._finish_selection_move()
         self._finish_selection_boundary_move()
         self.snapshot()
@@ -2120,6 +2179,7 @@ class PaintApp:
             display_index = self.layer_list.index(sel[0])
             selected_layer = len(self.layers) - 1 - display_index
             if selected_layer != self.active_layer:
+                self._finish_clone_stroke()
                 self._finish_selection_move()
                 self._finish_selection_boundary_move()
             self.active_layer = selected_layer
@@ -2450,6 +2510,30 @@ class PaintApp:
                     event.x, event.y)
                 self._paint_selection_brush(*self.selection_brush_last)
             return
+        if self.tool == "clone":
+            clone_x, clone_y = self.raster_image_coords(event.x, event.y)
+            if event.state & 0x4:
+                self.clone_source_center = (clone_x, clone_y)
+                self.clone_offset = None
+                self.request_redraw()
+            elif event.num in (1, 3) and self.clone_source_center is not None:
+                if self.clone_offset is None:
+                    self.clone_offset = (
+                        round(self.clone_source_center[0] - clone_x),
+                        round(self.clone_source_center[1] - clone_y))
+                self.snapshot()
+                self.clone_stroke_source = \
+                    self.layers[self.active_layer].image.copy()
+                if self.clone_build_up_var.get():
+                    self.clone_stroke_base = None
+                    self.clone_stroke_coverage = None
+                else:
+                    self.clone_stroke_base = self.clone_stroke_source
+                    self.clone_stroke_coverage = Image.new(
+                        "L", (self.doc_w, self.doc_h), 0)
+                self.clone_last = (clone_x, clone_y)
+                self._paint_clone(clone_x, clone_y)
+            return
         current_layer = self.layers[self.active_layer]
         
         if current_layer.is_raster:
@@ -2512,6 +2596,11 @@ class PaintApp:
             if self.selection_brush_last is not None:
                 brush_x, brush_y = self.raster_image_coords(event.x, event.y)
                 self._paint_selection_brush(brush_x, brush_y)
+            return
+        if self.tool == "clone":
+            if self.clone_last is not None:
+                clone_x, clone_y = self.raster_image_coords(event.x, event.y)
+                self._paint_clone(clone_x, clone_y)
             return
         current_layer = self.layers[self.active_layer]
         
@@ -2602,6 +2691,117 @@ class PaintApp:
             return max(0.1, min(1000, float(self.brush_spacing_var.get())))
         except (tk.TclError, ValueError):
             return 12.5
+
+    def clone_hardness(self):
+        try:
+            return max(0, min(100, int(self.clone_hardness_var.get())))
+        except (tk.TclError, ValueError):
+            return 75
+
+    def clone_spacing(self):
+        try:
+            return max(0.1, min(1000, float(self.clone_spacing_var.get())))
+        except (tk.TclError, ValueError):
+            return 12.5
+
+    def _stamp_clone(self, x, y):
+        """Copy one source-aligned circular sample to the destination."""
+        if self.clone_stroke_source is None or self.clone_offset is None:
+            return None
+        radius = max(0.5, int(self.size_var.get()) / 2)
+        raster_radius = max(0, radius - 0.5)
+        antialias = self.clone_antialias_var.get()
+        if raster_radius == 0 and not antialias:
+            pixel_x, pixel_y = round(x), round(y)
+            bounds = (pixel_x, pixel_y, pixel_x, pixel_y)
+            paint_mask = lambda draw, left, top, scale: draw.rectangle(
+                ((pixel_x - left) * scale, (pixel_y - top) * scale,
+                 (pixel_x - left + 1) * scale - 1,
+                 (pixel_y - top + 1) * scale - 1), fill=255)
+        else:
+            effective_radius = radius if raster_radius == 0 else raster_radius
+            bounds = (x - effective_radius, y - effective_radius,
+                      x + effective_radius, y + effective_radius)
+            paint_mask = lambda draw, left, top, scale: draw.ellipse(
+                _brush_ellipse_box(bounds, left, top, scale),
+                fill=255, outline=255)
+        box, dab_mask = _brush_shape_mask(
+            self.layers[self.active_layer].image, bounds, paint_mask,
+            antialias=antialias,
+            hardness=self.clone_hardness())
+        if box is None:
+            return None
+        dab_mask = self._clip_raster_mask_to_selection(box, dab_mask)
+        opacity = (self.primary_opacity if self.last_button == 1
+                   else self.secondary_opacity)
+        if opacity < 255:
+            dab_mask = dab_mask.point(
+                lambda value: (value * opacity + 127) // 255)
+
+        if self.clone_stroke_coverage is not None:
+            coverage = ImageChops.lighter(
+                self.clone_stroke_coverage.crop(box), dab_mask)
+            self.clone_stroke_coverage.paste(
+                coverage, (box[0], box[1]))
+            composite_mask = coverage
+        else:
+            composite_mask = dab_mask
+
+        offset_x, offset_y = self.clone_offset
+        source_left, source_top = box[0] + offset_x, box[1] + offset_y
+        source_right = source_left + dab_mask.width
+        source_bottom = source_top + dab_mask.height
+        clipped_left = max(0, source_left)
+        clipped_top = max(0, source_top)
+        clipped_right = min(self.doc_w, source_right)
+        clipped_bottom = min(self.doc_h, source_bottom)
+        source = Image.new("RGBA", dab_mask.size, (0, 0, 0, 0))
+        if clipped_right > clipped_left and clipped_bottom > clipped_top:
+            source.paste(
+                self.clone_stroke_source.crop(
+                    (clipped_left, clipped_top, clipped_right, clipped_bottom)),
+                (clipped_left - source_left, clipped_top - source_top))
+        source.putalpha(ImageChops.multiply(
+            source.getchannel("A"), composite_mask))
+        result_base = (self.clone_stroke_base
+                       if self.clone_stroke_base is not None
+                       else self.layers[self.active_layer].image)
+        result = result_base.crop(box)
+        result.alpha_composite(source)
+        self.apply_raster_result(self.layers[self.active_layer], result, box)
+        return box
+
+    def _paint_clone(self, x, y):
+        """Interpolate clone stamps using the configured brush spacing."""
+        last_x, last_y = self.clone_last or (x, y)
+        dx, dy = x - last_x, y - last_y
+        radius = max(0.5, int(self.size_var.get()) / 2)
+        spacing = max(1, radius * 2 * self.clone_spacing() / 100)
+        steps = max(1, math.ceil(math.hypot(dx, dy) / spacing))
+        dirty_boxes = []
+        for index in range(steps + 1):
+            amount = index / steps
+            dirty = self._stamp_clone(
+                last_x + dx * amount, last_y + dy * amount)
+            if dirty is not None:
+                dirty_boxes.append(dirty)
+        self.clone_last = (x, y)
+        if dirty_boxes:
+            dirty = (min(box[0] for box in dirty_boxes),
+                     min(box[1] for box in dirty_boxes),
+                     max(box[2] for box in dirty_boxes),
+                     max(box[3] for box in dirty_boxes))
+            self.layers[self.active_layer].update_mipmaps(dirty)
+        self.request_redraw()
+
+    def _finish_clone_stroke(self):
+        if self.clone_stroke_source is None:
+            return
+        self.clone_last = None
+        self.clone_stroke_source = None
+        self.clone_stroke_base = None
+        self.clone_stroke_coverage = None
+        self.notify_globe_document_changed()
 
     def _ensure_selection_animation(self):
         """Start the marquee timer if it is not already running."""
@@ -3417,6 +3617,9 @@ class PaintApp:
             self.selection_brush_last = None
             self.selection_brush_remove = False
             return
+        if self.tool == "clone":
+            self._finish_clone_stroke()
+            return
         current_layer = self.layers[self.active_layer]
         
         if current_layer.is_raster:
@@ -3765,7 +3968,7 @@ class PaintApp:
                         tags=("overlay",))
 
         if (current_layer.is_raster and
-                self.tool in ("brush", "eraser", "brush selection") and
+                self.tool in ("brush", "eraser", "brush selection", "clone") and
                 0 <= self.mouse_x < cw and 0 <= self.mouse_y < ch):
             diameter = max(1, round(int(self.size_var.get()) * self.zoom))
             if diameter != self._brush_cursor_diameter:
@@ -3777,6 +3980,28 @@ class PaintApp:
                 self.mouse_x, self.mouse_y,
                 image=self._brush_cursor_tkimg,
                 anchor="center", tags=("overlay",))
+
+        if self.tool == "clone" and self.clone_source_center is not None:
+            if self.clone_offset is None:
+                source_x, source_y = self.clone_source_center
+            else:
+                hover_x, hover_y = self.raster_image_coords(
+                    self.mouse_x, self.mouse_y)
+                source_x = hover_x + self.clone_offset[0]
+                source_y = hover_y + self.clone_offset[1]
+            center_x, center_y = self.screen_coords(source_x + 0.5,
+                                                    source_y + 0.5)
+            radius = max(1, int(self.size_var.get()) * self.zoom / 2)
+            self.canvas.create_oval(
+                center_x - radius, center_y - radius,
+                center_x + radius, center_y + radius,
+                outline="#00ff80", width=2, tags=("overlay",))
+            self.canvas.create_line(
+                center_x - 5, center_y, center_x + 5, center_y,
+                fill="#00ff80", width=1, tags=("overlay",))
+            self.canvas.create_line(
+                center_x, center_y - 5, center_x, center_y + 5,
+                fill="#00ff80", width=1, tags=("overlay",))
         
         # Draw vector handles if in proper mode and on vector layer
         if self.tool == "vector edit" and current_layer.layer_type == "vector" and current_layer.vector_data:
