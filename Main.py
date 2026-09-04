@@ -692,6 +692,8 @@ class PaintApp:
         self._stroke_coverage = None
         self.active_color_slot = "primary"
         self.picker_hue = 0.0
+        self.picker_saturation = 0.0
+        self.picker_value = 0.0
         self._color_controls_updating = False
         self.color = self.primary_color  # Keep for compatibility
         # Empty document pixels stay transparent.  The checkerboard is a view
@@ -1497,20 +1499,33 @@ class PaintApp:
                     self._render_hue_slider(control, value))
             slider.after_idle(lambda: self._render_hue_slider(slider, variable))
         else:
-            slider = tk.Scale(row, variable=variable, from_=minimum, to=maximum,
-                              orient="horizontal", showvalue=False, length=92,
-                              resolution=1, bd=0, highlightthickness=0,
-                              sliderlength=6, width=8,
-                              command=lambda value: callback())
+            slider = tk.Canvas(row, width=92, height=14, bd=0,
+                               highlightthickness=0,
+                               cursor="sb_h_double_arrow")
+            slider._color_component = label
+            slider._minimum = minimum
+            slider._maximum = maximum
+            slider._variable = variable
             slider.pack(side="left", fill="x", expand=True)
             slider.bind(
                 "<Button-1>",
-                lambda event, control=slider, changed=callback:
-                    self._set_slider_from_pointer(control, event, changed))
+                lambda event, control=slider, value=variable, changed=callback:
+                    self._set_color_slider_from_pointer(
+                        control, value, event, changed))
             slider.bind(
                 "<B1-Motion>",
-                lambda event, control=slider, changed=callback:
-                    self._set_slider_from_pointer(control, event, changed))
+                lambda event, control=slider, value=variable, changed=callback:
+                    self._set_color_slider_from_pointer(
+                        control, value, event, changed))
+            variable.trace_add(
+                "write", lambda *args, control=slider:
+                    self._render_color_slider(control))
+            slider.bind(
+                "<Configure>",
+                lambda event, control=slider:
+                    self._render_color_slider(control))
+            slider.after_idle(
+                lambda control=slider: self._render_color_slider(control))
         spinner = tk.Spinbox(row, textvariable=variable, from_=minimum,
                              to=maximum, width=4, justify="right",
                              command=callback)
@@ -1547,15 +1562,73 @@ class PaintApp:
         callback()
         return "break"
 
-    def _set_slider_from_pointer(self, slider, event, callback):
-        """Snap a compact scale's handle directly beneath the pointer."""
-        handle_width = float(slider.cget("sliderlength"))
-        usable_width = max(1.0, slider.winfo_width() - handle_width)
-        fraction = (event.x - handle_width / 2) / usable_width
+    def _render_color_slider(self, slider):
+        """Draw a component's true color range behind its position marker."""
+        width = max(2, slider.winfo_width())
+        height = max(2, slider.winfo_height())
+        component = slider._color_component
+        current_rgb = self._hex_to_rgb(
+            self.primary_color if self.active_color_slot == "primary"
+            else self.secondary_color)
+        image = Image.new("RGB", (width, height))
+        pixels = image.load()
+        checker = ((235, 235, 235), (195, 195, 195))
+
+        for x in range(width):
+            fraction = x / (width - 1)
+            if component in ("R", "G", "B"):
+                color = list(current_rgb)
+                color[("R", "G", "B").index(component)] = round(
+                    fraction * 255)
+                color = tuple(color)
+            elif component == "S":
+                hsv = (self.picker_hue, fraction,
+                       getattr(self, "picker_value", 0.0))
+                color = tuple(round(channel * 255)
+                              for channel in colorsys.hsv_to_rgb(*hsv))
+            elif component == "V":
+                hsv = (self.picker_hue,
+                       getattr(self, "picker_saturation", 0.0), fraction)
+                color = tuple(round(channel * 255)
+                              for channel in colorsys.hsv_to_rgb(*hsv))
+            else:  # Alpha previews transparency over a checkerboard.
+                color = current_rgb
+            for y in range(height):
+                if component == "A":
+                    background = checker[((x // 5) + (y // 5)) % 2]
+                    pixels[x, y] = tuple(round(
+                        foreground * fraction + backdrop * (1 - fraction))
+                        for foreground, backdrop in zip(color, background))
+                else:
+                    pixels[x, y] = color
+
+        slider._gradient_image = ImageTk.PhotoImage(image)
+        slider.delete("all")
+        slider.create_image(
+            0, 0, image=slider._gradient_image, anchor="nw")
+        try:
+            value = int(slider._variable.get())
+        except (tk.TclError, ValueError):
+            value = slider._minimum
+        span = max(1, slider._maximum - slider._minimum)
+        marker_x = ((value - slider._minimum) / span) * (width - 1)
+        slider.create_line(marker_x, 0, marker_x, height,
+                           fill="white", width=3)
+        slider.create_line(marker_x, 0, marker_x, height, fill="black")
+
+    def _refresh_color_slider_previews(self):
+        for slider in self.color_sliders:
+            if getattr(slider, "_color_component", None):
+                self._render_color_slider(slider)
+
+    def _set_color_slider_from_pointer(
+            self, slider, variable, event, callback):
+        """Set a gradient slider directly from its pointer position."""
+        fraction = event.x / max(1.0, slider.winfo_width() - 1)
         fraction = min(1.0, max(0.0, fraction))
-        minimum = float(slider.cget("from"))
-        maximum = float(slider.cget("to"))
-        slider.set(round(minimum + fraction * (maximum - minimum)))
+        variable.set(round(
+            slider._minimum + fraction *
+            (slider._maximum - slider._minimum)))
         callback()
         return "break"
 
@@ -1674,6 +1747,7 @@ class PaintApp:
             self.hex_var.set(color.lstrip("#").upper())
         finally:
             self._color_controls_updating = False
+        self._refresh_color_slider_previews()
 
     def swap_colors(self):
         self.primary_color, self.secondary_color = self.secondary_color, self.primary_color
