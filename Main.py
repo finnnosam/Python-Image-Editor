@@ -828,31 +828,46 @@ class PaintApp:
         tk.Button(top, text="Globe View", command=self.open_globe_view).pack(side="left", padx=2, pady=2)
         tk.Button(top, text="Settings",   command=self.open_settings).pack(side="right", padx=2, pady=2)
 
+        self.left_panel_collapsed = False
+        self.right_panel_collapsed = False
+        self.top_panel_collapsed = False
+
         # ── Main area: tools | canvas | layers ────────────────────────────
         main = tk.Frame(self.root)
         main.pack(fill="both", expand=True)
 
         # ── Left panel: tools ─────────────────────────────────────────────
         left = tk.Frame(main, width=190, bd=1, relief="sunken")
+        self.left_panel = left
         left.pack(side="left", fill="y")
         left.pack_propagate(False)
 
-        tk.Label(left, text="Tools", font=("TkDefaultFont", 9, "bold")).pack(pady=(6, 2))
+        left_header = tk.Frame(left)
+        left_header.pack(fill="x", pady=(3, 2))
+        self.left_panel_title = tk.Label(
+            left_header, text="Tools", font=("TkDefaultFont", 9, "bold"))
+        self.left_panel_title.pack(side="left", padx=(8, 2))
+        self.left_panel_toggle = tk.Button(
+            left_header, text="◀", width=2, command=self.toggle_left_panel)
+        self.left_panel_toggle.pack(side="right", padx=3)
 
-        tool_frame = tk.Frame(left)
+        self.left_panel_content = tk.Frame(left)
+        self.left_panel_content.pack(fill="both", expand=True)
+
+        tool_frame = tk.Frame(self.left_panel_content)
         tool_frame.pack(fill="x", padx=4)
 
         tools = [
-            ("Selection",  "selection",   None),
-            ("Brush Selection", "brush selection", None),
-            ("Move",       "move",        None),
-            ("Move Selection", "move selection", None),
-            ("Pan",        "pan",         None),
-            ("Color Picker", "color picker", None),
+            ("Selection",  "selection",   "selection.png"),
+            ("Brush Selection", "brush selection", "brush-selection.png"),
+            ("Move",       "move",        "move.png"),
+            ("Move Selection", "move selection", "move-selection.png"),
+            ("Pan",        "pan",         "pan.png"),
+            ("Color Picker", "color picker", "color-picker.png"),
             ("Brush",      "brush",       "brush.png"),
             ("Eraser",     "eraser",      "eraser.png"),
-            ("Clone",      "clone",       None),
-            ("Paint Bucket", "paint bucket", None),
+            ("Clone",      "clone",       "clone.png"),
+            ("Paint Bucket", "paint bucket", "paint-bucket.png"),
             ("Vector Edit", "vector edit", "vector-edit.png"),
             ("Line",       "line",        "line.png"),
             ("Rectangle",  "rect",        "rect.png"),
@@ -869,65 +884,9 @@ class PaintApp:
         }
         self.tool_hint_var = tk.StringVar(value="Brush")
         for index, (label, tool, filename) in enumerate(tools):
-            if filename is None:
-                icon_image = Image.new("RGBA", (32, 32), (0, 0, 0, 0))
-                icon_draw = ImageDraw.Draw(icon_image)
-                if tool == "selection":
-                    icon_draw.rectangle(
-                        (5, 6, 27, 25), outline="#202020", width=2)
-                    icon_draw.rectangle(
-                        (8, 9, 24, 22), outline="#d8d8d8", width=1)
-                    # Small gaps suggest a marquee without depending on a
-                    # platform-specific dashed-line renderer.
-                    for x, y in ((5, 6), (16, 6), (27, 6), (5, 16),
-                                 (27, 16), (5, 25), (16, 25), (27, 25)):
-                        icon_draw.rectangle(
-                            (x - 1, y - 1, x + 1, y + 1), fill="#f2f2f2")
-                elif tool == "move":
-                    icon_draw.rectangle(
-                        (5, 5, 20, 20), outline="#202020", width=2)
-                    icon_draw.line((14, 14, 27, 27), fill="#202020", width=3)
-                    icon_draw.polygon(
-                        (28, 28, 20, 26, 26, 20), fill="#202020")
-                elif tool == "move selection":
-                    icon_draw.rectangle(
-                        (4, 5, 20, 21), outline="#202020", width=2)
-                    icon_draw.line((16, 17, 27, 28), fill="#787878", width=2)
-                    icon_draw.polygon(
-                        (28, 29, 21, 27, 27, 21), fill="#787878")
-                elif tool == "brush selection":
-                    icon_draw.ellipse(
-                        (5, 5, 25, 25), outline="#202020", width=2)
-                    icon_draw.ellipse((11, 11, 19, 19), fill="#787878")
-                    icon_draw.line((22, 22, 28, 28), fill="#202020", width=3)
-                elif tool == "clone":
-                    icon_draw.ellipse((6, 5, 19, 18), outline="#202020", width=2)
-                    icon_draw.ellipse((13, 13, 26, 26), outline="#787878", width=2)
-                    icon_draw.line((17, 9, 23, 15), fill="#202020", width=2)
-                    icon_draw.polygon((25, 17, 19, 15, 23, 11), fill="#202020")
-                elif tool == "paint bucket":
-                    icon_draw.polygon(
-                        (7, 12, 17, 5, 26, 15, 16, 24),
-                        outline="#202020", fill="#d8d8d8")
-                    icon_draw.line((9, 12, 18, 21), fill="#202020", width=2)
-                    icon_draw.ellipse((22, 23, 27, 29), fill="#202020")
-                elif tool == "pan":
-                    icon_draw.line((6, 16, 26, 16), fill="#202020", width=3)
-                    icon_draw.line((16, 6, 16, 26), fill="#202020", width=3)
-                    icon_draw.polygon((3, 16, 9, 11, 9, 21), fill="#202020")
-                    icon_draw.polygon((29, 16, 23, 11, 23, 21), fill="#202020")
-                    icon_draw.polygon((16, 3, 11, 9, 21, 9), fill="#202020")
-                    icon_draw.polygon((16, 29, 11, 23, 21, 23), fill="#202020")
-                else:
-                    icon_draw.line((8, 25, 23, 10), fill="#202020", width=5)
-                    icon_draw.line((11, 28, 26, 13), fill="#d8d8d8", width=3)
-                    icon_draw.polygon((22, 5, 28, 11, 24, 15, 18, 9),
-                                      fill="#202020")
-                    icon_draw.rectangle((5, 25, 10, 29), outline="#202020")
-            else:
-                with Image.open(icon_dir / filename) as source_image:
-                    icon_image = source_image.convert("RGBA").resize(
-                        (32, 32), Image.Resampling.LANCZOS)
+            with Image.open(icon_dir / filename) as source_image:
+                icon_image = source_image.convert("RGBA").resize(
+                    (32, 32), Image.Resampling.LANCZOS)
             icon = ImageTk.PhotoImage(icon_image)
             self.tool_icons[tool] = icon
             button = tk.Button(
@@ -969,12 +928,13 @@ class PaintApp:
         self.picker_sample_area_var = tk.BooleanVar(value=False)
         self.vector_antialias_var = self.brush_antialias_var
         self.vector_hardness_var = self.brush_hardness_var
-        tk.Label(left, textvariable=self.tool_hint_var).pack(pady=(2, 0))
+        tk.Label(self.left_panel_content, textvariable=self.tool_hint_var).pack(
+            pady=(2, 0))
 
         # ── Color Selector ─────────────────────────────────────────────
         # Keep the whole group anchored to the bottom of the sidebar. The
         # unused height between Tools and Colors expands with the window.
-        color_panel = tk.Frame(left)
+        color_panel = tk.Frame(self.left_panel_content)
         color_panel.pack(side="bottom", fill="x", pady=(0, 6))
 
         ttk.Separator(color_panel, orient="horizontal").pack(
@@ -1071,14 +1031,21 @@ class PaintApp:
         self.view_workspace = tk.Frame(main)
         self.view_workspace.pack(side="left", fill="both", expand=True)
 
-        self.view_tabs = tk.Frame(self.view_workspace, bd=1, relief="raised")
+        self.top_workspace_panel = tk.Frame(self.view_workspace)
+        self.top_workspace_panel.pack(side="top", fill="x")
+
+        self.view_tabs = tk.Frame(
+            self.top_workspace_panel, bd=1, relief="raised")
         self.view_tabs.pack(side="top", fill="x")
+        self.top_panel_toggle = tk.Button(
+            self.view_tabs, text="▲", width=2, command=self.toggle_top_panel)
+        self.top_panel_toggle.pack(side="right", padx=3, pady=2)
 
         # Keep tool settings in a stable horizontal strip below the view tabs.
         # The fixed-height outer frame remains visible even for tools without
         # options, preventing the canvas from changing size as tools change.
         self.tool_settings_bar = tk.Frame(
-            self.view_workspace, height=44, bd=1, relief="groove")
+            self.top_workspace_panel, height=44, bd=1, relief="groove")
         self.tool_settings_bar.pack(side="top", fill="x")
         self.tool_settings_bar.pack_propagate(False)
         tk.Label(
@@ -1296,10 +1263,21 @@ class PaintApp:
 
         # ── Right panel: layers ───────────────────────────────────────────
         right = tk.Frame(main, width=250, bd=1, relief="sunken")
+        self.right_panel = right
         right.pack(side="right", fill="y")
         right.pack_propagate(False)
 
-        tk.Label(right, text="Layers", font=("TkDefaultFont", 9, "bold")).pack(pady=(6, 2))
+        right_header = tk.Frame(right)
+        right_header.pack(fill="x", pady=(3, 2))
+        self.right_panel_toggle = tk.Button(
+            right_header, text="▶", width=2, command=self.toggle_right_panel)
+        self.right_panel_toggle.pack(side="left", padx=3)
+        self.right_panel_title = tk.Label(
+            right_header, text="Layers", font=("TkDefaultFont", 9, "bold"))
+        self.right_panel_title.pack(side="right", padx=(2, 8))
+
+        self.right_panel_content = tk.Frame(right)
+        self.right_panel_content.pack(fill="both", expand=True)
 
         self.layer_style = ttk.Style()
         self.layer_style.configure("Layer.Treeview", rowheight=32)
@@ -1311,7 +1289,8 @@ class PaintApp:
                 "Treeview", "foreground", ("selected",)) or "#ffffff")
         self.layer_selected_raster_color = "#c94f4f"
         self.layer_list = ttk.Treeview(
-            right, show="tree", selectmode="browse", style="Layer.Treeview")
+            self.right_panel_content, show="tree", selectmode="browse",
+            style="Layer.Treeview")
         self.layer_list.pack(fill="both", expand=True, padx=4)
         self.layer_list.column("#0", stretch=True, width=220)
         self.layer_list.tag_configure("raster", background="#f7dddd")
@@ -1354,7 +1333,7 @@ class PaintApp:
             ("Move Layer Up", "move-layer-up.png", self.move_layer_up),
             ("Move Layer Down", "move-layer-down.png", self.move_layer_down),
         ]
-        action_frame = tk.Frame(right)
+        action_frame = tk.Frame(self.right_panel_content)
         action_frame.pack(padx=4, pady=(4, 0))
         self.layer_action_icons = {}
         self.layer_action_hint = tk.StringVar(value="Layer Actions")
@@ -1374,7 +1353,9 @@ class PaintApp:
             button.bind(
                 "<Leave>",
                 lambda event: self.layer_action_hint.set("Layer Actions"))
-        tk.Label(right, textvariable=self.layer_action_hint).pack(pady=(1, 4))
+        tk.Label(
+            self.right_panel_content, textvariable=self.layer_action_hint
+        ).pack(pady=(1, 4))
 
     def request_redraw(self, defer=False):
         if hasattr(self, "active_view") and self.active_view != "main":
@@ -1704,6 +1685,62 @@ class PaintApp:
         self._sync_picker_to_active_color()
         self.request_redraw()
 
+    def _panel_layout_changed(self):
+        """Refresh the active view after a panel changes the available space."""
+        self.root.update_idletasks()
+        self.request_redraw()
+        globe = getattr(self, "globe_window", None)
+        if globe is not None and self.active_view == "globe":
+            try:
+                globe.notify_document_changed()
+            except tk.TclError:
+                self.globe_window = None
+
+    def toggle_left_panel(self):
+        """Collapse or restore the shared tools and colors column."""
+        self.left_panel_collapsed = not self.left_panel_collapsed
+        if self.left_panel_collapsed:
+            self.left_panel_content.pack_forget()
+            self.left_panel_title.pack_forget()
+            self.left_panel.configure(width=42)
+            self.left_panel_toggle.configure(text="▶")
+        else:
+            self.left_panel.configure(width=190)
+            self.left_panel_title.pack(side="left", padx=(8, 2))
+            self.left_panel_content.pack(fill="both", expand=True)
+            self.left_panel_toggle.configure(text="◀")
+        self._panel_layout_changed()
+
+    def toggle_right_panel(self):
+        """Collapse or restore the shared layers column."""
+        self.right_panel_collapsed = not self.right_panel_collapsed
+        if self.right_panel_collapsed:
+            self.right_panel_content.pack_forget()
+            self.right_panel_title.pack_forget()
+            self.right_panel.configure(width=42)
+            self.right_panel_toggle.configure(text="◀")
+        else:
+            self.right_panel.configure(width=250)
+            self.right_panel_title.pack(side="right", padx=(2, 8))
+            self.right_panel_content.pack(fill="both", expand=True)
+            self.right_panel_toggle.configure(text="▶")
+        self._panel_layout_changed()
+
+    def toggle_top_panel(self):
+        """Collapse or restore the view tabs and tool-settings row."""
+        self.top_panel_collapsed = not self.top_panel_collapsed
+        if self.top_panel_collapsed:
+            for tab in self.view_tab_widgets.values():
+                tab.pack_forget()
+            self.tool_settings_bar.pack_forget()
+            self.top_panel_toggle.configure(text="▼")
+        else:
+            for tab in self.view_tab_widgets.values():
+                tab.pack(side="left", padx=2, pady=2)
+            self.tool_settings_bar.pack(side="top", fill="x")
+            self.top_panel_toggle.configure(text="▲")
+        self._panel_layout_changed()
+
     def open_settings(self):
         win = tk.Toplevel(self.root)
         win.title("Settings")
@@ -1751,7 +1788,8 @@ class PaintApp:
         if closable:
             tk.Button(tab, text="×", bd=0, padx=4,
                       command=lambda key=view_id: self.close_view(key)).pack(side="left")
-        tab.pack(side="left", padx=2, pady=2)
+        if not self.top_panel_collapsed:
+            tab.pack(side="left", padx=2, pady=2)
         self.view_tab_widgets[view_id] = tab
 
     def switch_view(self, view_id):
