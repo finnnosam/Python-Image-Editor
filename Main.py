@@ -12,6 +12,7 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from windows_clipboard import copy_image, paste_image
 
 
 def _apply_hardness_to_alpha(alpha, hardness, softness_scale):
@@ -823,6 +824,8 @@ class PaintApp:
 
         tk.Button(top, text="New",        command=self.new_project).pack(side="left", padx=2, pady=2)
         tk.Button(top, text="Open",       command=self.open_project).pack(side="left", padx=2, pady=2)
+        tk.Button(top, text="Copy", command=self.copy_to_clipboard).pack(side="left", padx=2, pady=2)
+        tk.Button(top, text="Paste", command=self.paste_from_clipboard).pack(side="left", padx=2, pady=2)
         tk.Button(top, text="Save",       command=self.save_project).pack(side="left", padx=2, pady=2)
         tk.Button(top, text="Save As",    command=self.save_project_as).pack(side="left", padx=2, pady=2)
         tk.Button(top, text="Export PNG", command=self.save_image).pack(side="left", padx=2, pady=2)
@@ -1255,6 +1258,10 @@ class PaintApp:
         self.root.bind("<KeyPress-KP_Add>", lambda e: adjust_size(1))
         self.root.bind("<KeyPress-KP_Subtract>", lambda e: adjust_size(-1))
         self.canvas.bind("<Control-z>", lambda e: self.undo())
+        self.root.bind("<Control-c>", self.copy_to_clipboard)
+        self.root.bind("<Control-v>", self.paste_from_clipboard)
+        self.canvas.bind("<Control-c>", self.copy_to_clipboard)
+        self.canvas.bind("<Control-v>", self.paste_from_clipboard)
         self.canvas.bind("<Control-a>", self.select_all)
         self.canvas.bind("<Control-b>", self.zoom_to_selection)
         self.canvas.bind("<Control-s>", lambda e: self.save_project())
@@ -4065,6 +4072,69 @@ class PaintApp:
         self.mouse_x = event.x
         self.mouse_y = event.y
         self.request_redraw()
+
+    def _clipboard_text_focus(self, event):
+        return event is not None and event.widget.winfo_class() in {
+            "Entry", "TEntry", "Spinbox", "TSpinbox", "Text", "TCombobox"}
+
+    def _finish_clipboard_edit(self):
+        self._finish_bucket_preview()
+        self._finish_raster_stroke()
+        self._finish_clone_stroke()
+        self._finish_selection_move()
+        self._finish_selection_boundary_move()
+
+    def copy_to_clipboard(self, event=None):
+        if self._clipboard_text_focus(event):
+            return
+        self._finish_clipboard_edit()
+        layer = self.layers[self.active_layer]
+        if not layer.is_raster:
+            layer.render_vector()
+        box = self._selection_pixel_box()
+        pixels = layer.image.crop(box) if box else layer.image.copy()
+        if box:
+            pixels.putalpha(ImageChops.multiply(
+                pixels.getchannel("A"), self.selection_mask.crop(box)))
+        try:
+            copy_image(pixels, self.root.winfo_id())
+        except Exception as error:
+            messagebox.showerror("Copy", str(error))
+        return "break"
+
+    def paste_from_clipboard(self, event=None):
+        if self._clipboard_text_focus(event):
+            return
+        layer = self.layers[self.active_layer]
+        if not layer.is_raster:
+            messagebox.showinfo("Paste", "Select a raster layer to paste pixels.")
+            return "break"
+        try:
+            pixels = paste_image()
+        except Exception as error:
+            messagebox.showerror("Paste", str(error))
+            return "break"
+        if pixels is None:
+            messagebox.showinfo("Paste", "The Windows clipboard does not contain an image.")
+            return "break"
+        self._finish_clipboard_edit()
+        self.snapshot()
+        box = self._selection_pixel_box()
+        left, top = box[:2] if box else (0, 0)
+        layer.image.alpha_composite(pixels, (left, top))
+        layer.reset_mipmaps()
+        self.selection_mask = Image.new("L", (self.doc_w, self.doc_h), 0)
+        self.selection_mask.paste(255, (left, top,
+            min(self.doc_w, left + pixels.width),
+            min(self.doc_h, top + pixels.height)))
+        self._update_selection_geometry()
+        self.refresh_layers()
+        self.set_tool("move")
+        self._ensure_selection_animation()
+        self.canvas.focus_set()
+        self.request_redraw()
+        self.notify_globe_document_changed()
+        return "break"
 
     def save_image(self):
         name = filedialog.asksaveasfilename(defaultextension=".png",

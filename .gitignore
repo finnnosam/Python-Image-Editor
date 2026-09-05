@@ -2,6 +2,7 @@
 __pycache__/
 .cwtools-ai/
 .agents/
+/testing_tools/
 #Files
 Debug_Version.py
 Debug_Version_old.py
