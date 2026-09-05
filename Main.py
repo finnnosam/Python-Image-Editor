@@ -746,6 +746,7 @@ class PaintApp:
         self.move_start = None
         self.move_source_box = None
         self.move_pixels = None
+        self.move_is_paste = False
         self.move_mask = None
         self.move_base_image = None
         self.move_selection_bounds = None
@@ -3168,6 +3169,7 @@ class PaintApp:
             return
         self.snapshot()
         self.move_start = (x, y)
+        self.move_is_paste = False
         self.move_source_box = box
         self.move_pixels = layer.image.crop(box)
         self.move_mask = self.selection_mask.crop(box)
@@ -3216,19 +3218,20 @@ class PaintApp:
         """Finish an interactive move and release its temporary images."""
         if self.move_pixels is None:
             return
-        moved = self.move_offset != (0, 0)
+        changed = self.move_is_paste or self.move_offset != (0, 0)
         self.move_start = None
         self.move_source_box = None
         self.move_pixels = None
+        self.move_is_paste = False
         self.move_mask = None
         self.move_base_image = None
         self.move_selection_bounds = None
         self.move_offset = (0, 0)
         self.move_drag_origin_offset = (0, 0)
-        if not moved and self.undo_stack:
+        if not changed and self.undo_stack:
             # Avoid adding an undo step for a click without movement.
             self.undo_stack.pop()
-        if moved:
+        if changed:
             self.notify_globe_document_changed()
 
     def _start_selection_boundary_move(self, x, y):
@@ -4118,18 +4121,25 @@ class PaintApp:
             messagebox.showinfo("Paste", "The Windows clipboard does not contain an image.")
             return "break"
         self._finish_clipboard_edit()
+        # Tool changes finish the current float; switch before starting paste.
+        self.set_tool("move")
         self.snapshot()
         box = self._selection_pixel_box()
         left, top = box[:2] if box else (0, 0)
-        layer.image.alpha_composite(pixels, (left, top))
-        layer.reset_mipmaps()
-        self.selection_mask = Image.new("L", (self.doc_w, self.doc_h), 0)
-        self.selection_mask.paste(255, (left, top,
-            min(self.doc_w, left + pixels.width),
-            min(self.doc_h, top + pixels.height)))
-        self._update_selection_geometry()
-        self.refresh_layers()
-        self.set_tool("move")
+        right = min(self.doc_w, left + pixels.width)
+        bottom = min(self.doc_h, top + pixels.height)
+        self.move_source_box = (left, top, right, bottom)
+        self.move_pixels = pixels.crop((0, 0, right - left, bottom - top))
+        self.move_mask = Image.new("L", self.move_pixels.size, 255)
+        # Paste previews preserve the complete base instead of cutting it.
+        self.move_base_image = layer.image.copy()
+        self.move_is_paste = True
+        self.move_selection_bounds = self.move_source_box
+        self.move_offset = (0, 0)
+        self.move_drag_origin_offset = (0, 0)
+        self.move_start = (left, top)
+        self._update_selection_move(left, top)
+        self._release_selection_move()
         self._ensure_selection_animation()
         self.canvas.focus_set()
         self.request_redraw()
