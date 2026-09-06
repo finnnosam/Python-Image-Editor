@@ -699,6 +699,67 @@ def spherical_brush_uv(
     ]
 
 
+def close_equirectangular_brush(boundary_uv, center_uv, angular_radius,
+                                edge_padding_uv=(0.0, 0.0)):
+    """Return a seam-safe polygon for a spherical brush boundary.
+
+    A spherical disc that contains a pole maps to a polar cap, not an
+    ordinary closed polygon: its boundary winds once around the texture and
+    must be closed along the corresponding horizontal texture edge.
+    """
+    if not boundary_uv:
+        return []
+
+    center_u, center_v = center_uv
+    north_distance = center_v * math.pi
+    south_distance = (1.0 - center_v) * math.pi
+    pole_v = None
+    if north_distance <= angular_radius + EPSILON:
+        pole_v = 0.0
+    elif south_distance <= angular_radius + EPSILON:
+        pole_v = 1.0
+
+    if pole_v is None:
+        return [
+            (center_u + ((u - center_u + 0.5) % 1.0 - 0.5), v)
+            for u, v in boundary_uv
+        ]
+
+    # Keep successive boundary vertices continuous while they wind around the
+    # pole.  Relative-to-centre unwrapping would insert a jump halfway around.
+    first_u, first_v = boundary_uv[0]
+    first_u = center_u + ((first_u - center_u + 0.5) % 1.0 - 0.5)
+    polygon = [(first_u, first_v)]
+    previous_u = first_u
+    for u, v in boundary_uv[1:]:
+        u = previous_u + ((u - previous_u + 0.5) % 1.0 - 0.5)
+        polygon.append((u, v))
+        previous_u = u
+
+    # The samples do not repeat their first vertex, so ``previous_u`` stops
+    # one segment short of a complete turn.  Explicitly finish that turn;
+    # otherwise a 32-segment brush leaves 1/32 of the pole row unpainted.
+    winding = 1.0 if previous_u >= first_u else -1.0
+    closing_u = first_u + winding
+    padding_u, padding_v = edge_padding_uv
+    padded_closing_u = closing_u + winding * padding_u
+    padded_first_u = first_u - winding * padding_u
+    padded_pole_v = (-padding_v if pole_v == 0.0
+                     else 1.0 + padding_v)
+    polygon.extend(((closing_u, first_v),
+                    (padded_closing_u, padded_pole_v),
+                    (padded_first_u, padded_pole_v)))
+
+    # Longitude at a pole is arbitrary, and the tangent basis can place this
+    # unwrapped turn one texture too far from the brush centre.  Keep it near
+    # the centre so the renderer's neighbouring seam copies always cover it.
+    midpoint_u = first_u + winding * 0.5
+    shift = round(center_u - midpoint_u)
+    if shift:
+        polygon = [(u + shift, v) for u, v in polygon]
+    return polygon
+
+
 # --------------------------------------------------------------------
 # Picking
 # --------------------------------------------------------------------

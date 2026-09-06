@@ -32,9 +32,11 @@ def _apply_hardness_to_alpha(alpha, hardness, softness_scale):
 
 
 def _brush_shape_mask(image, bounds, paint_mask, antialias=False,
-                      hardness=75):
+                      hardness=75, softness_scale=None):
     """Return the clipped document box and coverage mask for a brush shape."""
-    softness_scale = max(bounds[2] - bounds[0], bounds[3] - bounds[1]) * 0.25
+    if softness_scale is None:
+        softness_scale = max(
+            bounds[2] - bounds[0], bounds[3] - bounds[1]) * 0.25
     blur_radius = (softness_scale * (75 - hardness) / 75
                    if antialias and hardness < 75 else 0)
     padding = (1 + math.ceil(blur_radius * 3)) if antialias else 0
@@ -3856,12 +3858,13 @@ class PaintApp:
         """Restrict a raster tool mask to the active selection."""
         return ImageChops.multiply(mask, self._selection_mask_for_box(box))
 
-    def _paint_brush_shape(self, layer, bounds, color, paint_mask):
+    def _paint_brush_shape(self, layer, bounds, color, paint_mask,
+                           softness_scale=None):
         """Paint one dab, optionally capping coverage for the current stroke."""
         antialias = self.brush_antialias_var.get()
         box, dab_mask = _brush_shape_mask(
             layer.image, bounds, paint_mask, antialias=antialias,
-            hardness=self.brush_hardness())
+            hardness=self.brush_hardness(), softness_scale=softness_scale)
         if box is None:
             return None
         dab_mask = self._clip_raster_mask_to_selection(box, dab_mask)
@@ -3886,12 +3889,13 @@ class PaintApp:
         self.apply_raster_result(layer, result, box)
         return box
 
-    def _erase_brush_shape(self, layer, bounds, paint_mask):
+    def _erase_brush_shape(self, layer, bounds, paint_mask,
+                           softness_scale=None):
         """Erase through a hard or anti-aliased mask with stroke buildup rules."""
         box, dab_mask = _brush_shape_mask(
             layer.image, bounds, paint_mask,
             antialias=self.brush_antialias_var.get(),
-            hardness=self.brush_hardness())
+            hardness=self.brush_hardness(), softness_scale=softness_scale)
         if box is None:
             return None
         dab_mask = self._clip_raster_mask_to_selection(box, dab_mask)
@@ -4032,6 +4036,7 @@ class PaintApp:
             self.notify_globe_document_changed()
 
     def stamp_external_spherical_raster(self, footprint_uv, center_x, center_y,
+                                        brush_softness_scale=None,
                                         refresh=True):
         """Fill a globe-relative brush footprint on the equirectangular map.
 
@@ -4047,35 +4052,39 @@ class PaintApp:
                      "primary" if self.last_button == 1 else "secondary"))
         polygon = [(u * self.doc_w, v * self.doc_h) for u, v in footprint_uv]
 
-        # Repeat the unwrapped polygon on both sides of the texture.  PIL clips
-        # each copy to the image, preserving a brush that straddles the seam.
+        # Repeat the unwrapped polygon on both sides of the texture.  Draw all
+        # copies into one mask before antialiasing/hardness is applied; treating
+        # them as separate dabs would soften their artificial seam edges.
         layer = self.layers[self.active_layer]
-        for offset in (-self.doc_w, 0, self.doc_w):
-            shifted = [(x + offset, y) for x, y in polygon]
-            xs = [point[0] for point in shifted]
-            ys = [point[1] for point in shifted]
-            bounds = (min(xs), min(ys), max(xs), max(ys))
-            if self.tool == "eraser":
-                dirty_box = self._erase_brush_shape(
-                    layer,
-                    bounds,
-                    lambda draw, left, top, scale, points=shifted: draw.polygon(
-                        [((x - left + 0.5) * scale,
-                          (y - top + 0.5) * scale)
-                         for x, y in points], fill=255),
+        copies = [
+            [(x + offset, y) for x, y in polygon]
+            for offset in (-self.doc_w, 0, self.doc_w)
+        ]
+        all_points = [point for points in copies for point in points]
+        bounds = (
+            min(x for x, _ in all_points), min(y for _, y in all_points),
+            max(x for x, _ in all_points), max(y for _, y in all_points),
+        )
+
+        def paint_copies(draw, left, top, scale):
+            for points in copies:
+                draw.polygon(
+                    [((x - left + 0.5) * scale,
+                      (y - top + 0.5) * scale)
+                     for x, y in points],
+                    fill=255,
                 )
-            else:
-                dirty_box = self._paint_brush_shape(
-                    layer,
-                    bounds,
-                    color,
-                    lambda draw, left, top, scale, points=shifted: draw.polygon(
-                        [((x - left + 0.5) * scale,
-                          (y - top + 0.5) * scale)
-                         for x, y in points], fill=255),
-                )
-            if dirty_box is not None:
-                layer.update_mipmaps(dirty_box)
+
+        if self.tool == "eraser":
+            dirty_box = self._erase_brush_shape(
+                layer, bounds, paint_copies,
+                softness_scale=brush_softness_scale)
+        else:
+            dirty_box = self._paint_brush_shape(
+                layer, bounds, color, paint_copies,
+                softness_scale=brush_softness_scale)
+        if dirty_box is not None:
+            layer.update_mipmaps(dirty_box)
 
         self.last_x, self.last_y = center_x, center_y
         if refresh:

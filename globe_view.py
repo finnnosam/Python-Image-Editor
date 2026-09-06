@@ -37,6 +37,7 @@ from sphere_math import (
     vec_to_uv,
     uv_to_vec,
     spherical_brush_uv,
+    close_equirectangular_brush,
     apply_globe_rotation,
     remove_globe_rotation,
 )
@@ -804,17 +805,24 @@ class GlobeView(tk.Frame):
 
         # Keep the boundary continuous around the brush centre.  Coordinates
         # are deliberately allowed outside [0, 1] for seam-safe rasterizing.
-        footprint_uv = []
+        texture_boundary = []
         for point_u, point_v in boundary:
             texture_u = (1.0 - point_u) % 1.0
-            texture_u = uv[0] + ((texture_u - uv[0] + 0.5) % 1.0 - 0.5)
-            footprint_uv.append((texture_u, point_v))
+            texture_boundary.append((texture_u, point_v))
+        footprint_uv = close_equirectangular_brush(
+            texture_boundary,
+            uv,
+            angular_radius,
+            edge_padding_uv=(0.5 / self.texture.width,
+                             0.5 / self.texture.height),
+        )
 
         center_x, center_y = self.uv_to_image(*uv)
         self.app.stamp_external_spherical_raster(
             footprint_uv,
             center_x,
             center_y,
+            brush_softness_scale=radius * 0.5,
             refresh=refresh,
         )
 
