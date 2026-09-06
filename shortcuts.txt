@@ -1,0 +1,41 @@
+# Keyboard shortcuts — edit this file and restart PyPaint to apply changes.
+# Format: action = key, alternative key
+# An empty value disables a shortcut. Lines starting with # are comments.
+# Modifiers: Ctrl, Shift, Alt. Letter case alone does not mean Shift.
+# Named keys: Plus, Minus, Equals, NumpadPlus, NumpadMinus, Enter, Escape,
+# Space, Tab, Delete, Backspace, arrows, Home, End, PageUp, PageDown, F1–F35.
+# Each key combination may be assigned to only one action.
+# Mouse gestures and text-field editing keys are not changed by this file.
+
+pan = H
+cycle_selection = S
+cycle_move = M
+color_picker = I
+brush = B
+pencil = P
+eraser = E
+clone = C
+paint_bucket = F
+vector_edit = V
+line = L
+rectangle = R
+ellipse = O
+
+# Optional direct tool shortcuts (S and M still cycle tools).
+selection =
+brush_selection =
+magic_wand =
+move =
+move_selection =
+
+increase_size = Plus, Equals, Shift+Equals, NumpadPlus
+decrease_size = Minus, NumpadMinus
+undo = Ctrl+Z
+copy = Ctrl+C
+paste = Ctrl+V
+select_all = Ctrl+A
+zoom_to_selection = Ctrl+B
+save = Ctrl+S
+new = Ctrl+N
+open = Ctrl+O
+commit_fill = Enter

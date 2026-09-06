@@ -13,6 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from windows_clipboard import copy_image, paste_image
+from shortcuts import read_shortcuts
 
 
 def _apply_hardness_to_alpha(alpha, hardness, softness_scale):
@@ -89,6 +90,26 @@ def _composite_brush_shape(image, bounds, color, paint_mask, antialias=False):
     source.putalpha(ImageChops.multiply(source_alpha, mask))
     image.alpha_composite(source, (box[0], box[1]))
     return box
+
+
+def _pencil_path(x0, y0, x1, y1):
+    """Yield a thin, four-connected staircase between two pixel centers."""
+    dx, dy = abs(x1 - x0), abs(y1 - y0)
+    sx, sy = (1 if x0 < x1 else -1), (1 if y0 < y1 else -1)
+    error = dx - dy
+    yield x0, y0
+    while (x0, y0) != (x1, y1):
+        previous_x, previous_y = x0, y0
+        twice = 2 * error
+        if twice > -dy:
+            error -= dy
+            x0 += sx
+        if twice < dx:
+            error += dx
+            y0 += sy
+        if x0 != previous_x and y0 != previous_y:
+            yield ((previous_x, y0) if sy > 0 else (x0, previous_y))
+        yield x0, y0
 
 
 class VectorObject:
@@ -764,6 +785,7 @@ class PaintApp:
         self.clone_stroke_base = None
         self.clone_stroke_coverage = None
         self.bucket_pending = None
+        self.wand_pending = None
 
         # Drag and drop variables
         self.drag_start_index = None
@@ -782,7 +804,6 @@ class PaintApp:
             "<Button-1>", self._commit_pending_bucket_on_click, add="+")
         self.root.bind_all(
             "<Button-3>", self._commit_pending_bucket_on_click, add="+")
-        self.root.bind_all("<Return>", self._finish_bucket_preview, add="+")
         self.apply_ui_scale(self.ui_scale)  # A: apply 1.5× on launch
         self.refresh_layers()
         self.redraw()
@@ -879,6 +900,8 @@ class PaintApp:
             ("Line",       "line",        "line.png"),
             ("Rectangle",  "rect",        "rect.png"),
             ("Ellipse",    "ellipse",     "ellipse.png"),
+            ("Magic Wand", "magic wand", "magic-wand.png"),
+            ("Pencil", "pencil", "pencil.png"),
         ]
         icon_dir = Path(__file__).resolve().parent / "icons"
         self.tool_icons = {}
@@ -886,7 +909,7 @@ class PaintApp:
         self.tools_by_layer_type = {
             "raster": ("selection", "move", "move selection",
                        "brush selection", "pan", "color picker", "brush",
-                       "eraser", "clone", "paint bucket"),
+                       "eraser", "clone", "paint bucket", "magic wand", "pencil"),
             "vector": ("pan", "color picker", "vector edit", "line", "rect", "ellipse"),
         }
         self.tool_hint_var = tk.StringVar(value="Brush")
@@ -904,11 +927,15 @@ class PaintApp:
             if tool == "selection":
                 button.grid(row=0, column=1, padx=2, pady=2, sticky="w")
             elif tool == "move":
-                button.grid(row=2, column=1, padx=2, pady=2, sticky="w")
-            elif tool == "move selection":
                 button.grid(row=3, column=1, padx=2, pady=2, sticky="w")
+            elif tool == "move selection":
+                button.grid(row=4, column=1, padx=2, pady=2, sticky="w")
             elif tool == "brush selection":
                 button.grid(row=1, column=1, padx=2, pady=2, sticky="w")
+            elif tool == "magic wand":
+                button.grid(row=2, column=1, padx=2, pady=2, sticky="w")
+            elif tool == "pencil":
+                button.grid(row=5, column=1, padx=2, pady=2, sticky="w")
             else:
                 button.grid(row=index - 4, column=0, padx=2, pady=2, sticky="w")
             button.bind(
@@ -1158,6 +1185,16 @@ class PaintApp:
             self.bucket_settings_frame, text="Reset",
             command=self._reset_bucket_tolerance
         ).pack(side="left", padx=(3, 0))
+        self.wand_settings_frame = tk.Frame(self.tool_settings_bar)
+        tk.Label(self.wand_settings_frame, text="Tolerance:").pack(side="left")
+        tk.Scale(
+            self.wand_settings_frame, from_=0, to=100, orient="horizontal",
+            length=110, variable=self.bucket_tolerance_var
+        ).pack(side="left")
+        tk.Button(self.wand_settings_frame, text="Reset",
+                  command=lambda: self.bucket_tolerance_var.set(0)).pack(side="left")
+        self.bucket_tolerance_var.trace_add(
+            "write", lambda *_: self._refresh_wand_selection())
         tk.Label(self.clone_settings_frame, text="Spacing:").pack(
             side="left", padx=(10, 3))
         self.clone_spacing_entry = tk.Entry(
@@ -1238,36 +1275,7 @@ class PaintApp:
         self.canvas.bind("<ButtonRelease-3>", self.on_mouse_up)
         self.canvas.bind("<MouseWheel>",      self.on_mousewheel)  # Plain scroll for panning
         self.canvas.bind("<Control-MouseWheel>", self.zoom_mouse)  # Ctrl+scroll for zoom
-        # Hotkeys
-        self.canvas.bind("p", lambda e: self.set_tool("pan"))
-        self.canvas.bind("s", self.select_selection_tool)
-        self.canvas.bind("m", self.select_move_tool)
-        self.canvas.bind("i", lambda e: self.set_tool("color picker"))
-        self.canvas.bind("b", lambda e: self.set_tool("brush"))
-        self.canvas.bind("e", lambda e: self.set_tool("eraser"))
-        self.canvas.bind("c", lambda e: self.set_tool("clone"))
-        self.canvas.bind("f", lambda e: self.set_tool("paint bucket"))
-        self.canvas.bind("v", lambda e: self.set_tool("vector edit"))
-        self.canvas.bind("l", lambda e: self.set_tool("line"))
-        self.canvas.bind("r", lambda e: self.set_tool("rect"))
-        self.canvas.bind("o", lambda e: self.set_tool("ellipse"))
-        # Bind size keys at the window level so they keep working after a
-        # settings entry or toolbar button has temporarily taken focus.
-        self.root.bind("<KeyPress-plus>", lambda e: adjust_size(1))
-        self.root.bind("<KeyPress-equal>", lambda e: adjust_size(1))
-        self.root.bind("<Shift-KeyPress-equal>", lambda e: adjust_size(1))
-        self.root.bind("<KeyPress-minus>", lambda e: adjust_size(-1))
-        self.root.bind("<KeyPress-KP_Add>", lambda e: adjust_size(1))
-        self.root.bind("<KeyPress-KP_Subtract>", lambda e: adjust_size(-1))
-        self.canvas.bind("<Control-z>", lambda e: self.undo())
-        self.root.bind("<Control-c>", self.copy_to_clipboard)
-        self.root.bind("<Control-v>", self.paste_from_clipboard)
-        self.canvas.bind("<Control-c>", self.copy_to_clipboard)
-        self.canvas.bind("<Control-v>", self.paste_from_clipboard)
-        self.canvas.bind("<Control-a>", self.select_all)
-        self.canvas.bind("<Control-b>", self.zoom_to_selection)
-        self.canvas.bind("<Control-s>", lambda e: self.save_project())
-        self.canvas.bind("<Control-n>", lambda e: self.new_project())
+        self._load_keyboard_shortcuts(adjust_size)
         self.canvas.focus_set()
         self.update_tool_settings_visibility()
         self.switch_view("main")
@@ -1877,6 +1885,51 @@ class PaintApp:
             tab.pack(side="left", padx=2, pady=2)
         self.view_tab_widgets[view_id] = tab
 
+    def _load_keyboard_shortcuts(self, adjust_size):
+        actions = {
+            "cycle_selection": self.select_selection_tool,
+            "cycle_move": self.select_move_tool,
+            "increase_size": lambda: adjust_size(1),
+            "decrease_size": lambda: adjust_size(-1),
+            "undo": self.undo, "copy": self.copy_to_clipboard,
+            "paste": self.paste_from_clipboard, "select_all": self.select_all,
+            "zoom_to_selection": self.zoom_to_selection,
+            "save": self.save_project, "new": self.new_project,
+            "open": self.open_project, "commit_fill": self._finish_bucket_preview,
+        }
+        for name, tool in {
+                "pan": "pan", "color_picker": "color picker", "brush": "brush",
+                "pencil": "pencil", "eraser": "eraser", "clone": "clone",
+                "paint_bucket": "paint bucket", "vector_edit": "vector edit",
+                "line": "line", "rectangle": "rect", "ellipse": "ellipse",
+                "selection": "selection", "brush_selection": "brush selection",
+                "magic_wand": "magic wand", "move": "move",
+                "move_selection": "move selection"}.items():
+            actions[name] = lambda tool=tool: self.set_tool(tool)
+        path = Path(__file__).resolve().parent / "shortcuts.txt"
+        try:
+            bindings, errors = read_shortcuts(path, actions)
+        except (OSError, UnicodeError) as error:
+            bindings, errors = [], [str(error)]
+        window_actions = {"copy", "paste", "increase_size", "decrease_size", "commit_fill"}
+        for action, sequence in bindings:
+            def invoke(event, callback=actions[action]):
+                if self._clipboard_text_focus(event):
+                    return
+                callback()
+                return "break"
+            try:
+                # Canvas bindings take precedence over plain letter tools;
+                # selected actions also work when toolbar controls have focus.
+                self.canvas.bind(sequence, invoke)
+                if action in window_actions:
+                    self.root.bind(sequence, invoke)
+            except tk.TclError as error:
+                errors.append(f"{action}: {error}")
+        if errors:
+            message = f"Check {path}:\n\n" + "\n".join(errors)
+            self.root.after_idle(lambda: messagebox.showwarning("Keyboard shortcuts", message))
+
     def _initialize_documents(self):
         self.document_fields = (
             "doc_w doc_h current_file layers active_layer undo_stack zoom "
@@ -1906,6 +1959,7 @@ class PaintApp:
     def _store_document(self):
         if self.active_document is None:
             return
+        self.wand_pending = None
         self._finish_bucket_preview()
         self._finish_raster_stroke()
         self._finish_clone_stroke()
@@ -2323,6 +2377,7 @@ class PaintApp:
             return
         self._finish_raster_stroke()
         if tool != self.tool:
+            self.wand_pending = None
             self._finish_bucket_preview()
             self._finish_clone_stroke()
             self._finish_selection_move()
@@ -2354,13 +2409,15 @@ class PaintApp:
         self.set_tool(next_tool)
 
     def select_selection_tool(self, event=None):
-        """Select Selection, or Brush Selection when it is already active."""
-        next_tool = ("brush selection" if self.tool == "selection"
-                     else "selection")
+        """Cycle rectangle, brush selection, and magic wand with S."""
+        tools = ("selection", "brush selection", "magic wand")
+        next_tool = (tools[(tools.index(self.tool) + 1) % len(tools)]
+                     if self.tool in tools else tools[0])
         self.set_tool(next_tool)
 
     def select_all(self, event=None):
         """Select every pixel in the document."""
+        self.wand_pending = None
         self._finish_bucket_preview()
         self._finish_selection_move()
         self._finish_selection_boundary_move()
@@ -2419,12 +2476,13 @@ class PaintApp:
 
         for frame in (self.size_frame, self.picker_settings_frame,
                       self.brush_settings_frame, self.clone_settings_frame,
-                      self.bucket_settings_frame, self.vector_settings_frame):
+                      self.bucket_settings_frame, self.wand_settings_frame,
+                      self.vector_settings_frame):
             frame.pack_forget()
 
         uses_size = (self.tool not in
                      ("pan", "selection", "move", "move selection",
-                      "paint bucket") and
+                      "paint bucket", "magic wand", "pencil") and
                      (self.tool != "color picker" or
                       self.picker_sample_area_var.get()))
         if uses_size:
@@ -2441,6 +2499,9 @@ class PaintApp:
         elif (self.tool == "paint bucket" and self.layers and
               self.layers[self.active_layer].is_raster):
             self.bucket_settings_frame.pack(side="left")
+        elif (self.tool == "magic wand" and self.layers and
+              self.layers[self.active_layer].is_raster):
+            self.wand_settings_frame.pack(side="left")
         elif self.tool in ("line", "rect", "ellipse"):
             self.vector_settings_frame.pack(side="left")
         self.request_redraw()
@@ -2835,6 +2896,11 @@ class PaintApp:
             self.pick_color(event)
             return
         x, y = self.image_coords(event.x, event.y)
+        if self.tool == "magic wand":
+            if event.num == 1:
+                self._select_magic_wand(math.floor(x), math.floor(y),
+                                        add=bool(event.state & 0x4))
+            return
         if self.tool == "selection":
             control_down = bool(event.state & 0x4)
             operation = ("subtract" if control_down and event.num == 3 else
@@ -2962,7 +3028,7 @@ class PaintApp:
                 clone_x, clone_y = self.raster_image_coords(event.x, event.y)
                 self._paint_clone(clone_x, clone_y)
             return
-        if self.tool == "paint bucket":
+        if self.tool in ("paint bucket", "magic wand"):
             return
         current_layer = self.layers[self.active_layer]
         
@@ -3028,8 +3094,9 @@ class PaintApp:
         """Capture the state needed to cap opacity within one brush gesture."""
         self._stroke_base_image = None
         self._stroke_coverage = None
-        if (self.tool in ("brush", "eraser") and
-                not self.brush_build_up_var.get() and self.undo_stack):
+        if (self.undo_stack and (self.tool == "pencil" or
+                (self.tool in ("brush", "eraser") and
+                 not self.brush_build_up_var.get()))):
             snapshot_layers, snapshot_active = self.undo_stack[-1]
             if snapshot_active == self.active_layer:
                 self._stroke_base_image = snapshot_layers[snapshot_active].image
@@ -3114,31 +3181,7 @@ class PaintApp:
         layer.reset_mipmaps()
         pixel_x, pixel_y = pending["pixel_x"], pending["pixel_y"]
 
-        pixels = np.asarray(pending["original"])
-        target = pixels[pixel_y, pixel_x]
-        tolerance = self.bucket_tolerance()
-        if tolerance == 0:
-            matches = np.all(pixels == target, axis=2)
-        elif tolerance == 100:
-            matches = np.ones((self.doc_h, self.doc_w), dtype=bool)
-        else:
-            differences = (pixels.astype(np.int32) -
-                           target.astype(np.int32))
-            distance_squared = np.sum(
-                differences * differences, axis=2)
-            maximum_distance = math.sqrt(4 * 255 * 255)
-            threshold = maximum_distance * tolerance / 100
-            matches = distance_squared <= threshold * threshold
-        flood_source = Image.fromarray(
-            np.where(matches, 0, 255).astype(np.uint8)).copy()
-        ImageDraw.floodfill(flood_source, (pixel_x, pixel_y), 128)
-        fill_mask = flood_source.point(
-            lambda value: 255 if value == 128 else 0)
-
-        if self.bucket_antialias_var.get():
-            fill_mask = fill_mask.filter(ImageFilter.GaussianBlur(0.65))
-            fill_mask = _apply_hardness_to_alpha(
-                fill_mask, self.bucket_hardness(), 2)
+        fill_mask = self._bucket_region_mask(pending["original"], pixel_x, pixel_y)
         fill_mask = self._clip_raster_mask_to_selection(
             (0, 0, self.doc_w, self.doc_h), fill_mask)
         dirty_box = fill_mask.getbbox()
@@ -3156,6 +3199,67 @@ class PaintApp:
         result.alpha_composite(source)
         self.apply_raster_result(layer, result, dirty_box)
         layer.update_mipmaps(dirty_box)
+        self.request_redraw()
+
+    def _bucket_region_mask(self, image, pixel_x, pixel_y, antialias=True):
+        """Find a contiguous color region for both bucket and wand."""
+        pixels = np.asarray(image)
+        target = pixels[pixel_y, pixel_x]
+        tolerance = self.bucket_tolerance()
+        if tolerance == 0:
+            matches = np.all(pixels == target, axis=2)
+        elif tolerance == 100:
+            matches = np.ones((image.height, image.width), dtype=bool)
+        else:
+            differences = (pixels.astype(np.int32) -
+                           target.astype(np.int32))
+            distance_squared = np.sum(
+                differences * differences, axis=2)
+            maximum_distance = math.sqrt(4 * 255 * 255)
+            threshold = maximum_distance * tolerance / 100
+            matches = distance_squared <= threshold * threshold
+        flood_source = Image.fromarray(
+            np.where(matches, 0, 255).astype(np.uint8)).copy()
+        ImageDraw.floodfill(flood_source, (pixel_x, pixel_y), 128)
+        fill_mask = flood_source.point(
+            lambda value: 255 if value == 128 else 0)
+
+        if antialias and self.bucket_antialias_var.get():
+            fill_mask = fill_mask.filter(ImageFilter.GaussianBlur(0.65))
+            fill_mask = _apply_hardness_to_alpha(
+                fill_mask, self.bucket_hardness(), 2)
+        return fill_mask
+
+    def _select_magic_wand(self, pixel_x, pixel_y, add=False):
+        if not (0 <= pixel_x < self.doc_w and 0 <= pixel_y < self.doc_h):
+            return
+        layer = self.layers[self.active_layer]
+        if not layer.is_raster:
+            return
+        self._finish_clipboard_edit()
+        self.wand_pending = {
+            "layer": layer,
+            "original": layer.image.copy(),
+            "seed": (pixel_x, pixel_y),
+            "base_mask": self.selection_mask.copy() if add else None,
+        }
+        self._refresh_wand_selection()
+
+    def _refresh_wand_selection(self):
+        """Rebuild the last wand click from its fixed source and prior selection."""
+        pending = self.wand_pending
+        if pending is None or self.tool != "magic wand":
+            return
+        if self.layers[self.active_layer] is not pending["layer"]:
+            self.wand_pending = None
+            return
+        region = self._bucket_region_mask(
+            pending["original"], *pending["seed"], antialias=False)
+        base = pending["base_mask"]
+        self.selection_mask = (ImageChops.lighter(base, region)
+                               if base is not None else region)
+        self._update_selection_geometry()
+        self._ensure_selection_animation()
         self.request_redraw()
 
     def _finish_bucket_preview(self, event=None):
@@ -3660,6 +3764,10 @@ class PaintApp:
         Paint using image coordinates instead of a Tk mouse event.
         """
 
+        if self.tool == "pencil":
+            self._paint_pencil(x, y)
+            return
+
         if self.last_x is None or self.last_y is None:
             self.last_x = x
             self.last_y = y
@@ -3703,6 +3811,39 @@ class PaintApp:
         self.last_x = x
         self.last_y = y
 
+        self.request_redraw()
+        self.notify_globe_document_changed()
+
+    def _paint_pencil(self, x, y):
+        # Raster coordinates place integer values at pixel centers.
+        x1, y1 = math.floor(x + 0.5), math.floor(y + 0.5)
+        x0 = math.floor(self.last_x + 0.5) if self.last_x is not None else x1
+        y0 = math.floor(self.last_y + 0.5) if self.last_y is not None else y1
+        self.last_x, self.last_y = x, y
+        left, top = max(0, min(x0, x1)), max(0, min(y0, y1))
+        right = min(self.doc_w, max(x0, x1) + 1)
+        bottom = min(self.doc_h, max(y0, y1) + 1)
+        if right <= left or bottom <= top:
+            return
+        box = (left, top, right, bottom)
+        mask = Image.new("L", (right - left, bottom - top), 0)
+        for px, py in _pencil_path(x0, y0, x1, y1):
+            if left <= px < right and top <= py < bottom:
+                mask.putpixel((px - left, py - top), 255)
+        mask = self._clip_raster_mask_to_selection(box, mask)
+        layer = self.layers[self.active_layer]
+        if self._stroke_coverage is not None:
+            mask = ImageChops.lighter(self._stroke_coverage.crop(box), mask)
+            self._stroke_coverage.paste(mask, (left, top))
+            result = self._stroke_base_image.crop(box)
+        else:
+            result = layer.image.crop(box)
+        source = Image.new("RGBA", mask.size, self._color_with_opacity(
+            "primary" if self.last_button == 1 else "secondary"))
+        source.putalpha(ImageChops.multiply(source.getchannel("A"), mask))
+        result.alpha_composite(source)
+        layer.image.paste(result, (left, top))
+        layer.update_mipmaps(box)
         self.request_redraw()
         self.notify_globe_document_changed()
 
@@ -4092,7 +4233,7 @@ class PaintApp:
         if self.tool == "clone":
             self._finish_clone_stroke()
             return
-        if self.tool == "paint bucket":
+        if self.tool in ("paint bucket", "magic wand"):
             return
         current_layer = self.layers[self.active_layer]
         
