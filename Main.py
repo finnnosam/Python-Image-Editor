@@ -679,6 +679,11 @@ class Layer:
         return adjusted
 
 class PaintApp:
+    GLOBE_BLOCKED_TOOLS = {
+        "clone", "selection", "brush selection", "move selection",
+        "magic wand"
+    }
+
     def __init__(self, root):
         self.root = root
         self.root.title("PyPaint")
@@ -922,6 +927,8 @@ class PaintApp:
         ]
         icon_dir = Path(__file__).resolve().parent / "icons"
         self.tool_icons = {}
+        self.tool_blocked_overlay = ImageTk.PhotoImage(
+            Image.new("RGBA", (32, 32), (28, 28, 28, 255)))
         self.tool_buttons = {}
         self.tools_by_layer_type = {
             "raster": ("selection", "move", "move selection",
@@ -962,6 +969,8 @@ class PaintApp:
                 "<Leave>",
                 lambda event: self.tool_hint_var.set(self.tool.title()))
             self.tool_buttons[tool] = button
+        self.tool_button_background = next(
+            iter(self.tool_buttons.values())).cget("background")
         self.brush_build_up_var = tk.BooleanVar(value=False)
         self.brush_antialias_var = tk.BooleanVar(value=True)
         self.brush_hardness_var = tk.IntVar(value=75)
@@ -2158,6 +2167,19 @@ class PaintApp:
         """Show one view without disturbing the shared tools or layers."""
         if view_id not in self.views:
             return
+        old_is_globe = self.active_view in self.globe_documents
+        new_is_globe = view_id in self.globe_documents
+        clone_was_selected = self.tool == "clone"
+        if new_is_globe and self.tool in self.GLOBE_BLOCKED_TOOLS:
+            self.set_tool("brush")
+        if old_is_globe != new_is_globe and clone_was_selected:
+            self.clone_source_center = None
+            self.clone_offset = None
+            globe = (self.views.get(self.active_view) if old_is_globe
+                     else self.views.get(view_id))
+            if globe is not None:
+                globe.clone_source_vector = None
+                globe.clone_rotation = None
         owner = self.globe_documents.get(view_id)
         if owner is not None and owner != self.active_document:
             self.switch_document(owner)
@@ -2167,6 +2189,7 @@ class PaintApp:
                 old_view.on_hidden()
             old_view.pack_forget()
         self.active_view = view_id
+        self._update_globe_tool_availability()
         new_view = self.views[view_id]
         new_view.pack(fill="both", expand=True)
         if hasattr(new_view, "on_shown"):
@@ -2178,6 +2201,24 @@ class PaintApp:
             self.canvas.focus_set()
         if hasattr(self, "documents"):
             self._highlight_document_tabs()
+
+    def _update_globe_tool_availability(self):
+        """Visually and functionally disable unsupported globe tools."""
+        if not hasattr(self, "tool_buttons"):
+            return
+        globe_active = self.active_view in self.globe_documents
+        normal_background = self.tool_button_background
+        for name, button in self.tool_buttons.items():
+            blocked = globe_active and name in self.GLOBE_BLOCKED_TOOLS
+            button.configure(
+                state="disabled" if blocked else "normal",
+                image=(self.tool_blocked_overlay if blocked
+                       else self.tool_icons[name]),
+                background="#3b3b3b" if blocked else normal_background,
+                activebackground="#3b3b3b" if blocked else normal_background,
+                relief="flat" if blocked else
+                       ("sunken" if name == self.tool else "raised"),
+            )
 
     def close_view(self, view_id):
         """Remove an optional view and return to the main canvas."""
@@ -2475,6 +2516,9 @@ class PaintApp:
             self.view_tab_widgets.pop(startup_to_replace).destroy()
 
     def set_tool(self, tool):
+        if (self.active_view in getattr(self, "globe_documents", {}) and
+                tool in self.GLOBE_BLOCKED_TOOLS):
+            return
         if (hasattr(self, "tools_by_layer_type") and self.layers and
                 tool not in self.tools_by_layer_type[
                     self.layers[self.active_layer].layer_type]):
@@ -4445,11 +4489,16 @@ class PaintApp:
     def pick_color(self, event):
         """Sample one document pixel into the left or right color slot."""
         image_x, image_y = self.image_coords(event.x, event.y)
+        self.pick_color_at(image_x, image_y, event.num, event.state)
+
+    def pick_color_at(self, image_x, image_y, button=1, state=0):
+        """Sample document coordinates supplied by any view."""
+        self.last_button = button
         pixel_x, pixel_y = math.floor(image_x), math.floor(image_y)
         if not (0 <= pixel_x < self.doc_w and 0 <= pixel_y < self.doc_h):
             return
 
-        composite = bool(event.state & 0x4)
+        composite = bool(state & 0x4)
         if composite:  # Ctrl: sample the final visible composite.
             for layer in self.layers:
                 if layer.visible and layer.layer_type == "vector" and layer.vector_data:
@@ -4496,6 +4545,37 @@ class PaintApp:
         else:
             self.secondary_opacity = rgba[3]
         self._set_selected_color(self._rgb_to_hex(rgba[:3]))
+
+    def set_external_clone_source(self, x, y):
+        self.clone_source_center = (x, y)
+        self.clone_offset = None
+
+    def begin_external_clone(self, x, y, button=1):
+        if self.clone_source_center is None:
+            return False
+        self.last_button = button
+        if self.clone_offset is None:
+            self.clone_offset = (round(self.clone_source_center[0] - x),
+                                 round(self.clone_source_center[1] - y))
+        self.snapshot()
+        self.clone_stroke_source = self.layers[self.active_layer].image.copy()
+        if self.clone_build_up_var.get():
+            self.clone_stroke_base = None
+            self.clone_stroke_coverage = None
+        else:
+            self.clone_stroke_base = self.clone_stroke_source
+            self.clone_stroke_coverage = Image.new(
+                "L", (self.doc_w, self.doc_h), 0)
+        self.clone_last = (x, y)
+        self._paint_clone(x, y)
+        return True
+
+    def continue_external_clone(self, x, y):
+        self._paint_clone(x, y)
+        self.notify_globe_document_changed()
+
+    def end_external_clone(self):
+        self._finish_clone_stroke()
 
     def zoom_mouse(self, event):
         self._zoom_at(event.x, event.y, event.delta > 0)

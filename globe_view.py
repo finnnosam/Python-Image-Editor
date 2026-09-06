@@ -36,6 +36,7 @@ from sphere_math import (
     ray_sphere_intersection,
     vec_to_uv,
     uv_to_vec,
+    spherical_brush_points,
     spherical_brush_uv,
     close_equirectangular_brush,
     apply_globe_rotation,
@@ -97,6 +98,9 @@ class GlobeView(tk.Frame):
 
         self.last_mouse = None
         self.last_uv = None
+        self.cursor_mouse = None
+        self.clone_source_vector = None
+        self.clone_rotation = None
         self.vector_start_screen = None
         self.document_refresh_pending = False
         self.document_dirty = False
@@ -131,6 +135,7 @@ class GlobeView(tk.Frame):
         self.canvas = tk.Canvas(
             self,
             bg="#303030",
+            cursor="crosshair",
             highlightthickness=0
         )
 
@@ -198,6 +203,8 @@ class GlobeView(tk.Frame):
             self.on_mousewheel
         )
         self.canvas.bind("<Control-MouseWheel>", self.on_mousewheel)
+        self.canvas.bind("<Motion>", self.on_pointer_motion)
+        self.canvas.bind("<Leave>", self.on_pointer_leave)
 
     # --------------------------------------------------
 
@@ -357,6 +364,93 @@ class GlobeView(tk.Frame):
             image=self.photo,
             anchor="nw"
         )
+        self.draw_brush_cursor()
+
+    # --------------------------------------------------
+
+    def on_pointer_motion(self, event):
+        self.cursor_mouse = (event.x, event.y)
+        self.draw_brush_cursor()
+
+    def on_pointer_leave(self, event=None):
+        self.cursor_mouse = None
+        self.canvas.delete("brush_cursor")
+
+    def draw_brush_cursor(self):
+        """Draw the visible part of the geodesic brush outline."""
+        self.canvas.delete("brush_cursor")
+        raster_clone = (
+            self.app.tool == "clone" and
+            self.app.layers[self.app.active_layer].is_raster)
+        area_picker = (
+            self.app.tool == "color picker" and
+            self.app.picker_sample_area_var.get())
+        if (self.cursor_mouse is None or self.texture is None or
+                self.app.tool not in
+                ("brush", "eraser", "clone", "color picker") or
+                not (self.app.can_paint_from_globe() or raster_clone or
+                     area_picker) or
+                not hasattr(self, "display_center")):
+            return
+
+        uv = self.screen_to_uv(*self.cursor_mouse)
+        if uv is None:
+            return
+
+        self.draw_spherical_outline(uv, "black", "white")
+
+        if self.app.tool == "clone" and self.app.clone_source_center is not None:
+            if self.clone_rotation is not None:
+                source_uv = self.globe_clone_source_uv(uv)
+            elif self.app.clone_offset is None:
+                source_x, source_y = self.app.clone_source_center
+                source_uv = (
+                    ((source_x + 0.5) / self.texture.width) % 1.0,
+                    max(0.0, min(1.0,
+                        (source_y + 0.5) / self.texture.height)),
+                )
+            else:
+                destination_x, destination_y = self.uv_to_image(*uv)
+                source_x = destination_x + self.app.clone_offset[0]
+                source_y = destination_y + self.app.clone_offset[1]
+                source_uv = (
+                    ((source_x + 0.5) / self.texture.width) % 1.0,
+                    max(0.0, min(1.0,
+                        (source_y + 0.5) / self.texture.height)),
+                )
+            self.draw_spherical_outline(source_uv, "black", "#00ff80")
+
+    def draw_spherical_outline(self, uv, outer_color, inner_color):
+        """Project one brush-sized geodesic outline onto the visible globe."""
+        radius = max(0.5, int(self.app.size_var.get()) / 2)
+        angular_radius = (2 * np.pi * radius) / self.texture.width
+        center = uv_to_vec((1.0 - uv[0]) % 1.0, uv[1])
+        boundary = spherical_brush_points(
+            center, angular_radius, rings=1, segments=64)[1:]
+        projected = []
+        cx, cy = self.display_center
+        for point in boundary:
+            point = apply_globe_rotation(point, self.yaw, self.pitch)
+            projected.append((
+                cx + point.x * self.display_radius,
+                cy - point.y * self.display_radius,
+                point.z >= 0.0,
+            ))
+
+        # Draw only front-facing boundary segments.  The outline therefore
+        # stops naturally at the globe silhouette instead of showing through.
+        for index, current in enumerate(projected):
+            following = projected[(index + 1) % len(projected)]
+            if not (current[2] and following[2]):
+                continue
+            coordinates = (current[0], current[1],
+                           following[0], following[1])
+            self.canvas.create_line(
+                *coordinates, fill=outer_color, width=3,
+                tags=("overlay", "brush_cursor"))
+            self.canvas.create_line(
+                *coordinates, fill=inner_color, width=1,
+                tags=("overlay", "brush_cursor"))
 
     # --------------------------------------------------
 
@@ -612,8 +706,16 @@ class GlobeView(tk.Frame):
         self.start_paint(event, button=1)
 
     def on_left_drag(self, event):
+        self.cursor_mouse = (event.x, event.y)
+        self.draw_brush_cursor()
 
-        if self.painting:
+        if self.app.tool == "pan" and self.rotating:
+            self.on_middle_drag(event)
+        elif self.app.tool == "color picker" and self.painting:
+            self.pick_color_from_mouse(event)
+        elif self.app.tool == "clone" and self.painting:
+            self.clone_from_mouse(event.x, event.y)
+        elif self.painting:
 
             if self.vector_start_screen is not None:
                 self.last_mouse = (event.x, event.y)
@@ -621,22 +723,76 @@ class GlobeView(tk.Frame):
                 self.paint_from_mouse(event.x, event.y)
 
     def on_left_release(self, event):
+        self.cursor_mouse = (event.x, event.y)
         self.end_paint()
+        self.draw_brush_cursor()
 
     def on_right_press(self, event):
         self.start_paint(event, button=3)
 
     def on_right_drag(self, event):
-        if self.painting:
+        self.cursor_mouse = (event.x, event.y)
+        self.draw_brush_cursor()
+        if self.app.tool == "pan" and self.rotating:
+            self.on_middle_drag(event)
+        elif self.app.tool == "color picker" and self.painting:
+            self.pick_color_from_mouse(event)
+        elif self.app.tool == "clone" and self.painting:
+            self.clone_from_mouse(event.x, event.y)
+        elif self.painting:
             if self.vector_start_screen is not None:
                 self.last_mouse = (event.x, event.y)
             else:
                 self.paint_from_mouse(event.x, event.y)
 
     def on_right_release(self, event):
+        self.cursor_mouse = (event.x, event.y)
         self.end_paint()
+        self.draw_brush_cursor()
 
     def start_paint(self, event, button):
+        self.cursor_mouse = (event.x, event.y)
+        self.draw_brush_cursor()
+        if self.app.tool == "pan":
+            self.on_middle_press(event)
+            return
+        if self.app.tool == "color picker":
+            self.painting = True
+            self.paint_button = button
+            self.pick_color_from_mouse(event)
+            return
+        if self.app.tool == "clone":
+            uv = self.screen_to_uv(event.x, event.y)
+            if uv is None:
+                return
+            ix, iy = self.uv_to_image(*uv)
+            if event.state & 0x4:
+                self.app.set_external_clone_source(ix, iy)
+                self.clone_source_vector = uv_to_vec(
+                    (1.0 - uv[0]) % 1.0, uv[1])
+                self.clone_rotation = None
+                self.draw_brush_cursor()
+                return
+            if self.clone_source_vector is None:
+                self.bell()
+                return
+            # Establish the spherical source/destination relationship on the
+            # first destination click only.  Rebuilding it for every stroke
+            # would snap the source preview back to the originally sampled
+            # point whenever the user clicked again.
+            if self.clone_rotation is None:
+                destination = uv_to_vec((1.0 - uv[0]) % 1.0, uv[1])
+                self.clone_rotation = self.rotation_between(
+                    destination, self.clone_source_vector)
+            self.update_globe_clone_offset(uv)
+            self.paint_button = button
+            self.painting = self.app.begin_external_clone(ix, iy, button)
+            self.last_uv = uv if self.painting else None
+            if not self.painting:
+                self.bell()
+            else:
+                self.request_document_refresh()
+            return
         if not self.app.can_paint_from_globe():
             self.bell()
             return
@@ -653,6 +809,18 @@ class GlobeView(tk.Frame):
         self.paint_from_mouse(event.x, event.y, first=True)
 
     def end_paint(self):
+        if self.app.tool == "pan" and self.rotating:
+            self.on_middle_release(None)
+            return
+        if self.app.tool == "color picker":
+            self.painting = False
+            return
+        if self.app.tool == "clone":
+            if self.painting:
+                self.app.end_external_clone()
+            self.painting = False
+            self.last_uv = None
+            return
         if self.vector_start_screen is not None:
             self.finish_globe_vector(self.vector_start_screen,
                                      self.last_mouse or self.vector_start_screen)
@@ -664,6 +832,69 @@ class GlobeView(tk.Frame):
             self.app.end_external_raster_draw()
         self.painting = False
         self.last_uv = None
+
+    def pick_color_from_mouse(self, event):
+        uv = self.screen_to_uv(event.x, event.y)
+        if uv is None:
+            return
+        ix, iy = self.uv_to_image(*uv)
+        self.app.pick_color_at(ix, iy, self.paint_button, event.state)
+
+    def clone_from_mouse(self, x, y):
+        uv = self.screen_to_uv(x, y)
+        if uv is None:
+            self.last_uv = None
+            return
+        ix, iy = self.uv_to_image(*uv)
+        self.update_globe_clone_offset(uv)
+        self.app.continue_external_clone(ix, iy)
+        self.last_uv = uv
+        self.request_document_refresh()
+
+    @staticmethod
+    def rotation_between(start, end):
+        """Return a rotation matrix mapping one unit sphere point to another."""
+        a = np.array((start.x, start.y, start.z), dtype=float)
+        b = np.array((end.x, end.y, end.z), dtype=float)
+        cross = np.cross(a, b)
+        sine = np.linalg.norm(cross)
+        cosine = float(np.clip(np.dot(a, b), -1.0, 1.0))
+        if sine < 1e-10:
+            if cosine > 0:
+                return np.identity(3)
+            axis = np.cross(a, (1.0, 0.0, 0.0))
+            if np.linalg.norm(axis) < 1e-10:
+                axis = np.cross(a, (0.0, 1.0, 0.0))
+            axis /= np.linalg.norm(axis)
+            return 2.0 * np.outer(axis, axis) - np.identity(3)
+        kx, ky, kz = cross
+        skew = np.array(((0.0, -kz, ky),
+                         (kz, 0.0, -kx),
+                         (-ky, kx, 0.0)))
+        return (np.identity(3) + skew +
+                skew @ skew * ((1.0 - cosine) / (sine * sine)))
+
+    def update_globe_clone_offset(self, destination_uv):
+        """Set the flat raster offset from the globe-relative clone mapping."""
+        if self.clone_rotation is None:
+            return
+        source_uv = self.globe_clone_source_uv(destination_uv)
+        destination_x, destination_y = self.uv_to_image(*destination_uv)
+        source_x, source_y = self.uv_to_image(*source_uv)
+        offset_x = source_x - destination_x
+        if offset_x > self.texture.width / 2:
+            offset_x -= self.texture.width
+        elif offset_x < -self.texture.width / 2:
+            offset_x += self.texture.width
+        self.app.clone_offset = (offset_x, source_y - destination_y)
+
+    def globe_clone_source_uv(self, destination_uv):
+        destination = uv_to_vec(
+            (1.0 - destination_uv[0]) % 1.0, destination_uv[1])
+        source_array = self.clone_rotation @ np.array(
+            (destination.x, destination.y, destination.z))
+        source_u, source_v = vec_to_uv(Vec3(*source_array))
+        return ((1.0 - source_u) % 1.0, source_v)
 
     def finish_globe_vector(self, start, end):
         """Store a globe gesture as sphere-relative line primitives."""
@@ -709,6 +940,7 @@ class GlobeView(tk.Frame):
             event.x,
             event.y
         )
+        self.cursor_mouse = (event.x, event.y)
 
         # Match wheel rotation while retaining two-axis free rotation as an
         # additional mouse gesture.  Scale the angular step so dragging feels
