@@ -773,6 +773,7 @@ class PaintApp:
         self.ui_scale = 1.5
 
         self.build_ui()
+        self._initialize_documents()
         # Tk does not normally move keyboard focus when a label, frame, or
         # canvas background is clicked. Treat those clicks as "click away"
         # so entries commit through their existing <FocusOut> handlers.
@@ -1864,6 +1865,8 @@ class PaintApp:
     def register_view(self, view_id, label, widget, closable=True):
         """Add an embedded workspace view and its compact tab."""
         self.views[view_id] = widget
+        if view_id == "main":
+            return
         tab = tk.Frame(self.view_tabs)
         tk.Button(tab, text=label, bd=0,
                   command=lambda key=view_id: self.switch_view(key)).pack(side="left")
@@ -1873,6 +1876,139 @@ class PaintApp:
         if not self.top_panel_collapsed:
             tab.pack(side="left", padx=2, pady=2)
         self.view_tab_widgets[view_id] = tab
+
+    def _initialize_documents(self):
+        self.document_fields = (
+            "doc_w doc_h current_file layers active_layer undo_stack zoom "
+            "offset_x offset_y tool bg_color last_x last_y vector_start_x "
+            "vector_start_y current_vector_obj selected_vector_obj "
+            "selected_point_index is_dragging_point selection_start "
+            "selection_bounds selection_mask selection_operation selection_base_mask "
+            "selection_edges selection_dash_offset move_start move_source_box "
+            "move_pixels move_is_paste move_mask move_base_image move_selection_bounds "
+            "move_offset move_drag_origin_offset selection_move_start "
+            "selection_move_bounds selection_move_mask selection_brush_last "
+            "selection_brush_remove clone_source_center clone_offset clone_last "
+            "clone_stroke_source clone_stroke_base clone_stroke_coverage bucket_pending "
+            "_stroke_base_image _stroke_coverage").split()
+        self.document_defaults = copy.deepcopy({
+            key: getattr(self, key) for key in self.document_fields
+            if key not in {"layers", "selection_mask"}})
+        self.documents = {}
+        self.active_document = None
+        self.document_counter = 0
+        self._add_document_tab()
+        self.startup_document = self.active_document
+
+    def _capture_document(self):
+        return {key: getattr(self, key) for key in self.document_fields}
+
+    def _store_document(self):
+        if self.active_document is None:
+            return
+        self._finish_bucket_preview()
+        self._finish_raster_stroke()
+        self._finish_clone_stroke()
+        self._release_selection_move()
+        self._finish_selection_boundary_move()
+        self.last_x = self.last_y = None
+        self.is_dragging_point = False
+        self.selection_brush_last = None
+        if self.selection_animation_id is not None:
+            self.root.after_cancel(self.selection_animation_id)
+            self.selection_animation_id = None
+        self.documents[self.active_document]["state"] = self._capture_document()
+
+    def _add_document_tab(self, name=None):
+        self.document_counter += 1
+        key = f"document-{self.document_counter}"
+        self.active_document = key
+        self.documents[key] = {
+            "name": name or f"Untitled {self.document_counter}",
+            "state": self._capture_document(),
+        }
+        tab = tk.Frame(self.view_tabs)
+        tk.Button(tab, text=self.documents[key]["name"], bd=0,
+                  command=lambda: self.switch_document(key)).pack(side="left")
+        tk.Button(tab, text="×", bd=0, padx=4,
+                  command=lambda: self.close_document(key)).pack(side="left")
+        self.view_tab_widgets[key] = tab
+        if not self.top_panel_collapsed:
+            tab.pack(side="left", padx=2, pady=2)
+        self._highlight_document_tabs()
+
+    def _unchanged_startup_document(self):
+        """Return the disposable startup tab, ignoring view/tool changes."""
+        if (len(self.documents) != 1 or
+                self.active_document != self.startup_document or
+                self.current_file is not None or self.undo_stack or
+                self.move_pixels is not None or self.bucket_pending is not None or
+                len(self.layers) != 1):
+            return None
+        if (self.doc_w, self.doc_h, self.bg_color) != (
+                self.document_defaults["doc_w"], self.document_defaults["doc_h"],
+                self.document_defaults["bg_color"]):
+            return None
+        layer = self.layers[0]
+        if (not layer.is_raster or layer.name != "Background" or
+                not layer.visible or layer.opacity != 100 or layer.masked or
+                layer.mask_mode != Layer.MASK_LAYERS_UNDERNEATH or
+                layer.image.size != (self.doc_w, self.doc_h) or
+                any(band.getbbox() is not None for band in layer.image.split())):
+            return None
+        return self.startup_document
+
+    def _begin_document(self, name=None):
+        self._store_document()
+        for key, value in copy.deepcopy(self.document_defaults).items():
+            setattr(self, key, value)
+        self.layers = [Layer(self.doc_w, self.doc_h, "Background")]
+        self.selection_mask = Image.new("L", (self.doc_w, self.doc_h), 0)
+        self._add_document_tab(name)
+
+    def _highlight_document_tabs(self):
+        for key in self.documents:
+            self.view_tab_widgets[key].winfo_children()[0].configure(
+                relief="sunken" if key == self.active_document else "flat")
+
+    def switch_document(self, key):
+        if key not in self.documents:
+            return
+        if key != self.active_document:
+            self._store_document()
+            self.active_document = key
+            for field, value in self.documents[key]["state"].items():
+                setattr(self, field, value)
+            self.refresh_layers()
+            self._ensure_selection_animation()
+            self.notify_globe_document_changed()
+        self.main_view_dirty = True
+        self.switch_view("main")
+        self.canvas.configure(cursor=("fleur" if self.tool in
+            ("pan", "move", "move selection") else "crosshair"))
+        for name, button in getattr(self, "tool_buttons", {}).items():
+            button.configure(relief="sunken" if name == self.tool else "raised")
+        if hasattr(self, "tool_hint_var"):
+            self.tool_hint_var.set(self.tool.title())
+        self.update_title()
+        self._highlight_document_tabs()
+
+    def close_document(self, key):
+        if key not in self.documents:
+            return
+        state = (self._capture_document() if key == self.active_document
+                 else self.documents[key]["state"])
+        if state["undo_stack"] and not messagebox.askyesno(
+                "Unsaved Changes", f"Close {self.documents[key]['name']} without saving?"):
+            return
+        if key == self.active_document:
+            other = next((item for item in self.documents if item != key), None)
+            if other is None:
+                self.new_project()
+            else:
+                self.switch_document(other)
+        del self.documents[key]
+        self.view_tab_widgets.pop(key).destroy()
 
     def switch_view(self, view_id):
         """Show one view without disturbing the shared tools or layers."""
@@ -1928,7 +2064,9 @@ class PaintApp:
         self.root.update_idletasks()
 
     def on_close(self):
-        if self.undo_stack:
+        if self.undo_stack or any(
+                item["state"]["undo_stack"] for key, item in self.documents.items()
+                if key != self.active_document):
             if not messagebox.askyesno("Unsaved Changes",
                                        "You have unsaved changes. Quit anyway?"):
                 return
@@ -1939,6 +2077,12 @@ class PaintApp:
         self.root.destroy()
 
     def update_title(self):
+        if getattr(self, "active_document", None) is not None:
+            document = self.documents[self.active_document]
+            if self.current_file:
+                document["name"] = Path(self.current_file).name
+            self.view_tab_widgets[self.active_document].winfo_children()[0].configure(
+                text=document["name"])
         if self.current_file:
             self.root.title(f"PyPaint - {self.current_file}")
         else:
@@ -1999,24 +2143,8 @@ class PaintApp:
         self.notify_globe_document_changed()
 
     def new_project(self):
-        if self.undo_stack:
-            if not messagebox.askyesno("Unsaved Changes", 
-                                       "You have unsaved changes. Create new project anyway?"):
-                return
-        self._finish_bucket_preview()
-        
-        self.layers = [Layer(self.doc_w, self.doc_h, "Background", "raster")]
-        self.active_layer = 0
-        self.current_file = None
-        self.undo_stack = []
-        self.selection_mask = Image.new("L", (self.doc_w, self.doc_h), 0)
-        self._update_selection_geometry()
-        self.clone_source_center = None
-        self.clone_offset = None
-        self.refresh_layers()
-        self.redraw()
-        self.update_title()
-        self.notify_globe_document_changed()
+        self._begin_document()
+        self._finish_open()
 
     def save_project(self):
         self._finish_bucket_preview()
@@ -2079,29 +2207,21 @@ class PaintApp:
             messagebox.showerror("Error", f"Failed to save project: {e}")
 
     def open_project(self):
-        if self.undo_stack:
-            if not messagebox.askyesno("Unsaved Changes", 
-                                       "You have unsaved changes. Open project anyway?"):
-                return
-        
-        filename = filedialog.askopenfilename(
+        filenames = filedialog.askopenfilenames(
             filetypes=[
                 ("All files", "*.*"),
                 ("PyPaint projects", "*.pypaint"),
                 ("Images", "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp"),
             ]
         )
-        if not filename:
-            return
-        
-        try:
-            if Path(filename).suffix.lower() == ".pypaint":
-                self._open_pypaint_file(filename)
-                messagebox.showinfo("Success", f"Project loaded from {filename}")
-            else:
-                self._open_image_file(filename)
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to open file: {e}")
+        for filename in filenames:
+            try:
+                if Path(filename).suffix.lower() == ".pypaint":
+                    self._open_pypaint_file(filename)
+                else:
+                    self._open_image_file(filename)
+            except Exception as error:
+                messagebox.showerror("Error", f"Failed to open {filename}: {error}")
 
     def _open_pypaint_file(self, filename):
         """Load a native, editable PyPaint project."""
@@ -2149,19 +2269,24 @@ class PaintApp:
         if not loaded_layers:
             raise ValueError("Project contains no layers")
 
+        active_layer = max(0, min(int(project_data.get('active_layer', 0)),
+                                  len(loaded_layers) - 1))
+        startup_to_replace = self._unchanged_startup_document()
+        self._begin_document(Path(filename).name)
         self.doc_w = project_data['document_width']
         self.doc_h = project_data['document_height']
         self.layers = loaded_layers
-        self.active_layer = min(project_data.get('active_layer', 0),
-                                len(self.layers) - 1)
+        self.active_layer = active_layer
         self.current_file = filename
-        self._finish_open()
+        self._finish_open(startup_to_replace)
 
     def _open_image_file(self, filename):
         """Import an ordinary image as a new, unsaved raster document."""
         with Image.open(filename) as source:
             image = ImageOps.exif_transpose(source).convert("RGBA")
 
+        startup_to_replace = self._unchanged_startup_document()
+        self._begin_document(Path(filename).name)
         self.doc_w, self.doc_h = image.size
         layer = Layer(self.doc_w, self.doc_h, Path(filename).stem, "raster")
         layer.image = image
@@ -2173,9 +2298,9 @@ class PaintApp:
         # An imported image is not a native project yet.  This ensures Save
         # opens Save As instead of replacing (for example) a PNG with JSON.
         self.current_file = None
-        self._finish_open()
+        self._finish_open(startup_to_replace)
 
-    def _finish_open(self):
+    def _finish_open(self, startup_to_replace=None):
         """Refresh shared UI state after either kind of file is opened."""
         self.undo_stack = []
         self.selection_mask = Image.new("L", (self.doc_w, self.doc_h), 0)
@@ -2186,6 +2311,10 @@ class PaintApp:
         self.redraw()
         self.update_title()
         self.notify_globe_document_changed()
+        self.switch_document(self.active_document)
+        if startup_to_replace is not None:
+            del self.documents[startup_to_replace]
+            self.view_tab_widgets.pop(startup_to_replace).destroy()
 
     def set_tool(self, tool):
         if (hasattr(self, "tools_by_layer_type") and self.layers and
