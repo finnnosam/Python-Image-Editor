@@ -796,6 +796,7 @@ class PaintApp:
         # UI scale (1.5 = launch default)
         self.ui_scale = 1.5
 
+        self.globe_documents = {}
         self.build_ui()
         self._initialize_documents()
         # Tk does not normally move keyboard focus when a label, frame, or
@@ -1783,7 +1784,7 @@ class PaintApp:
         self.root.update_idletasks()
         self.request_redraw()
         globe = getattr(self, "globe_window", None)
-        if globe is not None and self.active_view == "globe":
+        if globe is not None and self.active_view in self.globe_documents:
             try:
                 globe.notify_document_changed()
             except tk.TclError:
@@ -2073,6 +2074,7 @@ class PaintApp:
 
     def _begin_document(self, name=None):
         self._store_document()
+        self.globe_window = None
         for key, value in copy.deepcopy(self.document_defaults).items():
             setattr(self, key, value)
         self.layers = [Layer(self.doc_w, self.doc_h, "Background")]
@@ -2080,8 +2082,9 @@ class PaintApp:
         self._add_document_tab(name)
 
     def _highlight_document_tabs(self):
-        for key in self.documents:
-            selected = key == self.active_document
+        for key in list(self.documents) + list(self.globe_documents):
+            selected = (key == self.active_view if key in self.globe_documents
+                        else key == self.active_document and self.active_view == "main")
             tab = self.view_tab_widgets[key]
             border = "#2878d7" if selected else "#d9d9d9"
             background = "#dcecff" if selected else "#f0f0f0"
@@ -2101,6 +2104,7 @@ class PaintApp:
             self.active_document = key
             for field, value in self.documents[key]["state"].items():
                 setattr(self, field, value)
+            self.globe_window = self.views.get(f"globe-{key}")
             self.refresh_layers()
             self._ensure_selection_animation()
             self.notify_globe_document_changed()
@@ -2130,6 +2134,9 @@ class PaintApp:
                 self.new_project()
             else:
                 self.switch_document(other)
+        for view_id, owner in list(self.globe_documents.items()):
+            if owner == key:
+                self.close_view(view_id)
         del self.documents[key]
         self.view_tab_widgets.pop(key).destroy()
 
@@ -2137,6 +2144,9 @@ class PaintApp:
         """Show one view without disturbing the shared tools or layers."""
         if view_id not in self.views:
             return
+        owner = self.globe_documents.get(view_id)
+        if owner is not None and owner != self.active_document:
+            self.switch_document(owner)
         if self.active_view in self.views:
             old_view = self.views[self.active_view]
             if hasattr(old_view, "on_hidden"):
@@ -2152,6 +2162,8 @@ class PaintApp:
                 self.main_view_dirty = False
                 self.redraw()
             self.canvas.focus_set()
+        if hasattr(self, "documents"):
+            self._highlight_document_tabs()
 
     def close_view(self, view_id):
         """Remove an optional view and return to the main canvas."""
@@ -2159,12 +2171,13 @@ class PaintApp:
             return
         widget = self.views.pop(view_id)
         tab = self.view_tab_widgets.pop(view_id)
+        self.globe_documents.pop(view_id, None)
         if self.active_view == view_id:
             self.active_view = None
             self.switch_view("main")
         tab.destroy()
         widget.destroy()
-        if view_id == "globe":
+        if getattr(self, "globe_window", None) is widget:
             self.globe_window = None
 
     def apply_ui_scale(self, scale):
@@ -2206,6 +2219,10 @@ class PaintApp:
                 document["name"] = Path(self.current_file).name
             self.view_tab_widgets[self.active_document].winfo_children()[0].configure(
                 text=document["name"])
+            for view_id, owner in self.globe_documents.items():
+                if owner == self.active_document:
+                    self.view_tab_widgets[view_id].winfo_children()[0].configure(
+                        text=f"{document['name']} · Globe")
         if self.current_file:
             self.root.title(f"PyPaint - {self.current_file}")
         else:
@@ -2437,6 +2454,9 @@ class PaintApp:
         self.notify_globe_document_changed()
         self.switch_document(self.active_document)
         if startup_to_replace is not None:
+            for view_id, owner in list(self.globe_documents.items()):
+                if owner == startup_to_replace:
+                    self.close_view(view_id)
             del self.documents[startup_to_replace]
             self.view_tab_widgets.pop(startup_to_replace).destroy()
 
@@ -4063,8 +4083,9 @@ class PaintApp:
         )
 
     def open_globe_view(self):
-        if "globe" in self.views:
-            self.switch_view("globe")
+        view_id = f"globe-{self.active_document}"
+        if view_id in self.views:
+            self.switch_view(view_id)
             return
 
         if self.doc_w != self.doc_h * 2:
@@ -4078,9 +4099,11 @@ class PaintApp:
 
         from globe_view import GlobeView
 
-        self.globe_window = GlobeView(self.view_host, self)
-        self.register_view("globe", "Globe", self.globe_window)
-        self.switch_view("globe")
+        self.globe_window = GlobeView(self.view_host, self, view_id=view_id)
+        self.globe_documents[view_id] = self.active_document
+        label = f"{self.documents[self.active_document]['name']} · Globe"
+        self.register_view(view_id, label, self.globe_window)
+        self.switch_view(view_id)
 
     def draw_circle(self, x, y, radius, color):
         layer = self.layers[self.active_layer]
@@ -4458,7 +4481,7 @@ class PaintApp:
 
     def zoom_keyboard(self, direction):
         """Zoom the active view, keeping the flat canvas center fixed."""
-        if self.active_view == "globe":
+        if self.active_view in self.globe_documents:
             globe = getattr(self, "globe_window", None)
             if globe is not None:
                 (globe.zoom_in if direction > 0 else globe.zoom_out)()

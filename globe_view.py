@@ -47,11 +47,12 @@ class GlobeView(tk.Frame):
     DEFAULT_SIZE = 700
     INTERACTIVE_RENDER_SIZE = 512
 
-    def __init__(self, parent, app):
+    def __init__(self, parent, app, view_id="globe"):
 
         super().__init__(parent, bg="#303030")
 
         self.app = app
+        self.view_id = view_id
 
         #
         # Camera
@@ -200,7 +201,7 @@ class GlobeView(tk.Frame):
     # --------------------------------------------------
 
     def on_close(self):
-        self.app.close_view("globe")
+        self.app.close_view(self.view_id)
 
     # --------------------------------------------------
 
@@ -225,12 +226,12 @@ class GlobeView(tk.Frame):
         """
 
         self.document_dirty = True
-        if self.app.active_view == "globe":
+        if self.app.active_view == self.view_id:
             self.request_document_refresh()
 
     def request_document_refresh(self):
         """Coalesce document updates so painting does not redraw twice per mouse event."""
-        if self.app.active_view != "globe":
+        if self.app.active_view != self.view_id:
             self.document_dirty = True
             return
         if self.document_refresh_pending:
@@ -240,7 +241,7 @@ class GlobeView(tk.Frame):
 
     def _refresh_document(self):
         self.document_refresh_pending = False
-        if self.winfo_exists() and self.app.active_view == "globe":
+        if self.winfo_exists() and self.app.active_view == self.view_id:
             self.update_texture()
             self.document_dirty = False
             self.redraw()
@@ -304,7 +305,7 @@ class GlobeView(tk.Frame):
 
     def _render_full_quality(self):
         self.full_quality_after_id = None
-        if self.app.active_view != "globe":
+        if self.app.active_view != self.view_id:
             return
         self.interactive_render = False
         self.build_lookup()
@@ -314,7 +315,7 @@ class GlobeView(tk.Frame):
 
     def redraw(self):
 
-        if self.app.active_view != "globe" or self.redraw_after_id is not None:
+        if self.app.active_view != self.view_id or self.redraw_after_id is not None:
             return
         # Coalesce bursts of mouse events, but do not impose a fixed delay on
         # every interaction.  The bounded renderer is fast enough to run as
@@ -325,7 +326,7 @@ class GlobeView(tk.Frame):
 
         self.redraw_after_id = None
 
-        if self.app.active_view != "globe":
+        if self.app.active_view != self.view_id:
             return
 
         if self.texture is None:
@@ -601,7 +602,7 @@ class GlobeView(tk.Frame):
 
     def on_resize(self, event=None):
 
-        if self.app.active_view != "globe":
+        if self.app.active_view != self.view_id:
             return
 
         self._begin_interactive_render(rebuild=True)
