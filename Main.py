@@ -680,7 +680,7 @@ class Layer:
 
 class PaintApp:
     GLOBE_BLOCKED_TOOLS = {
-        "clone", "selection", "brush selection", "move selection",
+        "clone", "selection", "brush selection", "move", "move selection",
         "magic wand"
     }
 
