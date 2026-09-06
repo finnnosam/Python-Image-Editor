@@ -786,6 +786,8 @@ class PaintApp:
         self.clone_stroke_coverage = None
         self.bucket_pending = None
         self.wand_pending = None
+        self.layer_preview_after_id = None
+        self.layer_preview_cache = {}
 
         # Drag and drop variables
         self.drag_start_index = None
@@ -1299,7 +1301,7 @@ class PaintApp:
         self.right_panel_content.pack(fill="both", expand=True)
 
         self.layer_style = ttk.Style()
-        self.layer_style.configure("Layer.Treeview", rowheight=32)
+        self.layer_style.configure("Layer.Treeview", rowheight=44)
         self.layer_selected_vector_color = (
             self.layer_style.lookup(
                 "Treeview", "background", ("selected",)) or "#4a6984")
@@ -1338,8 +1340,7 @@ class PaintApp:
                 row_image.alpha_composite(row_sources[visibility_name], (2, 2))
                 row_image.alpha_composite(row_sources[f"layer-{layer_type}"],
                                           (34, 2))
-                self.layer_row_icons[(visible, layer_type)] = \
-                    ImageTk.PhotoImage(row_image)
+                self.layer_row_icons[(visible, layer_type)] = row_image
 
         layer_actions = [
             ("Add Raster Layer", "add-raster-layer.png",
@@ -1377,6 +1378,7 @@ class PaintApp:
         ).pack(pady=(1, 4))
 
     def request_redraw(self, defer=False):
+        self._schedule_layer_previews()
         if hasattr(self, "active_view") and self.active_view != "main":
             self.main_view_dirty = True
             return
@@ -1977,6 +1979,7 @@ class PaintApp:
             self.root.after_cancel(self.selection_animation_id)
             self.selection_animation_id = None
         self.documents[self.active_document]["state"] = self._capture_document()
+        self._update_document_preview()
 
     def _add_document_tab(self, name=None):
         self.document_counter += 1
@@ -1987,7 +1990,7 @@ class PaintApp:
             "state": self._capture_document(),
         }
         tab = tk.Frame(self.view_tabs)
-        tk.Button(tab, text=self.documents[key]["name"], bd=0,
+        tk.Button(tab, text=self.documents[key]["name"], bd=0, compound="left", padx=5,
                   command=lambda: self.switch_document(key)).pack(side="left")
         tk.Button(tab, text="×", bd=0, padx=4,
                   command=lambda: self.close_document(key)).pack(side="left")
@@ -1995,6 +1998,57 @@ class PaintApp:
         if not self.top_panel_collapsed:
             tab.pack(side="left", padx=2, pady=2)
         self._highlight_document_tabs()
+        self._update_document_preview()
+
+    @staticmethod
+    def _document_preview_key(state):
+        return (state["doc_w"], state["doc_h"], state["bg_color"], tuple(
+            (id(layer), layer.visible, layer.opacity, layer.masked, layer.mask_mode,
+             json.dumps(layer.vector_data.to_dict(), sort_keys=True)
+             if layer.vector_data is not None else
+             (id(layer.image), layer._mipmap_revision)) for layer in state["layers"]))
+
+    def _render_document_thumbnail(self, state):
+        """Composite at thumbnail size, including visibility, opacity and masks."""
+        ratio = min(46 / state["doc_w"], 32 / state["doc_h"])
+        size = (max(1, round(state["doc_w"] * ratio)),
+                max(1, round(state["doc_h"] * ratio)))
+        rendered_layers = []
+        for layer in state["layers"]:
+            if layer.vector_data is not None:
+                layer.render_vector()
+            source = layer.image
+            for reduced in layer._mipmaps[1:]:
+                if reduced.width >= size[0] and reduced.height >= size[1]:
+                    source = reduced
+            rendered_layers.append(layer.image_with_opacity(
+                source.resize(size, Image.Resampling.LANCZOS, reducing_gap=3)))
+        result = Image.new("RGBA", size, state["bg_color"])
+        underlying_alpha = Image.new("L", size)
+        for index, (layer, rendered) in enumerate(zip(state["layers"], rendered_layers)):
+            if not layer.visible:
+                continue
+            below = rendered_layers[index - 1].getchannel("A") if index else None
+            rendered = self._cap_masked_layer(layer, rendered, underlying_alpha, below)
+            result.alpha_composite(rendered)
+            underlying_alpha = ImageChops.lighter(underlying_alpha, rendered.getchannel("A"))
+        thumbnail_layer = Layer(*size, "Preview")
+        thumbnail_layer.image = result
+        thumbnail_layer.reset_mipmaps()
+        return self._render_layer_thumbnail(thumbnail_layer)
+
+    def _update_document_preview(self):
+        if getattr(self, "active_document", None) is None:
+            return
+        document = self.documents[self.active_document]
+        state = self._capture_document()
+        key = self._document_preview_key(state)
+        if document.get("preview_key") == key:
+            return
+        photo = ImageTk.PhotoImage(self._render_document_thumbnail(state))
+        document["preview"] = photo  # Keep Tk's image alive with its tab.
+        document["preview_key"] = key
+        self.view_tab_widgets[self.active_document].winfo_children()[0].configure(image=photo)
 
     def _unchanged_startup_document(self):
         """Return the disposable startup tab, ignoring view/tool changes."""
@@ -2027,8 +2081,17 @@ class PaintApp:
 
     def _highlight_document_tabs(self):
         for key in self.documents:
-            self.view_tab_widgets[key].winfo_children()[0].configure(
-                relief="sunken" if key == self.active_document else "flat")
+            selected = key == self.active_document
+            tab = self.view_tab_widgets[key]
+            border = "#2878d7" if selected else "#d9d9d9"
+            background = "#dcecff" if selected else "#f0f0f0"
+            # Reserve the same border width on every tab to avoid layout jumps.
+            tab.configure(background=border, highlightthickness=3,
+                          highlightbackground=border, highlightcolor=border)
+            for button in tab.winfo_children():
+                button.configure(background=background,
+                                 activebackground="#c6dfff" if selected else "#e5e5e5",
+                                 relief="flat")
 
     def switch_document(self, key):
         if key not in self.documents:
@@ -2051,6 +2114,7 @@ class PaintApp:
             self.tool_hint_var.set(self.tool.title())
         self.update_title()
         self._highlight_document_tabs()
+        self._update_document_preview()
 
     def close_document(self, key):
         if key not in self.documents:
@@ -2149,6 +2213,7 @@ class PaintApp:
 
     def notify_globe_document_changed(self):
         """Refresh an open globe view after document content changes."""
+        self._schedule_layer_previews()
         globe = getattr(self, "globe_window", None)
         if globe is None:
             return
@@ -2801,12 +2866,15 @@ class PaintApp:
         return "break"
 
     def refresh_layers(self):
+        self.layer_preview_cache = {
+            layer: cached for layer, cached in self.layer_preview_cache.items()
+            if layer in self.layers}
         self.layer_list.delete(*self.layer_list.get_children())
         for i in range(len(self.layers) - 1, -1, -1):
             l = self.layers[i]
             self.layer_list.insert(
                 "", "end", text=f"{l.name}{' [Masked]' if l.masked else ''}",
-                image=self.layer_row_icons[(l.visible, l.layer_type)],
+                image=self._layer_row_preview(l),
                 tags=(l.layer_type,))
 
         self.update_layer_selection_style()
@@ -2817,6 +2885,64 @@ class PaintApp:
         if 0 <= display_index < len(rows):
             self.layer_list.selection_set(rows[display_index])
             self.layer_list.focus(rows[display_index])
+
+    @staticmethod
+    def _render_layer_thumbnail(layer, size=(48, 34)):
+        """Show the whole layer with its aspect ratio and transparency intact."""
+        width, height = size
+        preview = Image.new("RGBA", size, "#eeeeee")
+        draw = ImageDraw.Draw(preview)
+        for y in range(0, height, 5):
+            for x in range(0, width, 5):
+                if (x // 5 + y // 5) % 2:
+                    draw.rectangle((x, y, x + 4, y + 4), fill="#cccccc")
+        ratio = min((width - 2) / layer.image.width,
+                    (height - 2) / layer.image.height)
+        target = (max(1, round(layer.image.width * ratio)),
+                  max(1, round(layer.image.height * ratio)))
+        source = layer.image
+        # Reuse reductions already available without building a full pyramid.
+        for reduced in layer._mipmaps[1:]:
+            if reduced.width >= target[0] and reduced.height >= target[1]:
+                source = reduced
+        thumb = source.resize(target, Image.Resampling.LANCZOS, reducing_gap=3)
+        thumb = layer.image_with_opacity(thumb)
+        preview.alpha_composite(thumb, ((width - target[0]) // 2,
+                                         (height - target[1]) // 2))
+        ImageDraw.Draw(preview).rectangle((0, 0, width - 1, height - 1),
+                                          outline="#888888")
+        return preview
+
+    def _layer_row_preview(self, layer):
+        content = (json.dumps(layer.vector_data.to_dict(), sort_keys=True)
+                   if layer.vector_data is not None else
+                   (id(layer.image), layer._mipmap_revision))
+        key = (content, layer.visible, layer.opacity, layer.layer_type)
+        cached = self.layer_preview_cache.get(layer)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        if layer.vector_data is not None:
+            layer.render_vector()
+        row = Image.new("RGBA", (112, 40))
+        row.alpha_composite(self.layer_row_icons[(layer.visible, layer.layer_type)], (0, 6))
+        row.alpha_composite(self._render_layer_thumbnail(layer), (62, 3))
+        photo = ImageTk.PhotoImage(row)
+        self.layer_preview_cache[layer] = (key, photo)
+        return photo
+
+    def _schedule_layer_previews(self):
+        if (hasattr(self, "layer_list") and
+                self.layer_preview_after_id is None):
+            self.layer_preview_after_id = self.root.after(180, self._update_layer_previews)
+
+    def _update_layer_previews(self):
+        self.layer_preview_after_id = None
+        self._update_document_preview()
+        rows = self.layer_list.get_children()
+        if len(rows) != len(self.layers):
+            return
+        for row, layer in zip(rows, reversed(self.layers)):
+            self.layer_list.item(row, image=self._layer_row_preview(layer))
 
     def on_layer_pointer_down(self, event):
         row = self.layer_list.identify_row(event.y)
