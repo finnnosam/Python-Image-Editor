@@ -1896,6 +1896,10 @@ class PaintApp:
             "zoom_to_selection": self.zoom_to_selection,
             "save": self.save_project, "new": self.new_project,
             "open": self.open_project, "commit_fill": self._finish_bucket_preview,
+            "close_image": lambda: self.close_document(self.active_document),
+            "swap_colors": self.swap_colors,
+            "zoom_in": lambda: self.zoom_keyboard(1),
+            "zoom_out": lambda: self.zoom_keyboard(-1),
         }
         for name, tool in {
                 "pan": "pan", "color_picker": "color picker", "brush": "brush",
@@ -1911,7 +1915,8 @@ class PaintApp:
             bindings, errors = read_shortcuts(path, actions)
         except (OSError, UnicodeError) as error:
             bindings, errors = [], [str(error)]
-        window_actions = {"copy", "paste", "increase_size", "decrease_size", "commit_fill"}
+        window_actions = {"copy", "paste", "increase_size", "decrease_size", "commit_fill",
+                          "close_image", "swap_colors", "zoom_in", "zoom_out"}
         for action, sequence in bindings:
             def invoke(event, callback=actions[action]):
                 if self._clipboard_text_focus(event):
@@ -4323,8 +4328,21 @@ class PaintApp:
         self._set_selected_color(self._rgb_to_hex(rgba[:3]))
 
     def zoom_mouse(self, event):
+        self._zoom_at(event.x, event.y, event.delta > 0)
+
+    def zoom_keyboard(self, direction):
+        """Zoom the active view, keeping the flat canvas center fixed."""
+        if self.active_view == "globe":
+            globe = getattr(self, "globe_window", None)
+            if globe is not None:
+                (globe.zoom_in if direction > 0 else globe.zoom_out)()
+            return
+        self._zoom_at(self.canvas.winfo_width() / 2,
+                      self.canvas.winfo_height() / 2, direction > 0)
+
+    def _zoom_at(self, x, y, zoom_in):
         old = self.zoom
-        self.zoom *= 1.1 if event.delta > 0 else (1 / 1.1)
+        self.zoom *= 1.1 if zoom_in else (1 / 1.1)
         self.zoom = max(0.1, min(20, self.zoom))
 
         # Do not rebuild an identical frame when the wheel keeps moving after
@@ -4332,11 +4350,11 @@ class PaintApp:
         if self.zoom == old:
             return
 
-        ix = (event.x - self.offset_x) / old
-        iy = (event.y - self.offset_y) / old
+        ix = (x - self.offset_x) / old
+        iy = (y - self.offset_y) / old
 
-        self.offset_x = event.x - ix * self.zoom
-        self.offset_y = event.y - iy * self.zoom
+        self.offset_x = x - ix * self.zoom
+        self.offset_y = y - iy * self.zoom
         # Wheel events arrive in bursts.  Always schedule their redraw so the
         # input queue can coalesce several events before expensive Tk upload.
         self.request_redraw(defer=True)

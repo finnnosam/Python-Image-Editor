@@ -39,3 +39,7 @@ save = Ctrl+S
 new = Ctrl+N
 open = Ctrl+O
 commit_fill = Enter
+close_image = Ctrl+W
+swap_colors = X
+zoom_in = Ctrl+Plus, Ctrl+Equals, Ctrl+NumpadPlus
+zoom_out = Ctrl+Minus, Ctrl+NumpadMinus
