@@ -802,6 +802,7 @@ class PaintApp:
 
         # UI scale (1.5 = launch default)
         self.ui_scale = 1.5
+        self.canvas_resize_anchor = "center"
 
         self.globe_documents = {}
         self.build_ui()
@@ -851,6 +852,22 @@ class PaintApp:
         self._finish_bucket_preview()
 
     def build_ui(self):
+        menu_bar = tk.Frame(self.root, bd=1, relief="raised")
+        menu_bar.pack(fill="x", side="top")
+
+        image_button = tk.Menubutton(menu_bar, text="Image", padx=8,
+                                     relief="flat")
+        image_menu = tk.Menu(image_button, tearoff=False)
+        image_menu.add_command(label="Canvas Size…", command=self.open_canvas_size)
+        image_button.configure(menu=image_menu)
+        image_button.pack(side="left")
+
+        for label in ("Adjustments", "Effects"):
+            button = tk.Menubutton(menu_bar, text=label, padx=8, relief="flat")
+            menu = tk.Menu(button, tearoff=False)
+            menu.add_command(label="Coming soon", state="disabled")
+            button.configure(menu=menu)
+            button.pack(side="left")
         # ── Top bar: file & edit actions ──────────────────────────────────
         top = tk.Frame(self.root, bd=1, relief="raised")
         top.pack(fill="x", side="top")
@@ -2318,7 +2335,7 @@ class PaintApp:
             if l.layer_type == "vector" and l.vector_data:
                 n.vector_data = copy.deepcopy(l.vector_data)
             snap.append(n)
-        self.undo_stack.append((snap, self.active_layer))
+        self.undo_stack.append((snap, self.active_layer, self.doc_w, self.doc_h))
         if len(self.undo_stack) > 20:
             self.undo_stack.pop(0)
 
@@ -2330,10 +2347,18 @@ class PaintApp:
         if not self.undo_stack:
             messagebox.showinfo("Undo", "Nothing to undo")
             return
-        self.layers, self.active_layer = self.undo_stack.pop()
+        state = self.undo_stack.pop()
+        self.layers, self.active_layer = state[:2]
+        if len(state) >= 4:
+            self.doc_w, self.doc_h = state[2:4]
         # Recreate draw objects
         for l in self.layers:
+            l.width, l.height = self.doc_w, self.doc_h
+            if l.vector_data is not None:
+                l.vector_data.width, l.vector_data.height = self.doc_w, self.doc_h
             l.draw = ImageDraw.Draw(l.image)
+        self.selection_mask = Image.new("L", (self.doc_w, self.doc_h), 0)
+        self._update_selection_geometry()
         self.refresh_layers()
         self.request_redraw()
         self.notify_globe_document_changed()
@@ -2341,6 +2366,185 @@ class PaintApp:
     def new_project(self):
         self._begin_document()
         self._finish_open()
+
+    def open_canvas_size(self):
+        """Show a modal editor for the active document dimensions."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Canvas Size")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+
+        body = ttk.Frame(dialog, padding=12)
+        body.pack(fill="both", expand=True)
+        width_var = tk.StringVar(value=str(self.doc_w))
+        height_var = tk.StringVar(value=str(self.doc_h))
+
+        ttk.Label(body, text="Width:").grid(row=0, column=0, sticky="w", pady=3)
+        width_entry = ttk.Entry(body, textvariable=width_var, width=12)
+        width_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=3)
+        ttk.Label(body, text="Height:").grid(row=1, column=0, sticky="w", pady=3)
+        height_entry = ttk.Entry(body, textvariable=height_var, width=12)
+        height_entry.grid(
+            row=1, column=1, sticky="ew", padx=(8, 0), pady=3)
+
+        maintain_aspect_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            body, text="Maintain aspect ratio",
+            variable=maintain_aspect_var).grid(
+                row=2, column=0, columnspan=2, sticky="w", pady=(4, 3))
+
+        updating_dimensions = False
+
+        def keep_aspect(changed):
+            nonlocal updating_dimensions
+            if updating_dimensions or not maintain_aspect_var.get():
+                return
+            try:
+                updating_dimensions = True
+                if changed == "width":
+                    width = int(width_var.get())
+                    if width > 0:
+                        height_var.set(str(max(1, round(
+                            width * self.doc_h / self.doc_w))))
+                else:
+                    height = int(height_var.get())
+                    if height > 0:
+                        width_var.set(str(max(1, round(
+                            height * self.doc_w / self.doc_h))))
+            except ValueError:
+                # Intermediate entry states such as an empty field are valid
+                # while the user is typing and are checked again on OK.
+                pass
+            finally:
+                updating_dimensions = False
+
+        width_var.trace_add("write", lambda *_: keep_aspect("width"))
+        height_var.trace_add("write", lambda *_: keep_aspect("height"))
+
+        ttk.Label(body, text="Anchor:").grid(
+            row=3, column=0, sticky="nw", pady=(8, 3))
+        anchor_var = tk.StringVar(value=self.canvas_resize_anchor)
+        anchor_frame = ttk.Frame(body)
+        anchor_frame.grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(8, 3))
+        anchors = (
+            ("top-left", "top", "top-right"),
+            ("left", "center", "right"),
+            ("bottom-left", "bottom", "bottom-right"),
+        )
+        for row, names in enumerate(anchors):
+            for column, name in enumerate(names):
+                ttk.Radiobutton(
+                    anchor_frame, text="●", value=name, variable=anchor_var,
+                    style="Toolbutton", width=2).grid(
+                        row=row, column=column, padx=1, pady=1)
+
+        ttk.Label(body, text="Choose where the existing image stays anchored.",
+                  foreground="#555555").grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(7, 10))
+
+        def apply_size(event=None):
+            try:
+                width = int(width_var.get())
+                height = int(height_var.get())
+            except ValueError:
+                messagebox.showerror(
+                    "Canvas Size", "Width and height must be whole numbers.",
+                    parent=dialog)
+                return
+            if width < 1 or height < 1:
+                messagebox.showerror(
+                    "Canvas Size", "Width and height must be at least 1 pixel.",
+                    parent=dialog)
+                return
+            if width > 32768 or height > 32768:
+                messagebox.showerror(
+                    "Canvas Size", "Width and height cannot exceed 32,768 pixels.",
+                    parent=dialog)
+                return
+            self.canvas_resize_anchor = anchor_var.get()
+            if (width, height) != (self.doc_w, self.doc_h):
+                self.resize_canvas(width, height, self.canvas_resize_anchor)
+            dialog.destroy()
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=5, column=0, columnspan=2, sticky="e")
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(
+            side="right", padx=(6, 0))
+        ttk.Button(buttons, text="OK", command=apply_size).pack(side="right")
+        dialog.bind("<Return>", apply_size)
+        dialog.bind("<Escape>", lambda event: dialog.destroy())
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.grab_set()
+        width_entry.focus_set()
+        width_entry.selection_range(0, "end")
+
+    def resize_canvas(self, width, height, anchor="center"):
+        """Resize the document without scaling its existing layer content."""
+        self.wand_pending = None
+        self._finish_bucket_preview()
+        self._finish_raster_stroke()
+        self._finish_clone_stroke()
+        self._finish_selection_move()
+        self._finish_selection_boundary_move()
+        self.snapshot()
+
+        old_width, old_height = self.doc_w, self.doc_h
+        horizontal, vertical = {
+            "top-left": ("left", "top"), "top": ("center", "top"),
+            "top-right": ("right", "top"), "left": ("left", "center"),
+            "center": ("center", "center"), "right": ("right", "center"),
+            "bottom-left": ("left", "bottom"),
+            "bottom": ("center", "bottom"),
+            "bottom-right": ("right", "bottom"),
+        }.get(anchor, ("center", "center"))
+
+        x = {"left": 0, "center": (width - old_width) // 2,
+             "right": width - old_width}[horizontal]
+        y = {"top": 0, "center": (height - old_height) // 2,
+             "bottom": height - old_height}[vertical]
+
+        old_selection = self.selection_mask
+        self.doc_w, self.doc_h = width, height
+        for layer in self.layers:
+            layer.width, layer.height = width, height
+            if layer.vector_data is not None:
+                for obj in layer.vector_data.objects:
+                    self._translate_vector_object(obj, x, y)
+                layer.vector_data.width, layer.vector_data.height = width, height
+                layer.render_vector()
+            else:
+                resized = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+                resized.paste(layer.image, (x, y))
+                layer.image = resized
+                layer.draw = ImageDraw.Draw(layer.image)
+                layer.reset_mipmaps()
+
+        self.selection_mask = Image.new("L", (width, height), 0)
+        self.selection_mask.paste(old_selection, (x, y))
+        self._update_selection_geometry()
+        self.refresh_layers()
+        self.request_redraw()
+        self.notify_globe_document_changed()
+
+    @staticmethod
+    def _translate_vector_object(obj, x, y):
+        """Move an editable vector object with its newly anchored canvas."""
+        lines = obj.lines if isinstance(obj, Shape) else (
+            [obj] if isinstance(obj, Line) else [])
+        for line in lines:
+            line.x1 += x
+            line.y1 += y
+            line.x2 += x
+            line.y2 += y
+            if line.curve:
+                line.curve = tuple(
+                    value + (x if index % 2 == 0 else y)
+                    for index, value in enumerate(line.curve))
+        if isinstance(obj, Shape):
+            obj._spherical_fill_cache = None
+        elif isinstance(obj, (Rectangle, Ellipse)):
+            obj.x += x
+            obj.y += y
 
     def save_project(self):
         self._finish_bucket_preview()
@@ -3306,7 +3510,7 @@ class PaintApp:
         if (self.undo_stack and (self.tool == "pencil" or
                 (self.tool in ("brush", "eraser") and
                  not self.brush_build_up_var.get()))):
-            snapshot_layers, snapshot_active = self.undo_stack[-1]
+            snapshot_layers, snapshot_active = self.undo_stack[-1][:2]
             if snapshot_active == self.active_layer:
                 self._stroke_base_image = snapshot_layers[snapshot_active].image
                 self._stroke_coverage = Image.new(
