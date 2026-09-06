@@ -848,16 +848,28 @@ class PaintApp:
         top = tk.Frame(self.root, bd=1, relief="raised")
         top.pack(fill="x", side="top")
 
-        tk.Button(top, text="New",        command=self.new_project).pack(side="left", padx=2, pady=2)
-        tk.Button(top, text="Open",       command=self.open_project).pack(side="left", padx=2, pady=2)
-        tk.Button(top, text="Copy", command=self.copy_to_clipboard).pack(side="left", padx=2, pady=2)
-        tk.Button(top, text="Paste", command=self.paste_from_clipboard).pack(side="left", padx=2, pady=2)
-        tk.Button(top, text="Save",       command=self.save_project).pack(side="left", padx=2, pady=2)
-        tk.Button(top, text="Save As",    command=self.save_project_as).pack(side="left", padx=2, pady=2)
-        tk.Button(top, text="Export PNG", command=self.save_image).pack(side="left", padx=2, pady=2)
-        tk.Button(top, text="Undo",       command=self.undo).pack(side="left", padx=2, pady=2)
-        tk.Button(top, text="Globe View", command=self.open_globe_view).pack(side="left", padx=2, pady=2)
-        tk.Button(top, text="Settings",   command=self.open_settings).pack(side="right", padx=2, pady=2)
+        toolbar_actions = (
+            ("New", "new", self.new_project),
+            ("Open", "open", self.open_project),
+            ("Copy", "copy", self.copy_to_clipboard),
+            ("Paste", "paste", self.paste_from_clipboard),
+            ("Save", "save", self.save_project),
+            ("Save As", "save-as", self.save_project_as),
+            ("Export PNG", "export", self.save_image),
+            ("Undo", "undo", self.undo),
+            ("Globe View", "globe", self.open_globe_view),
+            ("Settings", "settings", self.open_settings),
+        )
+        self.toolbar_icons = {}
+        for label, name, command in toolbar_actions:
+            with Image.open(Path(__file__).resolve().parent / "icons" /
+                            f"toolbar-{name}.png") as source:
+                icon = ImageTk.PhotoImage(source.convert("RGBA").resize(
+                    (24, 24), Image.Resampling.LANCZOS))
+            self.toolbar_icons[name] = icon
+            tk.Button(top, text=label, image=icon, compound="left", padx=5,
+                      command=command).pack(
+                side="right" if name == "settings" else "left", padx=2, pady=2)
 
         self.left_panel_collapsed = False
         self.right_panel_collapsed = False

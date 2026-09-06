@@ -5,6 +5,8 @@ __pycache__/
 /testing_tools/
 #Files
 Debug_Version.py
+Debug_Version_Main.py
+Debug_Version_GlobeView.py
 Debug_Version_old.py
 Debug_Example.py
 Performance_Reports.txt
