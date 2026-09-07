@@ -3700,6 +3700,9 @@ class PaintApp:
         self.last_y = None
         self._finish_raster_stroke()
         self.raster_stroke_active = False
+        # Replace incremental display patches with one authoritative frame so
+        # fractional zoom rounding cannot leave hairline seams on screen.
+        self.request_redraw()
         if self.layer_preview_dirty:
             self._schedule_layer_previews()
 
@@ -4484,19 +4487,32 @@ class PaintApp:
         # Build-up mode retains individual samples because overlap density is
         # intentionally visible there.
         if not build_up and len(points) > 1:
+            render_points = list(points)
+            dx = points[-1][0] - points[0][0]
+            dy = points[-1][1] - points[0][1]
+            distance = math.hypot(dx, dy)
+            if distance:
+                # Put the beginning of this mask slightly inside the previous
+                # segment. Without this overlap, two separately area-sampled
+                # half-pixels are combined with MAX and can leave a periodic
+                # one-pixel seam perpendicular to the stroke direction.
+                overlap = min(2.0, radius)
+                render_points[0] = (
+                    points[0][0] - dx / distance * overlap,
+                    points[0][1] - dy / distance * overlap)
             shape_radius = radius if raster_radius == 0 else raster_radius
-            bounds = (min(point[0] for point in points) - shape_radius,
-                      min(point[1] for point in points) - shape_radius,
-                      max(point[0] for point in points) + shape_radius,
-                      max(point[1] for point in points) + shape_radius)
+            bounds = (min(point[0] for point in render_points) - shape_radius,
+                      min(point[1] for point in render_points) - shape_radius,
+                      max(point[0] for point in render_points) + shape_radius,
+                      max(point[1] for point in render_points) + shape_radius)
 
             def paint_path(draw, left, top, scale):
                 centers = [((px - left + 0.5) * scale,
                             (py - top + 0.5) * scale)
-                           for px, py in points]
+                           for px, py in render_points]
                 width = max(1, round(radius * 2 * scale))
                 draw.line(centers, fill=255, width=width)
-                for px, py in (points[0], points[-1]):
+                for px, py in (render_points[0], render_points[-1]):
                     end_bounds = (px - shape_radius, py - shape_radius,
                                   px + shape_radius, py + shape_radius)
                     draw.ellipse(_brush_ellipse_box(
@@ -4504,7 +4520,7 @@ class PaintApp:
 
             box, mask = _brush_shape_mask(
                 layer.image, bounds, paint_path, antialias=antialias,
-                hardness=hardness)
+                hardness=hardness, softness_scale=radius * 0.5)
             if box is not None:
                 dabs.append((
                     box, self._clip_raster_mask_to_selection(box, mask)))
@@ -5025,6 +5041,10 @@ class PaintApp:
             self.last_y = None
             self._finish_raster_stroke()
             self.raster_stroke_active = False
+            # Partial PhotoImage updates deliberately favor responsiveness.
+            # Rebuild the full visible composite at stroke completion to
+            # remove any one-pixel joins caused by patch-coordinate rounding.
+            self.request_redraw()
             if self.layer_preview_dirty:
                 self._schedule_layer_previews()
         else:  # vector layer
