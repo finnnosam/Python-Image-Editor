@@ -2049,6 +2049,7 @@ class PaintApp:
         self.documents[key] = {
             "name": name or f"Untitled {self.document_counter}",
             "state": self._capture_document(),
+            "modified": True,
         }
         tab = tk.Frame(self.view_tabs)
         tk.Button(tab, text=self.documents[key]["name"], bd=0, compound="left", padx=5,
@@ -2146,14 +2147,22 @@ class PaintApp:
             selected = (key == self.active_view if key in self.globe_documents
                         else key == self.active_document and self.active_view == "main")
             tab = self.view_tab_widgets[key]
-            border = "#2878d7" if selected else "#d9d9d9"
-            background = "#dcecff" if selected else "#f0f0f0"
+            document_key = self.globe_documents.get(key, key)
+            modified = self.documents.get(document_key, {}).get("modified", False)
+            if modified:
+                border = "#c62828" if selected else "#e05252"
+                background = "#ffd9d9" if selected else "#ffe8e8"
+                active_background = "#ffc4c4"
+            else:
+                border = "#2878d7" if selected else "#d9d9d9"
+                background = "#dcecff" if selected else "#f0f0f0"
+                active_background = "#c6dfff" if selected else "#e5e5e5"
             # Reserve the same border width on every tab to avoid layout jumps.
             tab.configure(background=border, highlightthickness=3,
                           highlightbackground=border, highlightcolor=border)
             for button in tab.winfo_children():
                 button.configure(background=background,
-                                 activebackground="#c6dfff" if selected else "#e5e5e5",
+                                 activebackground=active_background,
                                  relief="flat")
 
     def switch_document(self, key):
@@ -2185,7 +2194,7 @@ class PaintApp:
             return
         state = (self._capture_document() if key == self.active_document
                  else self.documents[key]["state"])
-        if state["undo_stack"] and not messagebox.askyesno(
+        if self.documents[key].get("modified", False) and not messagebox.askyesno(
                 "Unsaved Changes", f"Close {self.documents[key]['name']} without saving?"):
             return
         if key == self.active_document:
@@ -2292,9 +2301,7 @@ class PaintApp:
         self.root.update_idletasks()
 
     def on_close(self):
-        if self.undo_stack or any(
-                item["state"]["undo_stack"] for key, item in self.documents.items()
-                if key != self.active_document):
+        if any(item.get("modified", False) for item in self.documents.values()):
             if not messagebox.askyesno("Unsaved Changes",
                                        "You have unsaved changes. Quit anyway?"):
                 return
@@ -2358,6 +2365,9 @@ class PaintApp:
         self.undo_stack.append((snap, self.active_layer, self.doc_w, self.doc_h))
         if len(self.undo_stack) > 20:
             self.undo_stack.pop(0)
+        if self.active_document in self.documents:
+            self.documents[self.active_document]["modified"] = True
+            self._highlight_document_tabs()
 
     def undo(self):
         self._finish_bucket_preview()
@@ -2733,7 +2743,8 @@ class PaintApp:
     def save_project(self):
         self._finish_bucket_preview()
         if self.current_file:
-            self._save_to_file(self.current_file)
+            if self._save_to_file(self.current_file):
+                self.update_title()
         else:
             self.save_project_as()
 
@@ -2743,10 +2754,10 @@ class PaintApp:
             filetypes=[("PyPaint files", "*.pypaint"), ("All files", "*.*")]
         )
         if filename:
-            self._save_to_file(filename)
-            self.current_file = filename
-            self.update_title()
-            messagebox.showinfo("Success", f"Project saved to {filename}")
+            if self._save_to_file(filename):
+                self.current_file = filename
+                self.update_title()
+                messagebox.showinfo("Success", f"Project saved to {filename}")
 
     def _save_to_file(self, filename):
         try:
@@ -2786,9 +2797,14 @@ class PaintApp:
                 json.dump(project_data, f)
             
             self.undo_stack = []
+            if self.active_document in self.documents:
+                self.documents[self.active_document]["modified"] = False
+                self._highlight_document_tabs()
+            return True
             
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save project: {e}")
+            return False
 
     def open_project(self):
         filenames = filedialog.askopenfilenames(
@@ -2863,6 +2879,8 @@ class PaintApp:
         self.active_layer = active_layer
         self.current_file = filename
         self._finish_open(startup_to_replace)
+        self.documents[self.active_document]["modified"] = False
+        self._highlight_document_tabs()
 
     def _open_image_file(self, filename):
         """Import an ordinary image as a new, unsaved raster document."""
