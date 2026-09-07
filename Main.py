@@ -859,6 +859,7 @@ class PaintApp:
                                      relief="flat")
         image_menu = tk.Menu(image_button, tearoff=False)
         image_menu.add_command(label="Canvas Size…", command=self.open_canvas_size)
+        image_menu.add_command(label="Resize…", command=self.open_resize)
         image_button.configure(menu=image_menu)
         image_button.pack(side="left")
 
@@ -2525,6 +2526,170 @@ class PaintApp:
         self.refresh_layers()
         self.request_redraw()
         self.notify_globe_document_changed()
+
+    def open_resize(self):
+        """Show the image-resampling dialog."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Resize")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+
+        body = ttk.Frame(dialog, padding=12)
+        body.pack(fill="both", expand=True)
+        width_var = tk.StringVar(value=str(self.doc_w))
+        height_var = tk.StringVar(value=str(self.doc_h))
+        maintain_aspect_var = tk.BooleanVar(value=True)
+        resampling_var = tk.StringVar(value="Nearest Neighbor")
+
+        ttk.Label(body, text="Width:").grid(row=0, column=0, sticky="w", pady=3)
+        width_entry = ttk.Entry(body, textvariable=width_var, width=15)
+        width_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=3)
+        ttk.Label(body, text="Height:").grid(row=1, column=0, sticky="w", pady=3)
+        ttk.Entry(body, textvariable=height_var, width=15).grid(
+            row=1, column=1, sticky="ew", padx=(8, 0), pady=3)
+        ttk.Checkbutton(
+            body, text="Maintain aspect ratio",
+            variable=maintain_aspect_var).grid(
+                row=2, column=0, columnspan=2, sticky="w", pady=(4, 7))
+        ttk.Label(body, text="Resampling:").grid(
+            row=3, column=0, sticky="w", pady=3)
+        ttk.Combobox(
+            body, textvariable=resampling_var, values=("Nearest Neighbor",),
+            state="readonly", width=17).grid(
+                row=3, column=1, sticky="ew", padx=(8, 0), pady=3)
+
+        updating_dimensions = False
+
+        def keep_aspect(changed):
+            nonlocal updating_dimensions
+            if updating_dimensions or not maintain_aspect_var.get():
+                return
+            try:
+                updating_dimensions = True
+                if changed == "width":
+                    width = int(width_var.get())
+                    if width > 0:
+                        height_var.set(str(max(1, round(
+                            width * self.doc_h / self.doc_w))))
+                else:
+                    height = int(height_var.get())
+                    if height > 0:
+                        width_var.set(str(max(1, round(
+                            height * self.doc_w / self.doc_h))))
+            except ValueError:
+                pass
+            finally:
+                updating_dimensions = False
+
+        width_var.trace_add("write", lambda *_: keep_aspect("width"))
+        height_var.trace_add("write", lambda *_: keep_aspect("height"))
+
+        def apply_size(event=None):
+            try:
+                width = int(width_var.get())
+                height = int(height_var.get())
+            except ValueError:
+                messagebox.showerror(
+                    "Resize", "Width and height must be whole numbers.",
+                    parent=dialog)
+                return
+            if width < 1 or height < 1:
+                messagebox.showerror(
+                    "Resize", "Width and height must be at least 1 pixel.",
+                    parent=dialog)
+                return
+            if width > 32768 or height > 32768:
+                messagebox.showerror(
+                    "Resize", "Width and height cannot exceed 32,768 pixels.",
+                    parent=dialog)
+                return
+            if (width, height) != (self.doc_w, self.doc_h):
+                self.resize_image(width, height, resampling_var.get())
+            dialog.destroy()
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=4, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(
+            side="right", padx=(6, 0))
+        ttk.Button(buttons, text="OK", command=apply_size).pack(side="right")
+        dialog.bind("<Return>", apply_size)
+        dialog.bind("<Escape>", lambda event: dialog.destroy())
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.grab_set()
+        width_entry.focus_set()
+        width_entry.selection_range(0, "end")
+
+    def resize_image(self, width, height, resampling="Nearest Neighbor"):
+        """Scale all document content to new pixel dimensions."""
+        self.wand_pending = None
+        self._finish_bucket_preview()
+        self._finish_raster_stroke()
+        self._finish_clone_stroke()
+        self._finish_selection_move()
+        self._finish_selection_boundary_move()
+        self.snapshot()
+
+        old_width, old_height = self.doc_w, self.doc_h
+        scale_x = width / old_width
+        scale_y = height / old_height
+        # The menu currently exposes one method; keeping the lookup here makes
+        # adding more choices later a UI-only extension.
+        filters = {"Nearest Neighbor": Image.Resampling.NEAREST}
+        image_filter = filters.get(resampling, Image.Resampling.NEAREST)
+
+        self.doc_w, self.doc_h = width, height
+        for layer in self.layers:
+            layer.width, layer.height = width, height
+            if layer.vector_data is not None:
+                for obj in layer.vector_data.objects:
+                    self._scale_vector_object(obj, scale_x, scale_y)
+                layer.vector_data.width, layer.vector_data.height = width, height
+                layer.render_vector()
+            else:
+                layer.image = layer.image.resize((width, height), image_filter)
+                layer.draw = ImageDraw.Draw(layer.image)
+                layer.reset_mipmaps()
+
+        self.selection_mask = self.selection_mask.resize(
+            (width, height), Image.Resampling.NEAREST)
+        self._update_selection_geometry()
+        self.clone_source_center = None
+        self.clone_offset = None
+        self.refresh_layers()
+        self.request_redraw()
+        self.notify_globe_document_changed()
+
+    @staticmethod
+    def _scale_vector_object(obj, scale_x, scale_y):
+        """Scale editable vector geometry with a resized image."""
+        lines = obj.lines if isinstance(obj, Shape) else (
+            [obj] if isinstance(obj, Line) else [])
+        for line in lines:
+            line.x1 *= scale_x
+            line.y1 *= scale_y
+            line.x2 *= scale_x
+            line.y2 *= scale_y
+            line.width = max(1, round(
+                line.width * math.sqrt(scale_x * scale_y)))
+            if line.curve:
+                line.curve = tuple(
+                    value * (scale_x if index % 2 == 0 else scale_y)
+                    for index, value in enumerate(line.curve))
+        if isinstance(obj, Shape):
+            obj.width = max(1, round(
+                obj.width * math.sqrt(scale_x * scale_y)))
+            obj._spherical_fill_cache = None
+        elif isinstance(obj, (Rectangle, Ellipse)):
+            obj.x *= scale_x
+            obj.y *= scale_y
+            obj.width = max(1, round(
+                obj.width * math.sqrt(scale_x * scale_y)))
+            if isinstance(obj, Rectangle):
+                obj.w *= scale_x
+                obj.h *= scale_y
+            else:
+                obj.rx *= scale_x
+                obj.ry *= scale_y
 
     @staticmethod
     def _translate_vector_object(obj, x, y):
