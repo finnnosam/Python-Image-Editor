@@ -695,6 +695,7 @@ class PaintApp:
         self.redraw_pending = False
         self.last_redraw = 0.0
         self.redraw_after_id = None
+        self.pending_redraw_box = None
         self.mipmap_after_id = None
         self.pending_mipmap_level = None
         self.mipmap_future = None
@@ -794,6 +795,8 @@ class PaintApp:
         self.bucket_pending = None
         self.wand_pending = None
         self.layer_preview_after_id = None
+        self.layer_preview_dirty = False
+        self.raster_stroke_active = False
         self.layer_preview_cache = {}
 
         # Drag and drop variables
@@ -1419,13 +1422,26 @@ class PaintApp:
             self.right_panel_content, textvariable=self.layer_action_hint
         ).pack(pady=(1, 4))
 
-    def request_redraw(self, defer=False):
+    @staticmethod
+    def _union_boxes(first, second):
+        if first is None:
+            return second
+        return (min(first[0], second[0]), min(first[1], second[1]),
+                max(first[2], second[2]), max(first[3], second[3]))
+
+    def request_redraw(self, defer=False, dirty_box=None):
         self._schedule_layer_previews()
         if hasattr(self, "active_view") and self.active_view != "main":
             self.main_view_dirty = True
             return
 
         if self.redraw_after_id is not None:
+            # None means that a full refresh is already pending.
+            if self.pending_redraw_box is not None and dirty_box is not None:
+                self.pending_redraw_box = self._union_boxes(
+                    self.pending_redraw_box, dirty_box)
+            elif dirty_box is None:
+                self.pending_redraw_box = None
             return
 
         now = time.perf_counter()
@@ -1435,18 +1451,21 @@ class PaintApp:
             delay = max(delay, 0.008)
         if delay == 0:
             self.last_redraw = now
-            self.redraw()
+            self.redraw(dirty_box)
         else:
             # Keep a trailing redraw.  Merely discarding requests received
             # inside the frame interval makes fast drags look jerky and can
             # leave the canvas one event behind the document.
+            self.pending_redraw_box = dirty_box
             self.redraw_after_id = self.root.after(
                 max(1, math.ceil(delay * 1000)), self._scheduled_redraw)
 
     def _scheduled_redraw(self):
         self.redraw_after_id = None
         self.last_redraw = time.perf_counter()
-        self.redraw()
+        dirty_box = self.pending_redraw_box
+        self.pending_redraw_box = None
+        self.redraw(dirty_box)
 
     def request_mipmap_level(self, level):
         """Build a missing zoom level after wheel input has settled.
@@ -3378,12 +3397,20 @@ class PaintApp:
         return photo
 
     def _schedule_layer_previews(self):
-        if (hasattr(self, "layer_list") and
-                self.layer_preview_after_id is None):
-            self.layer_preview_after_id = self.root.after(180, self._update_layer_previews)
+        """Debounce previews, and never build them while a stroke is active."""
+        self.layer_preview_dirty = True
+        if not hasattr(self, "layer_list") or self.raster_stroke_active:
+            return
+        if self.layer_preview_after_id is not None:
+            self.root.after_cancel(self.layer_preview_after_id)
+        self.layer_preview_after_id = self.root.after(
+            400, self._update_layer_previews)
 
     def _update_layer_previews(self):
         self.layer_preview_after_id = None
+        if self.raster_stroke_active:
+            return
+        self.layer_preview_dirty = False
         self._update_document_preview()
         rows = self.layer_list.get_children()
         if len(rows) != len(self.layers):
@@ -3547,6 +3574,10 @@ class PaintApp:
 
     def start_raster_draw(self, event):
         self.snapshot()
+        self.raster_stroke_active = True
+        if self.layer_preview_after_id is not None:
+            self.root.after_cancel(self.layer_preview_after_id)
+            self.layer_preview_after_id = None
         self._prepare_raster_stroke()
         self.last_x, self.last_y = self.raster_image_coords(event.x, event.y)
         # Stamp the initial point immediately so a click/tap without any
@@ -3654,6 +3685,7 @@ class PaintApp:
         (such as the globe window).
         """
         self.snapshot()
+        self.raster_stroke_active = True
         self._prepare_raster_stroke()
         self.last_x = x
         self.last_y = y
@@ -3667,6 +3699,9 @@ class PaintApp:
         self.last_x = None
         self.last_y = None
         self._finish_raster_stroke()
+        self.raster_stroke_active = False
+        if self.layer_preview_dirty:
+            self._schedule_layer_previews()
 
     def _prepare_raster_stroke(self):
         """Capture the state needed to cap opacity within one brush gesture."""
@@ -4374,25 +4409,185 @@ class PaintApp:
         # two-pixel holes in thin strokes between mouse-motion events.
         steps = max(1, math.ceil(dist / spacing))
 
+        points = []
         for i in range(steps + 1):
-
             t = i / steps
+            points.append((self.last_x + dx * t,
+                           self.last_y + dy * t))
 
-            px = self.last_x + dx * t
-            py = self.last_y + dy * t
+        # A single union box for a long diagonal stroke can cover most of a
+        # large document even though only a thin path changed. Keep composite
+        # patches bounded so fast pointer events do work proportional to the
+        # painted path instead of its potentially enormous bounding rectangle.
+        max_center_span = max(128, min(384, round(radius * 4)))
+        chunks = []
+        chunk = [points[0]]
+        chunk_left = chunk_right = points[0][0]
+        chunk_top = chunk_bottom = points[0][1]
+        for point in points[1:]:
+            next_left = min(chunk_left, point[0])
+            next_right = max(chunk_right, point[0])
+            next_top = min(chunk_top, point[1])
+            next_bottom = max(chunk_bottom, point[1])
+            if (next_right - next_left > max_center_span or
+                    next_bottom - next_top > max_center_span):
+                chunks.append(chunk)
+                # Repeat the boundary sample so adjacent chunks cannot leave
+                # a subpixel seam at their join.
+                chunk = [chunk[-1], point]
+                chunk_left = min(chunk[0][0], point[0])
+                chunk_right = max(chunk[0][0], point[0])
+                chunk_top = min(chunk[0][1], point[1])
+                chunk_bottom = max(chunk[0][1], point[1])
+            else:
+                chunk.append(point)
+                chunk_left, chunk_right = next_left, next_right
+                chunk_top, chunk_bottom = next_top, next_bottom
+        chunks.append(chunk)
 
-            self.draw_circle(
-                px,
-                py,
-                radius,
-                color
-            )
+        dirty_box = None
+        for chunk in chunks:
+            chunk_box = self._paint_brush_segment(chunk, radius, color)
+            if chunk_box is not None:
+                dirty_box = self._union_boxes(dirty_box, chunk_box)
+        if dirty_box is not None:
+            self.layers[self.active_layer].update_mipmaps(dirty_box)
 
         self.last_x = x
         self.last_y = y
 
-        self.request_redraw()
+        self.request_redraw(defer=True, dirty_box=dirty_box)
         self.notify_globe_document_changed()
+
+    def _paint_brush_segment(self, points, radius, color):
+        """Rasterize and apply all interpolated dabs from one motion event.
+
+        Mask creation remains local to each dab so subpixel antialiasing and
+        hardness are unchanged. The expensive layer crop/composite and mipmap
+        refresh, however, happen only once for the complete event segment.
+        """
+        layer = self.layers[self.active_layer]
+        radius = max(0.5, radius)
+        raster_radius = max(0, radius - 0.5)
+        antialias = self.brush_antialias_var.get()
+        hardness = self.brush_hardness()
+        build_up = self._stroke_base_image is None
+        dab_opacity = (self.primary_opacity if self.last_button == 1
+                       else self.secondary_opacity)
+        if self.tool != "eraser":
+            dab_opacity = color[3]
+        dabs = []
+
+        # In capped-opacity mode, overlapping stamps are combined with MAX.
+        # That is geometrically the same as one round-ended path, so render
+        # the path in a single mask instead of allocating a mask per sample.
+        # Build-up mode retains individual samples because overlap density is
+        # intentionally visible there.
+        if not build_up and len(points) > 1:
+            shape_radius = radius if raster_radius == 0 else raster_radius
+            bounds = (min(point[0] for point in points) - shape_radius,
+                      min(point[1] for point in points) - shape_radius,
+                      max(point[0] for point in points) + shape_radius,
+                      max(point[1] for point in points) + shape_radius)
+
+            def paint_path(draw, left, top, scale):
+                centers = [((px - left + 0.5) * scale,
+                            (py - top + 0.5) * scale)
+                           for px, py in points]
+                width = max(1, round(radius * 2 * scale))
+                draw.line(centers, fill=255, width=width)
+                for px, py in (points[0], points[-1]):
+                    end_bounds = (px - shape_radius, py - shape_radius,
+                                  px + shape_radius, py + shape_radius)
+                    draw.ellipse(_brush_ellipse_box(
+                        end_bounds, left, top, scale), fill=255, outline=255)
+
+            box, mask = _brush_shape_mask(
+                layer.image, bounds, paint_path, antialias=antialias,
+                hardness=hardness)
+            if box is not None:
+                dabs.append((
+                    box, self._clip_raster_mask_to_selection(box, mask)))
+
+        for x, y in (() if dabs else points):
+            if raster_radius == 0 and not antialias:
+                px, py = round(x), round(y)
+                bounds = (px, py, px, py)
+                painter = lambda draw, left, top, scale, px=px, py=py: \
+                    draw.rectangle(((px - left) * scale,
+                                    (py - top) * scale,
+                                    (px - left + 1) * scale - 1,
+                                    (py - top + 1) * scale - 1), fill=255)
+            else:
+                shape_radius = radius if raster_radius == 0 else raster_radius
+                bounds = (x - shape_radius, y - shape_radius,
+                          x + shape_radius, y + shape_radius)
+                painter = lambda draw, left, top, scale, bounds=bounds: \
+                    draw.ellipse(_brush_ellipse_box(bounds, left, top, scale),
+                                 fill=255, outline=255)
+            box, mask = _brush_shape_mask(
+                layer.image, bounds, painter, antialias=antialias,
+                hardness=hardness)
+            if box is not None:
+                mask = self._clip_raster_mask_to_selection(box, mask)
+                # Build-up mode applies opacity per dab; scaling before the
+                # SCREEN union preserves the same overlap accumulation.
+                if build_up and dab_opacity < 255:
+                    mask = mask.point(
+                        lambda value, opacity=dab_opacity:
+                        (value * opacity + 127) // 255)
+                dabs.append((box, mask))
+
+        if not dabs:
+            return None
+        union = (min(box[0] for box, _ in dabs),
+                 min(box[1] for box, _ in dabs),
+                 max(box[2] for box, _ in dabs),
+                 max(box[3] for box, _ in dabs))
+        combined = Image.new("L", (union[2] - union[0], union[3] - union[1]), 0)
+        for box, mask in dabs:
+            offset = (box[0] - union[0], box[1] - union[1])
+            existing = combined.crop((offset[0], offset[1],
+                                      offset[0] + mask.width,
+                                      offset[1] + mask.height))
+            merged = (ImageChops.screen(existing, mask) if build_up
+                      else ImageChops.lighter(existing, mask))
+            combined.paste(merged, offset)
+
+        if self.tool == "eraser":
+            if not build_up and dab_opacity < 255:
+                combined = combined.point(
+                    lambda value: (value * dab_opacity + 127) // 255)
+            if self._stroke_base_image is not None:
+                coverage = ImageChops.lighter(
+                    self._stroke_coverage.crop(union), combined)
+                self._stroke_coverage.paste(coverage, union[:2])
+                result = self._stroke_base_image.crop(union)
+                erase_mask = coverage
+            else:
+                result = layer.image.crop(union)
+                erase_mask = combined
+            result.putalpha(ImageChops.multiply(
+                result.getchannel("A"), ImageOps.invert(erase_mask)))
+        else:
+            if self._stroke_base_image is not None:
+                coverage = ImageChops.lighter(
+                    self._stroke_coverage.crop(union), combined)
+                self._stroke_coverage.paste(coverage, union[:2])
+                result = self._stroke_base_image.crop(union)
+                paint_mask = coverage
+            else:
+                result = layer.image.crop(union)
+                paint_mask = combined
+            source_color = ((color[0], color[1], color[2], 255)
+                            if build_up else color)
+            source = Image.new("RGBA", paint_mask.size, source_color)
+            source.putalpha(ImageChops.multiply(
+                source.getchannel("A"), paint_mask))
+            result.alpha_composite(source)
+
+        self.apply_raster_result(layer, result, union)
+        return union
 
     def _paint_pencil(self, x, y):
         # Raster coordinates place integer values at pixel centers.
@@ -4829,6 +5024,9 @@ class PaintApp:
             self.last_x = None
             self.last_y = None
             self._finish_raster_stroke()
+            self.raster_stroke_active = False
+            if self.layer_preview_dirty:
+                self._schedule_layer_previews()
         else:  # vector layer
             if self.is_dragging_point:
                 self.is_dragging_point = False
@@ -5228,7 +5426,7 @@ class PaintApp:
         self._canvas_image_id = self.canvas.create_image(
             sx, sy, image=self.tkimg, anchor="nw")
 
-    def redraw(self):
+    def redraw(self, dirty_box=None):
         # Keep inactive views lazy.  In particular, globe painting used to
         # render this hidden canvas as well as the visible globe every frame.
         if hasattr(self, "active_view") and self.active_view != "main":
@@ -5264,20 +5462,50 @@ class PaintApp:
         sw = max(1, round((crop_right - crop_left) * self.zoom))
         sh = max(1, round((crop_bottom - crop_top) * self.zoom))
         crop_box = (crop_left, crop_top, crop_right, crop_bottom)
-        crop = self.composite_region(crop_box, (sw, sh))
-
-        checker = self.get_checker_backdrop_pil(cw, ch).crop(
-            (doc_sx, doc_sy, doc_sx + sw, doc_sy + sh))
-        checker.alpha_composite(crop)
-        self.tkimg = ImageTk.PhotoImage(checker.convert("RGB"))
-
-        if self._canvas_image_id is None:
-            self._canvas_image_id = self.canvas.create_image(
-                sx, sy, image=self.tkimg, anchor="nw")
+        geometry = (cw, ch, crop_box, sw, sh, sx, sy)
+        partial = (dirty_box is not None and
+                   getattr(self, "_display_geometry", None) == geometry and
+                   getattr(self, "tkimg", None) is not None and
+                   self._canvas_image_id is not None)
+        if partial:
+            # Convert the dirty document bounds to pixels within the existing
+            # viewport PhotoImage. A small guard band absorbs rounding at
+            # fractional zoom levels and brush antialias edges.
+            px0 = max(0, math.floor((dirty_box[0] - crop_left) * self.zoom) - 2)
+            py0 = max(0, math.floor((dirty_box[1] - crop_top) * self.zoom) - 2)
+            px1 = min(sw, math.ceil((dirty_box[2] - crop_left) * self.zoom) + 2)
+            py1 = min(sh, math.ceil((dirty_box[3] - crop_top) * self.zoom) + 2)
+            if px1 > px0 and py1 > py0:
+                patch_box = (crop_left + px0 / self.zoom,
+                             crop_top + py0 / self.zoom,
+                             crop_left + px1 / self.zoom,
+                             crop_top + py1 / self.zoom)
+                patch = self.composite_region(
+                    patch_box, (px1 - px0, py1 - py0))
+                checker = self.get_checker_backdrop_pil(cw, ch).crop(
+                    (doc_sx + px0, doc_sy + py0,
+                     doc_sx + px1, doc_sy + py1))
+                checker.alpha_composite(patch)
+                patch_tk = ImageTk.PhotoImage(checker.convert("RGB"))
+                # Tk's native photo-image copy supports a destination offset;
+                # Pillow's PhotoImage.paste only replaces an entire image.
+                self.canvas.tk.call(str(self.tkimg), "copy", str(patch_tk),
+                                    "-to", px0, py0)
         else:
-            self.canvas.coords(self._canvas_image_id, sx, sy)
-            self.canvas.itemconfigure(self._canvas_image_id,
-                                      image=self.tkimg, state="normal")
+            crop = self.composite_region(crop_box, (sw, sh))
+            checker = self.get_checker_backdrop_pil(cw, ch).crop(
+                (doc_sx, doc_sy, doc_sx + sw, doc_sy + sh))
+            checker.alpha_composite(crop)
+            self.tkimg = ImageTk.PhotoImage(checker.convert("RGB"))
+
+            if self._canvas_image_id is None:
+                self._canvas_image_id = self.canvas.create_image(
+                    sx, sy, image=self.tkimg, anchor="nw")
+            else:
+                self.canvas.coords(self._canvas_image_id, sx, sy)
+                self.canvas.itemconfigure(self._canvas_image_id,
+                                          image=self.tkimg, state="normal")
+            self._display_geometry = geometry
 
         # Draw brush cursor for raster layers
         current_layer = self.layers[self.active_layer]
