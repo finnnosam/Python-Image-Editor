@@ -1395,6 +1395,7 @@ class PaintApp:
             ("Add Vector Layer", "add-vector-layer.png",
              lambda: self.add_layer("vector")),
             ("Delete Layer", "delete-layer.png", self.delete_layer),
+            ("Duplicate Layer", "toolbar-copy.png", self.duplicate_layer),
             ("Toggle Visibility", "toggle-visibility.png",
              self.toggle_visibility),
             ("Move Layer Up", "move-layer-up.png", self.move_layer_up),
@@ -1407,11 +1408,11 @@ class PaintApp:
         for index, (label, filename, command) in enumerate(layer_actions):
             with Image.open(icon_dir / filename) as icon_image:
                 icon_image = icon_image.convert("RGBA").resize(
-                    (28, 28), Image.Resampling.LANCZOS)
+                    (24, 24), Image.Resampling.LANCZOS)
             icon = ImageTk.PhotoImage(icon_image)
             self.layer_action_icons[filename] = icon
             button = tk.Button(
-                action_frame, image=icon, width=34, height=34,
+                action_frame, image=icon, width=26, height=26,
                 command=command, takefocus=True)
             button.grid(row=0, column=index, padx=1, pady=1)
             button.bind(
@@ -3096,6 +3097,35 @@ class PaintApp:
     def toggle_visibility(self):
         self.layers[self.active_layer].visible = not self.layers[self.active_layer].visible
         self.refresh_layers()
+        self.request_redraw()
+        self.notify_globe_document_changed()
+
+    def duplicate_layer(self):
+        """Duplicate the active layer immediately above the source layer."""
+        self._finish_clone_stroke()
+        self._finish_selection_move()
+        self._finish_selection_boundary_move()
+        self.snapshot()
+
+        source = self.layers[self.active_layer]
+        duplicate = Layer(
+            self.doc_w, self.doc_h, f"{source.name} copy", source.layer_type)
+        duplicate.visible = source.visible
+        duplicate.opacity = source.opacity
+        duplicate.masked = source.masked
+        duplicate.anti_mask = source.anti_mask
+        duplicate.mask_mode = source.mask_mode
+        duplicate.image = source.image.copy()
+        duplicate.draw = ImageDraw.Draw(duplicate.image)
+        if source.vector_data is not None:
+            duplicate.vector_data = copy.deepcopy(source.vector_data)
+            duplicate.vector_data.name = duplicate.name
+        duplicate.reset_mipmaps()
+
+        self.active_layer += 1
+        self.layers.insert(self.active_layer, duplicate)
+        self.refresh_layers()
+        self.update_tools_for_active_layer()
         self.request_redraw()
         self.notify_globe_document_changed()
 
