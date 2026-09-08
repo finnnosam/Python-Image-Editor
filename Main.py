@@ -779,6 +779,7 @@ class PaintApp:
         self.move_mask = None
         self.move_base_image = None
         self.move_selection_bounds = None
+        self.move_selection_edges = None
         self.move_offset = (0, 0)
         self.move_drag_origin_offset = (0, 0)
         self.selection_move_start = None
@@ -2007,6 +2008,7 @@ class PaintApp:
             "selection_bounds selection_mask selection_operation selection_base_mask "
             "selection_edges selection_dash_offset move_start move_source_box "
             "move_pixels move_is_paste move_mask move_base_image move_selection_bounds "
+            "move_selection_edges "
             "move_offset move_drag_origin_offset selection_move_start "
             "selection_move_bounds selection_move_mask selection_brush_last "
             "selection_brush_remove clone_source_center clone_offset clone_last "
@@ -4011,16 +4013,23 @@ class PaintApp:
 
     def _start_selection_move(self, x, y):
         """Capture the selected raster pixels for an interactive move."""
+        # A floating edit can extend beyond the document, where there is no
+        # document-sized selection mask to hit-test.  Its own alpha is the
+        # authoritative hit area until the edit is committed.
+        if self.move_pixels is not None:
+            source_left, source_top, _, _ = self.move_source_box
+            local_x = math.floor(x - source_left - self.move_offset[0])
+            local_y = math.floor(y - source_top - self.move_offset[1])
+            if (0 <= local_x < self.move_pixels.width and
+                    0 <= local_y < self.move_pixels.height and
+                    self.move_pixels.getchannel("A").getpixel(
+                        (local_x, local_y)) > 0):
+                self.move_start = (x, y)
+                self.move_drag_origin_offset = self.move_offset
+            return
         if self.selection_bounds is None:
             return
         if not self._point_in_selection(x, y):
-            return
-
-        # A released move remains floating. Starting another drag reuses the
-        # original pixels and cleared base, preserving one continuous edit.
-        if self.move_pixels is not None:
-            self.move_start = (x, y)
-            self.move_drag_origin_offset = self.move_offset
             return
 
         box = self._selection_pixel_box()
@@ -4046,6 +4055,9 @@ class PaintApp:
         self.move_base_image = layer.image.copy()
         self.move_base_image.paste((0, 0, 0, 0), box, self.move_mask)
         self.move_selection_bounds = self.selection_bounds
+        self.move_selection_edges = [
+            (x0 - box[0], y0 - box[1], x1 - box[0], y1 - box[1])
+            for x0, y0, x1, y1 in self.selection_edges]
         self.move_offset = (0, 0)
         self.move_drag_origin_offset = (0, 0)
 
@@ -4059,13 +4071,11 @@ class PaintApp:
               round(x - self.move_start[0]))
         dy = (self.move_drag_origin_offset[1] +
               round(y - self.move_start[1]))
-        dx = max(-source_left, min(self.doc_w - source_right, dx))
-        dy = max(-source_top, min(self.doc_h - source_bottom, dy))
 
         layer = self.layers[self.active_layer]
+        # Keep the layer at its cut-out base while the pixels float.  Drawing
+        # the float as an overlay preserves pixels beyond the document bounds.
         layer.image.paste(self.move_base_image)
-        layer.image.alpha_composite(
-            self.move_pixels, (source_left + dx, source_top + dy))
         layer.reset_mipmaps()
 
         self.selection_mask = Image.new("L", (self.doc_w, self.doc_h), 0)
@@ -4086,6 +4096,14 @@ class PaintApp:
         if self.move_pixels is None:
             return
         changed = self.move_is_paste or self.move_offset != (0, 0)
+        source_left, source_top, _, _ = self.move_source_box
+        layer = self.layers[self.active_layer]
+        layer.image.paste(self.move_base_image)
+        layer.image.alpha_composite(
+            self.move_pixels,
+            (source_left + self.move_offset[0],
+             source_top + self.move_offset[1]))
+        layer.reset_mipmaps()
         self.move_start = None
         self.move_source_box = None
         self.move_pixels = None
@@ -4093,6 +4111,7 @@ class PaintApp:
         self.move_mask = None
         self.move_base_image = None
         self.move_selection_bounds = None
+        self.move_selection_edges = None
         self.move_offset = (0, 0)
         self.move_drag_origin_offset = (0, 0)
         if not changed and self.undo_stack:
@@ -4103,7 +4122,7 @@ class PaintApp:
 
     def _start_selection_boundary_move(self, x, y):
         """Begin moving only the selection marquee, leaving pixels untouched."""
-        if self.selection_bounds is None:
+        if self.selection_bounds is None and self.move_pixels is None:
             return
         if self._point_in_selection(x, y):
             self.selection_move_start = (x, y)
@@ -4188,11 +4207,21 @@ class PaintApp:
 
     def _draw_selection_marquee(self):
         """Draw the active selection outline over the current raster view."""
-        if (self.selection_bounds is None or not self.layers or
+        if ((self.selection_bounds is None and self.move_pixels is None) or
+                not self.layers or
                 not self.layers[self.active_layer].is_raster):
             return
         tags = ("overlay", "selection_marquee")
-        edges = list(self.selection_edges)
+        if self.move_pixels is not None:
+            source_left, source_top, _, _ = self.move_source_box
+            origin_x = source_left + self.move_offset[0]
+            origin_y = source_top + self.move_offset[1]
+            edges = [
+                (origin_x + x0, origin_y + y0,
+                 origin_x + x1, origin_y + y1)
+                for x0, y0, x1, y1 in self.move_selection_edges]
+        else:
+            edges = list(self.selection_edges)
         if self.selection_start is not None:
             left, top, right, bottom = self.selection_bounds
             edges.extend(((left, top, right, top),
@@ -5269,15 +5298,21 @@ class PaintApp:
         self.snapshot()
         box = self._selection_pixel_box()
         left, top = box[:2] if box else (0, 0)
-        right = min(self.doc_w, left + pixels.width)
-        bottom = min(self.doc_h, top + pixels.height)
+        right = left + pixels.width
+        bottom = top + pixels.height
         self.move_source_box = (left, top, right, bottom)
-        self.move_pixels = pixels.crop((0, 0, right - left, bottom - top))
+        self.move_pixels = pixels.copy()
         self.move_mask = Image.new("L", self.move_pixels.size, 255)
         # Paste previews preserve the complete base instead of cutting it.
         self.move_base_image = layer.image.copy()
         self.move_is_paste = True
         self.move_selection_bounds = self.move_source_box
+        self.move_selection_edges = [
+            (0, 0, pixels.width, 0),
+            (pixels.width, 0, pixels.width, pixels.height),
+            (pixels.width, pixels.height, 0, pixels.height),
+            (0, pixels.height, 0, 0),
+        ]
         self.move_offset = (0, 0)
         self.move_drag_origin_offset = (0, 0)
         self.move_start = (left, top)
@@ -5545,6 +5580,26 @@ class PaintApp:
                                           image=self.tkimg, state="normal")
             self._display_geometry = geometry
 
+        # Floating move/paste pixels are intentionally not part of the
+        # document image yet.  Showing them as a canvas overlay lets the full
+        # temporary object remain visible outside the document; committing the
+        # edit later clips it naturally to the fixed-size raster layer.
+        if self.move_pixels is not None:
+            source_left, source_top, _, _ = self.move_source_box
+            float_x = source_left + self.move_offset[0]
+            float_y = source_top + self.move_offset[1]
+            float_image = self.move_pixels
+            scaled_width = max(1, round(float_image.width * self.zoom))
+            scaled_height = max(1, round(float_image.height * self.zoom))
+            if (scaled_width, scaled_height) != float_image.size:
+                float_image = float_image.resize(
+                    (scaled_width, scaled_height), Image.Resampling.NEAREST)
+            self._floating_move_tkimg = ImageTk.PhotoImage(float_image)
+            float_sx, float_sy = self.screen_coords(float_x, float_y)
+            self.canvas.create_image(
+                float_sx, float_sy, image=self._floating_move_tkimg,
+                anchor="nw", tags=("overlay", "floating_move"))
+
         # Draw brush cursor for raster layers
         current_layer = self.layers[self.active_layer]
         if self.tool == "color picker":
@@ -5622,9 +5677,11 @@ class PaintApp:
                                                outline="cyan", fill="cyan", width=1,
                                                tags=("overlay",))
 
-        # A raster selection is document-space state, so it stays aligned as
-        # the canvas pans and zooms. Draw a contrasting marquee over the image.
-        if current_layer.is_raster and self.selection_bounds is not None:
+        # A committed selection is document-space state; a floating selection
+        # can also occupy the surrounding workspace until it is finalized.
+        if (current_layer.is_raster and
+                (self.selection_bounds is not None or
+                 self.move_pixels is not None)):
             self._draw_selection_marquee()
 
 
