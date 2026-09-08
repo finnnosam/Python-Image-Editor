@@ -4193,7 +4193,7 @@ class PaintApp:
     def _animate_selection_marquee(self):
         """Advance the selection dashes without rerendering the document."""
         self.selection_animation_id = None
-        if self.selection_bounds is None:
+        if self.selection_bounds is None and self.move_pixels is None:
             return
         self.selection_dash_offset = (self.selection_dash_offset + 1) % 10
         try:
@@ -4224,6 +4224,14 @@ class PaintApp:
             edges = list(self.selection_edges)
         if self.selection_start is not None:
             left, top, right, bottom = self.selection_bounds
+            left, right = sorted((left, right))
+            top, bottom = sorted((top, bottom))
+            left = max(0, min(self.doc_w, left))
+            right = max(0, min(self.doc_w, right))
+            top = max(0, min(self.doc_h, top))
+            bottom = max(0, min(self.doc_h, bottom))
+            left, top, right, bottom = self._pixel_box_from_bounds(
+                (left, top, right, bottom))
             edges.extend(((left, top, right, top),
                           (right, top, right, bottom),
                           (right, bottom, left, bottom),
