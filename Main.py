@@ -3099,6 +3099,65 @@ class PaintApp:
         self.request_redraw()
         self.notify_globe_document_changed()
 
+    def _bake_layer_mask(self, layer_index):
+        """Replace a layer with its current masked, opacity-adjusted pixels."""
+        layer = self.layers[layer_index]
+        if not layer.masked:
+            return False
+
+        if layer.layer_type == "vector" and layer.vector_data:
+            layer.render_vector()
+
+        underlying_alpha = Image.new("L", (self.doc_w, self.doc_h), 0)
+        for index, candidate in enumerate(self.layers[:layer_index]):
+            if not candidate.visible:
+                continue
+            if candidate.layer_type == "vector" and candidate.vector_data:
+                candidate.render_vector()
+            rendered = candidate.image_with_opacity()
+            below_alpha = None
+            if index > 0 and candidate.mask_mode == Layer.MASK_LAYER_BELOW:
+                below = self.layers[index - 1]
+                if below.layer_type == "vector" and below.vector_data:
+                    below.render_vector()
+                below_alpha = below.image_with_opacity().getchannel("A")
+            rendered = self._cap_masked_layer(
+                candidate, rendered, underlying_alpha, below_alpha)
+            underlying_alpha = ImageChops.lighter(
+                underlying_alpha, rendered.getchannel("A"))
+
+        below_alpha = None
+        if layer_index > 0 and layer.mask_mode == Layer.MASK_LAYER_BELOW:
+            below = self.layers[layer_index - 1]
+            if below.layer_type == "vector" and below.vector_data:
+                below.render_vector()
+            below_alpha = below.image_with_opacity().getchannel("A")
+
+        layer.image = self._cap_masked_layer(
+            layer, layer.image_with_opacity(), underlying_alpha, below_alpha)
+        layer.opacity = 100
+        layer.masked = False
+        layer.anti_mask = False
+        layer.layer_type = "raster"
+        layer.vector_data = None
+        layer.draw = ImageDraw.Draw(layer.image)
+        layer.reset_mipmaps()
+        return True
+
+    def apply_layer_mask(self):
+        """Bake the active layer's visible masked output into independent pixels."""
+        if not self.layers[self.active_layer].masked:
+            return
+        self._finish_clone_stroke()
+        self._finish_selection_move()
+        self._finish_selection_boundary_move()
+        self.snapshot()
+        self._bake_layer_mask(self.active_layer)
+        self.refresh_layers()
+        self.update_tools_for_active_layer()
+        self.request_redraw()
+        self.notify_globe_document_changed()
+
     def move_layer_up(self):
         if self.active_layer >= len(self.layers) - 1:
             return
@@ -3208,19 +3267,23 @@ class PaintApp:
             row=4, column=1, columnspan=3, sticky="w",
             padx=(18, 0), pady=(0, 10))
 
+        apply_mask_button = ttk.Button(body, text="Apply Mask")
+        apply_mask_button.grid(
+            row=5, column=1, columnspan=3, sticky="w", pady=(0, 10))
+
         ttk.Label(body, text="Opacity:").grid(
-            row=5, column=0, sticky="w", padx=(0, 8))
+            row=6, column=0, sticky="w", padx=(0, 8))
         opacity_var = tk.IntVar(value=layer.opacity)
         opacity_scale = ttk.Scale(
             body, from_=0, to=100, orient="horizontal", length=190)
         opacity_scale.set(layer.opacity)
-        opacity_scale.grid(row=5, column=1, sticky="ew")
+        opacity_scale.grid(row=6, column=1, sticky="ew")
 
         opacity_spinbox = ttk.Spinbox(
             body, from_=0, to=100, textvariable=opacity_var,
             width=5, justify="right")
-        opacity_spinbox.grid(row=5, column=2, padx=(8, 0))
-        ttk.Label(body, text="%").grid(row=5, column=3, sticky="w", padx=(3, 0))
+        opacity_spinbox.grid(row=6, column=2, padx=(8, 0))
+        ttk.Label(body, text="%").grid(row=6, column=3, sticky="w", padx=(3, 0))
 
         syncing = False
         preview_after_id = None
@@ -3282,6 +3345,7 @@ class PaintApp:
             anti_mask_check.configure(state=radio_state)
             underneath_radio.configure(state=radio_state)
             below_radio.configure(state=radio_state)
+            apply_mask_button.configure(state=radio_state)
             self.refresh_layers()
             schedule_preview()
 
@@ -3299,6 +3363,44 @@ class PaintApp:
 
         mask_mode_var.trace_add("write", mask_mode_changed)
         masked_changed()
+
+        def apply_mask():
+            nonlocal preview_after_id
+            if preview_after_id is not None:
+                self.root.after_cancel(preview_after_id)
+                preview_after_id = None
+
+            # Preview controls mutate the live layer. Restore the state from
+            # before the dialog so the bake remains a single undoable action.
+            current_name = name_var.get().strip() or original_name
+            current_opacity = layer.opacity
+            current_masked = masked_var.get()
+            current_anti_mask = anti_mask_var.get()
+            current_mask_mode = mask_mode_var.get()
+            layer.name = original_name
+            layer.opacity = original_opacity
+            layer.masked = original_masked
+            layer.anti_mask = original_anti_mask
+            layer.mask_mode = original_mask_mode
+            if layer.vector_data:
+                layer.vector_data.name = original_name
+            self.snapshot()
+
+            layer.name = current_name
+            layer.opacity = current_opacity
+            layer.masked = current_masked
+            layer.anti_mask = current_anti_mask
+            layer.mask_mode = current_mask_mode
+            if layer.vector_data:
+                layer.vector_data.name = current_name
+            self._bake_layer_mask(layer_index)
+            self.refresh_layers()
+            self.update_tools_for_active_layer()
+            self.request_redraw()
+            self.notify_globe_document_changed()
+            dialog.destroy()
+
+        apply_mask_button.configure(command=apply_mask)
 
         def accept(_event=None):
             name = name_var.get().strip()
@@ -3359,7 +3461,7 @@ class PaintApp:
             dialog.destroy()
 
         buttons = ttk.Frame(body)
-        buttons.grid(row=6, column=0, columnspan=4, sticky="e", pady=(14, 0))
+        buttons.grid(row=7, column=0, columnspan=4, sticky="e", pady=(14, 0))
         ttk.Button(buttons, text="Cancel", command=cancel).pack(
             side="right", padx=(6, 0))
         ttk.Button(buttons, text="OK", command=accept).pack(side="right")
@@ -5325,6 +5427,35 @@ class PaintApp:
         if pixels is None:
             messagebox.showinfo("Paste", "The Windows clipboard does not contain an image.")
             return "break"
+
+        paste_width, paste_height = pixels.size
+        expanded_width = max(self.doc_w, paste_width)
+        expanded_height = max(self.doc_h, paste_height)
+        if (expanded_width, expanded_height) != (self.doc_w, self.doc_h):
+            affected = []
+            if expanded_width != self.doc_w:
+                affected.append(f"width to {expanded_width}px")
+            if expanded_height != self.doc_h:
+                affected.append(f"height to {expanded_height}px")
+            dimension_text = (affected[0] if len(affected) == 1 else
+                              f"{affected[0]} and {affected[1]}")
+            if expanded_width <= 32768 and expanded_height <= 32768:
+                should_expand = messagebox.askyesno(
+                    "Expand Canvas for Paste",
+                    f"The pasted image is {paste_width} × {paste_height}px, "
+                    f"which is larger than the {self.doc_w} × {self.doc_h}px "
+                    f"canvas.\n\nExpand the canvas {dimension_text}?\n\n"
+                    "Existing artwork will remain anchored at the top-left.")
+                if should_expand:
+                    self.resize_canvas(
+                        expanded_width, expanded_height, "top-left")
+            else:
+                messagebox.showwarning(
+                    "Canvas Size Limit",
+                    "The pasted image exceeds the maximum canvas size of "
+                    "32,768px in at least one dimension. It will be pasted "
+                    "without expanding the canvas.")
+
         self._finish_clipboard_edit()
         # Tool changes finish the current float; switch before starting paste.
         self.set_tool("move")
