@@ -594,6 +594,7 @@ class Layer:
         self.opacity = 100
         self.layer_type = layer_type  # "raster" or "vector"
         self.masked = False
+        self.anti_mask = False
         self.mask_mode = self.MASK_LAYERS_UNDERNEATH
         self.width = width
         self.height = height
@@ -2067,7 +2068,8 @@ class PaintApp:
     @staticmethod
     def _document_preview_key(state):
         return (state["doc_w"], state["doc_h"], state["bg_color"], tuple(
-            (id(layer), layer.visible, layer.opacity, layer.masked, layer.mask_mode,
+            (id(layer), layer.visible, layer.opacity, layer.masked,
+             layer.anti_mask, layer.mask_mode,
              json.dumps(layer.vector_data.to_dict(), sort_keys=True)
              if layer.vector_data is not None else
              (id(layer.image), layer._mipmap_revision)) for layer in state["layers"]))
@@ -2129,6 +2131,7 @@ class PaintApp:
         layer = self.layers[0]
         if (not layer.is_raster or layer.name != "Background" or
                 not layer.visible or layer.opacity != 100 or layer.masked or
+                layer.anti_mask or
                 layer.mask_mode != Layer.MASK_LAYERS_UNDERNEATH or
                 layer.image.size != (self.doc_w, self.doc_h) or
                 any(band.getbbox() is not None for band in layer.image.split())):
@@ -2357,6 +2360,7 @@ class PaintApp:
             n.visible = l.visible
             n.opacity = l.opacity
             n.masked = l.masked
+            n.anti_mask = l.anti_mask
             n.mask_mode = l.mask_mode
             n.image = l.image.copy()
             n.draw = ImageDraw.Draw(n.image)
@@ -2775,6 +2779,7 @@ class PaintApp:
                     'visible': layer.visible,
                     'opacity': layer.opacity,
                     'masked': layer.masked,
+                    'anti_mask': layer.anti_mask,
                     'mask_mode': layer.mask_mode,
                     'layer_type': layer.layer_type,
                     'image_data': img_base64,
@@ -2851,6 +2856,7 @@ class PaintApp:
             layer.visible = layer_info['visible']
             layer.opacity = max(0, min(100, int(layer_info.get('opacity', 100))))
             layer.masked = bool(layer_info.get('masked', saved_type == 'mask'))
+            layer.anti_mask = bool(layer_info.get('anti_mask', False))
             layer.mask_mode = layer_info.get(
                 'mask_mode', Layer.MASK_LAYERS_UNDERNEATH)
             if layer.mask_mode not in (
@@ -3153,6 +3159,7 @@ class PaintApp:
         original_name = layer.name
         original_opacity = layer.opacity
         original_masked = layer.masked
+        original_anti_mask = layer.anti_mask
         original_mask_mode = layer.mask_mode
         self.active_layer = layer_index
         self.layer_list.selection_set(row)
@@ -3179,34 +3186,41 @@ class PaintApp:
         masked_check = ttk.Checkbutton(
             body, text="Enable masking", variable=masked_var)
         masked_check.grid(
-            row=1, column=1, columnspan=3, sticky="w", pady=(0, 10))
+            row=1, column=1, columnspan=3, sticky="w")
+
+        anti_mask_var = tk.BooleanVar(value=layer.anti_mask)
+        anti_mask_check = ttk.Checkbutton(
+            body, text="Anti-mask", variable=anti_mask_var)
+        anti_mask_check.grid(
+            row=2, column=1, columnspan=3, sticky="w",
+            padx=(18, 0), pady=(0, 10))
 
         mask_mode_var = tk.StringVar(value=layer.mask_mode)
         underneath_radio = ttk.Radiobutton(
             body, text="Masked by layers underneath",
             variable=mask_mode_var, value=Layer.MASK_LAYERS_UNDERNEATH)
         underneath_radio.grid(
-            row=2, column=1, columnspan=3, sticky="w", padx=(18, 0))
+            row=3, column=1, columnspan=3, sticky="w", padx=(18, 0))
         below_radio = ttk.Radiobutton(
             body, text="Masked by layer below",
             variable=mask_mode_var, value=Layer.MASK_LAYER_BELOW)
         below_radio.grid(
-            row=3, column=1, columnspan=3, sticky="w",
+            row=4, column=1, columnspan=3, sticky="w",
             padx=(18, 0), pady=(0, 10))
 
         ttk.Label(body, text="Opacity:").grid(
-            row=4, column=0, sticky="w", padx=(0, 8))
+            row=5, column=0, sticky="w", padx=(0, 8))
         opacity_var = tk.IntVar(value=layer.opacity)
         opacity_scale = ttk.Scale(
             body, from_=0, to=100, orient="horizontal", length=190)
         opacity_scale.set(layer.opacity)
-        opacity_scale.grid(row=4, column=1, sticky="ew")
+        opacity_scale.grid(row=5, column=1, sticky="ew")
 
         opacity_spinbox = ttk.Spinbox(
             body, from_=0, to=100, textvariable=opacity_var,
             width=5, justify="right")
-        opacity_spinbox.grid(row=4, column=2, padx=(8, 0))
-        ttk.Label(body, text="%").grid(row=4, column=3, sticky="w", padx=(3, 0))
+        opacity_spinbox.grid(row=5, column=2, padx=(8, 0))
+        ttk.Label(body, text="%").grid(row=5, column=3, sticky="w", padx=(3, 0))
 
         syncing = False
         preview_after_id = None
@@ -3265,12 +3279,19 @@ class PaintApp:
         def masked_changed():
             layer.masked = masked_var.get()
             radio_state = "normal" if layer.masked else "disabled"
+            anti_mask_check.configure(state=radio_state)
             underneath_radio.configure(state=radio_state)
             below_radio.configure(state=radio_state)
             self.refresh_layers()
             schedule_preview()
 
         masked_check.configure(command=masked_changed)
+
+        def anti_mask_changed():
+            layer.anti_mask = anti_mask_var.get()
+            schedule_preview()
+
+        anti_mask_check.configure(command=anti_mask_changed)
 
         def mask_mode_changed(*_args):
             layer.mask_mode = mask_mode_var.get()
@@ -3298,10 +3319,12 @@ class PaintApp:
             # The controls have already previewed their values. Temporarily
             # restore the originals so Undo records the pre-dialog state.
             new_masked = masked_var.get()
+            new_anti_mask = anti_mask_var.get()
             new_mask_mode = mask_mode_var.get()
             layer.name = original_name
             layer.opacity = original_opacity
             layer.masked = original_masked
+            layer.anti_mask = original_anti_mask
             layer.mask_mode = original_mask_mode
             if layer.vector_data:
                 layer.vector_data.name = original_name
@@ -3309,6 +3332,7 @@ class PaintApp:
             layer.name = name
             layer.opacity = opacity
             layer.masked = new_masked
+            layer.anti_mask = new_anti_mask
             layer.mask_mode = new_mask_mode
             if layer.vector_data:
                 layer.vector_data.name = name
@@ -3325,6 +3349,7 @@ class PaintApp:
             layer.name = original_name
             layer.opacity = original_opacity
             layer.masked = original_masked
+            layer.anti_mask = original_anti_mask
             layer.mask_mode = original_mask_mode
             if layer.vector_data:
                 layer.vector_data.name = original_name
@@ -3334,7 +3359,7 @@ class PaintApp:
             dialog.destroy()
 
         buttons = ttk.Frame(body)
-        buttons.grid(row=5, column=0, columnspan=4, sticky="e", pady=(14, 0))
+        buttons.grid(row=6, column=0, columnspan=4, sticky="e", pady=(14, 0))
         ttk.Button(buttons, text="Cancel", command=cancel).pack(
             side="right", padx=(6, 0))
         ttk.Button(buttons, text="OK", command=accept).pack(side="right")
@@ -5371,6 +5396,8 @@ class PaintApp:
         if layer.mask_mode == Layer.MASK_LAYER_BELOW:
             mask_alpha = (below_alpha if below_alpha is not None
                           else Image.new("L", rendered.size, 0))
+        if layer.anti_mask:
+            mask_alpha = ImageOps.invert(mask_alpha)
         capped = rendered.copy()
         capped.putalpha(ImageChops.darker(
             rendered.getchannel("A"), mask_alpha))
