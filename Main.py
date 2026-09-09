@@ -4742,8 +4742,17 @@ class PaintApp:
         build_up = self._stroke_base_image is None
         dab_opacity = (self.primary_opacity if self.last_button == 1
                        else self.secondary_opacity)
-        if self.tool != "eraser":
-            dab_opacity = color[3]
+        if build_up and 0 < dab_opacity < 255:
+            # Neighboring dabs overlap heavily at normal brush spacing. If
+            # every dab used the full selected opacity, a single pass at the
+            # default 12.5% spacing would apply it about eight times. Convert
+            # the pass opacity to a per-dab value so one brush-width of travel
+            # lands near the requested strength while repeated passes still
+            # build up naturally.
+            spacing_fraction = min(1.0, self.brush_spacing() / 100.0)
+            normalized = 1.0 - ((1.0 - dab_opacity / 255.0) **
+                                spacing_fraction)
+            dab_opacity = max(1, round(normalized * 255))
         dabs = []
 
         # In capped-opacity mode, overlapping stamps are combined with MAX.
@@ -4860,8 +4869,10 @@ class PaintApp:
             else:
                 result = layer.image.crop(union)
                 paint_mask = combined
-            source_color = ((color[0], color[1], color[2], 255)
-                            if build_up else color)
+            # ``_color_with_opacity`` returns a Pillow hex color string, not
+            # an RGBA tuple. Build-up mode applies opacity through the mask,
+            # so use the selected RGB at full alpha here.
+            source_color = (color[:7] if build_up else color)
             source = Image.new("RGBA", paint_mask.size, source_color)
             source.putalpha(ImageChops.multiply(
                 source.getchannel("A"), paint_mask))
