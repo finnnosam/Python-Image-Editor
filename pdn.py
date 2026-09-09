@@ -6,6 +6,7 @@ https://github.com/rivy/OpenPDN/blob/master/src/Core/MemoryBlock.cs
 Only normal-blend, full-canvas bitmap layers are supported by this editor.
 """
 
+import base64
 import gzip
 import io
 import os
@@ -399,6 +400,29 @@ def _object(name, library, *members):
     return (name, library, list(members))
 
 
+def _thumbnail_png(width, height, layers):
+    """Return Paint.NET's embedded, flattened Explorer thumbnail as PNG."""
+    composite = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+    for layer in layers:
+        if not layer.visible:
+            continue
+        image = layer.image.convert('RGBA')
+        if layer.opacity != 255:
+            alpha = image.getchannel('A').point(
+                lambda value, opacity=layer.opacity: (value * opacity + 127) // 255)
+            image.putalpha(alpha)
+        composite.alpha_composite(image)
+
+    if width > 256 or height > 256:
+        scale = min(256 / width, 256 / height)
+        size = (max(1, round(width * scale)), max(1, round(height * scale)))
+        composite = composite.resize(size, Image.Resampling.LANCZOS, reducing_gap=3)
+
+    output = io.BytesIO()
+    composite.save(output, format='PNG')
+    return output.getvalue()
+
+
 def write_pdn(filename, width, height, layers):
     """Atomically save full-canvas RasterLayers as a layered PDN3 document."""
     if not layers or len(layers) > 1024 or width <= 0 or height <= 0:
@@ -461,8 +485,11 @@ def write_pdn(filename, width, height, layers):
     try:
         with tempfile.NamedTemporaryFile(dir=path.parent, prefix='.pdn-', delete=False) as stream:
             temporary = stream.name
+            thumbnail = base64.b64encode(
+                _thumbnail_png(width, height, layers)).decode('ascii')
             header = (f'<pdnImage width="{width}" height="{height}" layers="{len(layers)}" '
-                      'savedWithVersion="5.112.9563.32325"><custom /></pdnImage>').encode('utf-8')
+                      f'savedWithVersion="5.112.9563.32325"><custom><thumb png="{thumbnail}" />'
+                      '</custom></pdnImage>').encode('utf-8')
             stream.write(b'PDN3' + len(header).to_bytes(3, 'little') + header + b'\x00\x01')
             _Writer(stream).write(document)
             chunk_size = 65536
