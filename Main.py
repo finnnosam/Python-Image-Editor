@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from windows_clipboard import copy_image, paste_image
 from shortcuts import read_shortcuts
+from pdn import read_pdn, write_pdn, RasterLayer, PDNError
 
 
 def _apply_hardness_to_alpha(alpha, hardness, softness_scale):
@@ -675,7 +676,7 @@ class Layer:
             return source
         adjusted = source.copy()
         alpha = adjusted.getchannel("A").point(
-            lambda value: (value * self.opacity + 50) // 100)
+            lambda value: int((value * self.opacity + 50) // 100))
         adjusted.putalpha(alpha)
         return adjusted
 
@@ -2756,9 +2757,14 @@ class PaintApp:
             self.save_project_as()
 
     def save_project_as(self):
+        self._finish_bucket_preview()
+        filetypes = [("PyPaint files", "*.pypaint")]
+        if self._pdn_save_supported():
+            filetypes.append(("Paint.NET files", "*.pdn"))
+        filetypes.append(("All files", "*.*"))
         filename = filedialog.asksaveasfilename(
             defaultextension=".pypaint",
-            filetypes=[("PyPaint files", "*.pypaint"), ("All files", "*.*")]
+            filetypes=filetypes
         )
         if filename:
             if self._save_to_file(filename):
@@ -2768,6 +2774,17 @@ class PaintApp:
 
     def _save_to_file(self, filename):
         try:
+            if Path(filename).suffix.lower() == '.pdn':
+                if not self._pdn_save_supported():
+                    raise PDNError('PDN saving requires raster layers without masks. '
+                                   'Save as .pypaint to keep vectors and masks editable, '
+                                   'or rasterize vectors and apply masks first.')
+                write_pdn(filename, self.doc_w, self.doc_h, [
+                    RasterLayer(layer.name, layer.image, layer.visible,
+                                round(layer.opacity * 255 / 100))
+                    for layer in self.layers])
+                self._mark_project_saved()
+                return True
             layer_data = []
             for layer in self.layers:
                 # Convert image to bytes
@@ -2804,21 +2821,32 @@ class PaintApp:
             with open(filename, 'w', encoding='utf-8') as f:
                 json.dump(project_data, f)
             
-            self.undo_stack = []
-            if self.active_document in self.documents:
-                self.documents[self.active_document]["modified"] = False
-                self._highlight_document_tabs()
+            self._mark_project_saved()
             return True
             
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save project: {e}")
             return False
 
+    def _pdn_save_supported(self):
+        return bool(self.layers) and all(
+            layer.layer_type == 'raster' and not layer.masked
+            and not layer.anti_mask
+            and not (layer.vector_data and layer.vector_data.objects)
+            for layer in self.layers)
+
+    def _mark_project_saved(self):
+        self.undo_stack = []
+        if self.active_document in self.documents:
+            self.documents[self.active_document]["modified"] = False
+            self._highlight_document_tabs()
+
     def open_project(self):
         filenames = filedialog.askopenfilenames(
             filetypes=[
                 ("All files", "*.*"),
                 ("PyPaint projects", "*.pypaint"),
+                ("Paint.NET files", "*.pdn"),
                 ("Images", "*.png *.jpg *.jpeg *.bmp *.gif *.tif *.tiff *.webp"),
             ]
         )
@@ -2826,10 +2854,35 @@ class PaintApp:
             try:
                 if Path(filename).suffix.lower() == ".pypaint":
                     self._open_pypaint_file(filename)
+                elif Path(filename).suffix.lower() == ".pdn":
+                    self._open_pdn_file(filename)
                 else:
                     self._open_image_file(filename)
             except Exception as error:
                 messagebox.showerror("Error", f"Failed to open {filename}: {error}")
+
+    def _open_pdn_file(self, filename):
+        """Open PDN as a saved, layered raster document."""
+        width, height, raster_layers = read_pdn(filename)
+        loaded_layers = []
+        for source in raster_layers:
+            layer = Layer(width, height, source.name)
+            layer.image = source.image
+            layer.visible = source.visible
+            # Preserve PDN's byte opacity until the user edits the percentage.
+            layer.opacity = source.opacity * 100 / 255
+            layer.draw = ImageDraw.Draw(layer.image)
+            layer.reset_mipmaps()
+            loaded_layers.append(layer)
+        startup_to_replace = self._unchanged_startup_document()
+        self._begin_document(Path(filename).name)
+        self.doc_w, self.doc_h = width, height
+        self.layers = loaded_layers
+        self.active_layer = len(loaded_layers) - 1
+        self.current_file = filename
+        self._finish_open(startup_to_replace)
+        self.documents[self.active_document]["modified"] = False
+        self._highlight_document_tabs()
 
     def _open_pypaint_file(self, filename):
         """Load a native, editable PyPaint project."""
@@ -2855,7 +2908,7 @@ class PaintApp:
                           layer_info['name'], layer_type)
             layer.image = img
             layer.visible = layer_info['visible']
-            layer.opacity = max(0, min(100, int(layer_info.get('opacity', 100))))
+            layer.opacity = max(0, min(100, float(layer_info.get('opacity', 100))))
             layer.masked = bool(layer_info.get('masked', saved_type == 'mask'))
             layer.anti_mask = bool(layer_info.get('anti_mask', False))
             layer.mask_mode = layer_info.get(
@@ -3303,7 +3356,7 @@ class PaintApp:
 
         ttk.Label(body, text="Opacity:").grid(
             row=6, column=0, sticky="w", padx=(0, 8))
-        opacity_var = tk.IntVar(value=layer.opacity)
+        opacity_var = tk.IntVar(value=round(layer.opacity))
         opacity_scale = ttk.Scale(
             body, from_=0, to=100, orient="horizontal", length=190)
         opacity_scale.set(layer.opacity)
