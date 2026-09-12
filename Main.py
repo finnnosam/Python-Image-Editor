@@ -189,6 +189,7 @@ def _pencil_path(x0, y0, x1, y1):
 class VectorObject:
     """Base class for vector objects"""
     def __init__(self, color="#000000", width=2, antialias=True, hardness=75):
+        self.name = None
         self.color = color
         self.width = width
         self.antialias = antialias
@@ -199,6 +200,7 @@ class VectorObject:
         """Convert to dictionary for serialization"""
         return {
             'type': self.__class__.__name__,
+            'name': self.name,
             'color': self.color,
             'width': self.width,
             'antialias': self.antialias,
@@ -211,14 +213,17 @@ class VectorObject:
         data = dict(data)  # avoid mutating the original
         obj_type = data.pop('type')
         if obj_type == 'Line':
-            return Line.from_dict(data)
+            obj = Line.from_dict(data)
         elif obj_type == 'Shape':
-            return Shape.from_dict(data)
+            obj = Shape.from_dict(data)
         elif obj_type == 'Rectangle':
-            return Shape.from_legacy_rectangle(data)
+            obj = Shape.from_legacy_rectangle(data)
         elif obj_type == 'Ellipse':
-            return Shape.from_legacy_ellipse(data)
-        return None
+            obj = Shape.from_legacy_ellipse(data)
+        else:
+            return None
+        obj.name = data.get('name')
+        return obj
 
 class Line(VectorObject):
     def __init__(self, x1=0, y1=0, x2=100, y2=100, color="#000000", width=2,
@@ -942,6 +947,17 @@ class PaintApp:
                 return
             clicked = getattr(clicked, "master", None)
 
+        # Attribute-table whitespace and an inactive scrollbar are neutral
+        # surfaces. Keep the current cell focused instead of treating those
+        # clicks as a request to return keyboard focus to the main editor.
+        focused_window = focused.winfo_toplevel()
+        clicked_window = event.widget.winfo_toplevel()
+        if (focused_window == clicked_window and
+                getattr(focused_window, "_neutral_background_clicks", False) and
+                event.widget.winfo_class() not in {
+                    "Entry", "TEntry", "Spinbox", "TSpinbox"}):
+            return
+
         # Moving focus fires the field's FocusOut callback synchronously,
         # which validates and applies the edited value.
         self.root.focus_set()
@@ -1474,6 +1490,9 @@ class PaintApp:
         self.layer_list.bind("<Button-3>",         self.show_layer_properties)
         self.layer_list.bind("<B1-Motion>",        self.on_layer_drag)
         self.layer_list.bind("<ButtonRelease-1>",  self.on_layer_drag_end)
+        self.layer_control_tooltip = DelayedToolTip(self.layer_list, "")
+        self.layer_list.bind("<Motion>", self._update_layer_control_tooltip,
+                             add="+")
 
         self.layer_row_icons = {}
         row_sources = {}
@@ -1484,15 +1503,30 @@ class PaintApp:
                     (24, 24), Image.Resampling.LANCZOS)
         for visible in (True, False):
             for layer_type in ("raster", "vector"):
-                row_image = Image.new("RGBA", (58, 28), (0, 0, 0, 0))
+                row_image = Image.new("RGBA", (88, 28), (0, 0, 0, 0))
                 row_draw = ImageDraw.Draw(row_image)
                 row_draw.rounded_rectangle(
-                    (0, 0, 27, 27), radius=4,
+                    (31, 0, 58, 27), radius=4,
                     fill=(232, 232, 232, 255), outline=(135, 135, 135, 255))
                 visibility_name = "layer-visible" if visible else "layer-hidden"
-                row_image.alpha_composite(row_sources[visibility_name], (2, 2))
+                # Visibility always occupies the second control slot so raster
+                # and vector eye icons line up vertically.
+                visibility_x = 33
+                row_image.alpha_composite(row_sources[visibility_name],
+                                          (visibility_x, 2))
+                if layer_type == "vector":
+                    row_draw.rounded_rectangle(
+                        (0, 0, 27, 27), radius=4,
+                        fill=(232, 232, 232, 255), outline=(135, 135, 135, 255))
+                    # A tiny attribute-table glyph drawn at native row size.
+                    for table_x in (5, 13, 21):
+                        row_draw.line((table_x, 5, table_x, 22),
+                                      fill=(55, 85, 105, 255), width=1)
+                    for table_y in (5, 11, 17, 22):
+                        row_draw.line((5, table_y, 22, table_y),
+                                      fill=(55, 85, 105, 255), width=1)
                 row_image.alpha_composite(row_sources[f"layer-{layer_type}"],
-                                          (34, 2))
+                                          (64, 2))
                 self.layer_row_icons[(visible, layer_type)] = row_image
 
         layer_actions = [
@@ -2103,6 +2137,7 @@ class PaintApp:
             "pan": "pan", "color_picker": "color picker", "brush": "brush",
             "pencil": "pencil", "eraser": "eraser", "clone": "clone",
             "paint_bucket": "paint bucket", "vector_edit": "vector edit",
+            "vector_select": "vector select",
             "line": "line", "rectangle": "rect", "ellipse": "ellipse",
             "selection": "selection", "brush_selection": "brush selection",
             "magic_wand": "magic wand", "move": "move",
@@ -3767,9 +3802,9 @@ class PaintApp:
             return cached[1]
         if layer.vector_data is not None:
             layer.render_vector()
-        row = Image.new("RGBA", (112, 40))
+        row = Image.new("RGBA", (142, 40))
         row.alpha_composite(self.layer_row_icons[(layer.visible, layer.layer_type)], (0, 6))
-        row.alpha_composite(self._render_layer_thumbnail(layer), (62, 3))
+        row.alpha_composite(self._render_layer_thumbnail(layer), (92, 3))
         photo = ImageTk.PhotoImage(row)
         self.layer_preview_cache[layer] = (key, photo)
         return photo
@@ -3802,13 +3837,25 @@ class PaintApp:
             return
         display_index = self.layer_list.index(row)
 
-        # The first icon in each row is a button-shaped visibility control.
         row_box = self.layer_list.bbox(row, "#0")
-        # Treeview reserves a small indent before the row image; the button
-        # occupies the first 28 pixels of that image.
-        if row_box and event.x < row_box[0] + 50:
-            layer_index = len(self.layers) - 1 - display_index
-            self.layers[layer_index].visible = not self.layers[layer_index].visible
+        layer_index = len(self.layers) - 1 - display_index
+        layer = self.layers[layer_index]
+
+        # Vector rows put their table button before the visibility button.
+        if (row_box and layer.layer_type == "vector" and
+                event.x < row_box[0] + 50):
+            self.layer_list.selection_set(row)
+            self.layer_list.focus(row)
+            self.active_layer = layer_index
+            self.update_layer_selection_style()
+            self.update_tools_for_active_layer()
+            self.show_vector_object_table(layer)
+            return "break"
+
+        visibility_start = row_box[0] + 50
+        visibility_limit = row_box[0] + 81
+        if row_box and visibility_start <= event.x < visibility_limit:
+            layer.visible = not layer.visible
             self.refresh_layers()
             self.request_redraw()
             self.notify_globe_document_changed()
@@ -3824,6 +3871,159 @@ class PaintApp:
         self.snapshot()  # snapshot once at the start of the drag
         self.request_redraw()
         return "break"
+
+    def _update_layer_control_tooltip(self, event):
+        """Describe the layer-row control currently beneath the pointer."""
+        tooltip = self.layer_control_tooltip
+        row = self.layer_list.identify_row(event.y)
+        text = ""
+        if row:
+            row_box = self.layer_list.bbox(row, "#0")
+            if row_box:
+                display_index = self.layer_list.index(row)
+                layer = self.layers[len(self.layers) - 1 - display_index]
+                relative_x = event.x - row_box[0]
+                if layer.layer_type == "vector" and relative_x < 50:
+                    text = "Open vector object table"
+                elif 50 <= relative_x < 81:
+                    text = "Toggle layer visibility"
+        if text == tooltip.text:
+            return
+        tooltip._hide()
+        tooltip.text = text
+        if text:
+            tooltip._schedule()
+
+    def show_vector_object_table(self, layer):
+        """Open a compact QGIS-inspired attribute table for a vector layer."""
+        if layer.layer_type != "vector" or layer.vector_data is None:
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog._neutral_background_clicks = True
+        dialog.title(f"{layer.name} — Objects: {len(layer.vector_data.objects)}")
+        dialog.geometry("760x360")
+        dialog.minsize(560, 220)
+
+        body = ttk.Frame(dialog, padding=8)
+        body.pack(fill="both", expand=True)
+        canvas = tk.Canvas(body, highlightthickness=0, background="#ffffff")
+        scrollbar = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        grid = tk.Frame(canvas, background="#9b9b9b")
+        window = canvas.create_window((0, 0), window=grid, anchor="nw")
+        grid.bind("<Configure>", lambda _event: canvas.configure(
+            scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(
+            window, width=event.width))
+
+        headings = ("#", "Type", "Name", "Left Color", "Right Color", "Size")
+        weights = (0, 2, 3, 2, 2, 1)
+        for column, (heading, weight) in enumerate(zip(headings, weights)):
+            grid.grid_columnconfigure(column, weight=weight,
+                                      minsize=42 if column == 0 else 90)
+            tk.Label(grid, text=heading, font=("TkDefaultFont", 9, "bold"),
+                     background="#e5e5e5", relief="solid", borderwidth=1,
+                     anchor="w", padx=5, pady=4).grid(
+                         row=0, column=column, sticky="nsew")
+
+        rows = []
+
+        def select_object(obj, row_widgets):
+            self.active_layer = self.layers.index(layer)
+            self.set_tool("vector select")
+            self.selected_vector_obj = obj
+            self.selected_point_index = None
+            self._load_selected_vector_attributes()
+            for widgets in rows:
+                for widget in widgets:
+                    if str(widget.cget("state")) != "disabled":
+                        widget.configure(background="white")
+            for widget in row_widgets:
+                if str(widget.cget("state")) != "disabled":
+                    widget.configure(background="#cce8ff")
+            self.request_redraw()
+
+        def commit(obj, field, variable):
+            value = variable.get().strip()
+            try:
+                if field == "name":
+                    new_value = None if not value or value.upper() == "NULL" else value
+                elif field == "size":
+                    new_value = max(1, min(999, int(value)))
+                else:
+                    normalized = value.lstrip("#")
+                    if len(normalized) not in (6, 8):
+                        raise ValueError
+                    int(normalized, 16)
+                    new_value = "#" + normalized.lower()
+            except ValueError:
+                current = (obj.name if field == "name" else obj.width
+                           if field == "size" else obj.color
+                           if field == "left_color" else obj.fill)
+                variable.set("NULL" if current is None else str(current))
+                return
+
+            self.snapshot()
+            if field == "name":
+                obj.name = new_value
+                variable.set("NULL" if new_value is None else new_value)
+            elif field == "size":
+                obj.width = new_value
+                if isinstance(obj, Shape):
+                    for line in obj.lines:
+                        line.width = new_value
+                variable.set(str(new_value))
+            elif field == "left_color":
+                obj.color = new_value
+                if isinstance(obj, Shape):
+                    for line in obj.lines:
+                        line.color = new_value
+            elif field == "right_color" and isinstance(obj, Shape):
+                obj.fill = new_value
+                obj._spherical_fill_cache = None
+            layer.render_vector()
+            if self.selected_vector_obj is obj:
+                self._load_selected_vector_attributes()
+            self._schedule_layer_previews()
+            self.request_redraw()
+            self.notify_globe_document_changed()
+
+        for index, obj in enumerate(layer.vector_data.objects, start=1):
+            object_type = ({"rect": "Rectangle", "ellipse": "Ellipse"}.get(
+                               obj.preset, "Shape")
+                           if isinstance(obj, Shape)
+                           else obj.__class__.__name__)
+            right_color = obj.fill if isinstance(obj, Shape) else None
+            values = (str(index), object_type,
+                      obj.name if obj.name is not None else "NULL", obj.color,
+                      right_color if right_color is not None else "NULL",
+                      str(obj.width))
+            row_widgets = []
+            for column, value in enumerate(values):
+                variable = tk.StringVar(value=value)
+                editable = column in (2, 3, 5) or (
+                    column == 4 and isinstance(obj, Shape))
+                widget = tk.Entry(
+                    grid, textvariable=variable, relief="solid", borderwidth=1,
+                    readonlybackground="white", disabledbackground="#eeeeee",
+                    disabledforeground="#777777")
+                widget.grid(row=index, column=column, sticky="nsew", ipady=4)
+                if not editable:
+                    widget.configure(state="disabled")
+                else:
+                    field = {2: "name", 3: "left_color",
+                             4: "right_color", 5: "size"}[column]
+                    widget.bind("<Return>", lambda _event, o=obj, f=field, v=variable:
+                                commit(o, f, v))
+                    widget.bind("<FocusOut>", lambda _event, o=obj, f=field, v=variable:
+                                commit(o, f, v))
+                    widget.bind("<Button-1>", lambda _event, o=obj, w=row_widgets:
+                                select_object(o, w), add="+")
+                row_widgets.append(widget)
+            rows.append(row_widgets)
 
     def on_layer_drag(self, event):
         if self.drag_start_index is None:
