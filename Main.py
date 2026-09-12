@@ -217,7 +217,10 @@ class VectorObject:
         """Create object from dictionary"""
         data = dict(data)  # avoid mutating the original
         obj_type = data.pop('type')
-        if obj_type == 'Line':
+        if obj_type == 'Point':
+            obj = Point(data['x'], data['y'], data['color'], data['width'],
+                        data.get('antialias', True), data.get('hardness', 75))
+        elif obj_type == 'Line':
             obj = Line.from_dict(data)
         elif obj_type == 'Shape':
             obj = Shape.from_dict(data)
@@ -229,6 +232,57 @@ class VectorObject:
             return None
         obj.name = data.get('name')
         return obj
+
+class Point(VectorObject):
+    """A movable vector dot; width is its diameter."""
+    def __init__(self, x=0, y=0, color="#000000", width=2,
+                 antialias=True, hardness=75):
+        super().__init__(color, width, antialias, hardness)
+        self.x, self.y = x, y
+
+    def to_dict(self):
+        return dict(super().to_dict(), x=self.x, y=self.y)
+
+    def get_points(self):
+        return [(self.x, self.y)]
+
+    def update_point(self, index, x, y):
+        self.x, self.y = x, y
+
+
+def snap_line_endpoint(start, end):
+    dx, dy = end[0]-start[0], end[1]-start[1]
+    angle = round(math.atan2(dy, dx)/(math.pi/12))*(math.pi/12)
+    length = math.hypot(dx, dy)
+    return start[0]+length*math.cos(angle), start[1]+length*math.sin(angle)
+
+
+def transform_vector(obj, transform):
+    """Transform endpoints and Bezier controls together."""
+    if isinstance(obj, Shape):
+        for line in obj.lines:
+            transform_vector(line, transform)
+        obj._spherical_fill_cache = None
+    elif isinstance(obj, Line):
+        obj.x1, obj.y1 = transform(obj.x1, obj.y1)
+        obj.x2, obj.y2 = transform(obj.x2, obj.y2)
+        if obj.curve:
+            obj.curve = [v for i in range(0, len(obj.curve), 2)
+                         for v in transform(*obj.curve[i:i+2])]
+    elif isinstance(obj, Point):
+        obj.x, obj.y = transform(obj.x, obj.y)
+
+
+def vector_center(obj):
+    points = obj.get_points()
+    return (sum(x for x, y in points)/len(points),
+            sum(y for x, y in points)/len(points))
+
+
+def rotation_handle(obj, zoom):
+    cx, cy = vector_center(obj)
+    return cx, min(y for x, y in obj.get_points())-28/zoom
+
 
 class Line(VectorObject):
     def __init__(self, x1=0, y1=0, x2=100, y2=100, color="#000000", width=2,
@@ -372,7 +426,7 @@ class Shape(VectorObject):
         points = []
         for line in self.lines:
             segment = line.sampled_points(width, height)
-            if points and segment:
+            if points and segment and line.space == "globe":
                 shift = round((points[-1][0] - segment[0][0]) / width) * width
                 segment = [(x + shift, y) for x, y in segment]
             points.extend(segment if not points else segment[1:])
@@ -467,9 +521,45 @@ class Shape(VectorObject):
                     fill=self.color, width=self.width, joint="curve")
 
     def get_points(self):
+        if (self.preset == "ellipse" and len(self.lines) == 4 and
+                all(line.space == "flat" for line in self.lines)):
+            right, bottom, left, top = [(line.x1, line.y1) for line in self.lines]
+            cx, cy = (right[0]+left[0])/2, (right[1]+left[1])/2
+            ux, uy = right[0]-cx, right[1]-cy
+            vx, vy = bottom[0]-cx, bottom[1]-cy
+            return [(cx-ux-vx, cy-uy-vy), (cx+ux-vx, cy+uy-vy),
+                    (cx+ux+vx, cy+uy+vy), (cx-ux+vx, cy-uy+vy)]
         return [(line.x1, line.y1) for line in self.lines]
 
-    def update_point(self, index, x, y):
+    def update_point(self, index, x, y, square=False):
+        if (self.preset in ("rect", "ellipse") and len(self.lines) == 4
+                and all(line.space == "flat" for line in self.lines)):
+            points = self.get_points()
+            anchor = points[(index+2) % 4]
+            a, b = points[(index+1) % 4], points[(index-1) % 4]
+            u = (a[0]-anchor[0], a[1]-anchor[1])
+            v = (b[0]-anchor[0], b[1]-anchor[1])
+            determinant = u[0]*v[1]-u[1]*v[0]
+            if abs(determinant) < 1e-10:
+                return
+            dx, dy = x-anchor[0], y-anchor[1]
+            su = (dx*v[1]-dy*v[0])/determinant
+            sv = (u[0]*dy-u[1]*dx)/determinant
+            if square:
+                ul, vl = math.hypot(*u), math.hypot(*v)
+                side = max(abs(su)*ul, abs(sv)*vl, 1e-4)
+                su = math.copysign(side/ul, su)
+                sv = math.copysign(side/vl, sv)
+            su = math.copysign(max(abs(su), 1e-4), su)
+            sv = math.copysign(max(abs(sv), 1e-4), sv)
+            def resize(px, py):
+                dx, dy = px-anchor[0], py-anchor[1]
+                cu = (dx*v[1]-dy*v[0])/determinant
+                cv = (u[0]*dy-u[1]*dx)/determinant
+                return (anchor[0]+cu*su*u[0]+cv*sv*v[0],
+                        anchor[1]+cu*su*u[1]+cv*sv*v[1])
+            transform_vector(self, resize)
+            return
         if not (0 <= index < len(self.lines)):
             return
         old = (self.lines[index].x1, self.lines[index].y1)
@@ -543,7 +633,8 @@ class Ellipse(VectorObject):
                 (self.x, self.y - self.ry), (self.x, self.y + self.ry)]
 
 
-def _draw_vector_path(image, points, color, width, antialias=True, hardness=75):
+def _draw_vector_path(image, points, color, width, antialias=True, hardness=75,
+                      square_corners=False):
     """Stroke a path with consistent geometry and optional edge smoothing."""
     if len(points) < 2:
         return
@@ -551,7 +642,7 @@ def _draw_vector_path(image, points, color, width, antialias=True, hardness=75):
     softness_scale = width * 0.25
     blur_radius = (softness_scale * (75 - hardness) / 75
                    if antialias and hardness < 75 else 0)
-    padding = width / 2 + 2 + math.ceil(blur_radius * 3)
+    padding = width / (math.sqrt(2) if square_corners else 2) + 2 + math.ceil(blur_radius * 3)
     left = max(0, math.floor(min(x for x, _ in points) - padding))
     top = max(0, math.floor(min(y for _, y in points) - padding))
     right = min(image.width, math.ceil(max(x for x, _ in points) + padding + 1))
@@ -572,9 +663,23 @@ def _draw_vector_path(image, points, color, width, antialias=True, hardness=75):
                      (0, 0, 0, 0))
     scaled_points = [((x - left) * scale, (y - top) * scale)
                      for x, y in points]
-    ImageDraw.Draw(tile).line(
-        scaled_points, fill=color, width=max(1, round(width * scale)),
-        joint="curve")
+    draw = ImageDraw.Draw(tile)
+    if square_corners:
+        # Rectangle edges meet at right angles. Square-capped strips form
+        # exact miter joins, including the closing vertex, in one alpha layer.
+        half = width * scale / 2
+        for (ax, ay), (bx, by) in zip(scaled_points, scaled_points[1:]):
+            length = math.hypot(bx-ax, by-ay)
+            if length == 0:
+                continue
+            ux, uy = (bx-ax)/length*half, (by-ay)/length*half
+            nx, ny = -uy, ux
+            draw.polygon([(ax-ux+nx, ay-uy+ny), (bx+ux+nx, by+uy+ny),
+                          (bx+ux-nx, by+uy-ny), (ax-ux-nx, ay-uy-ny)],
+                         fill=color)
+    else:
+        draw.line(scaled_points, fill=color,
+                  width=max(1, round(width * scale)), joint="curve")
     resampling = (Image.Resampling.LANCZOS if antialias
                   else Image.Resampling.NEAREST)
     tile = tile.resize((tile_width, tile_height), resampling)
@@ -586,6 +691,14 @@ def _draw_vector_path(image, points, color, width, antialias=True, hardness=75):
 
 def render_vector_object(image, obj, document_width, document_height):
     """Render one vector object with an anti-aliased, uniform-width stroke."""
+    if isinstance(obj, Point):
+        radius = obj.width/2
+        bounds = (obj.x-radius, obj.y-radius, obj.x+radius, obj.y+radius)
+        _composite_brush_shape(image, bounds, obj.color,
+            lambda draw, left, top, scale: draw.ellipse(
+                _brush_ellipse_box(bounds, left, top, scale), fill=255),
+            antialias=obj.antialias)
+        return
     if isinstance(obj, Line):
         points = obj.sampled_points(document_width, document_height)
         offsets = (-document_width, 0, document_width) \
@@ -612,7 +725,8 @@ def render_vector_object(image, obj, document_width, document_height):
             _draw_vector_path(
                 image, [(x + offset, y) for x, y in points],
                 obj.color, obj.width, obj.antialias,
-                getattr(obj, "hardness", 75))
+                getattr(obj, "hardness", 75),
+                square_corners=obj.preset == "rect" and not globe)
         return
 
     # Compatibility for any legacy in-memory vector object.
@@ -653,6 +767,10 @@ class VectorLayer:
         """Return the topmost object whose rendered path is near a point."""
         tolerance_sq = tolerance * tolerance
         for obj in reversed(self.objects):
+            if isinstance(obj, Point):
+                if math.hypot(x-obj.x, y-obj.y) <= tolerance + obj.width/2:
+                    return obj
+                continue
             if isinstance(obj, Line):
                 points = obj.sampled_points(self.width, self.height)
             elif isinstance(obj, Shape):
@@ -1077,6 +1195,7 @@ class PaintApp:
             ("Line",       "line",        "line.png"),
             ("Rectangle",  "rect",        "rect.png"),
             ("Ellipse",    "ellipse",     "ellipse.png"),
+            ("Point", "point", "point.png"),
             ("Magic Wand", "magic wand", "magic-wand.png"),
             ("Pencil", "pencil", "pencil.png"),
         ]
@@ -1092,7 +1211,7 @@ class PaintApp:
                        "brush selection", "pan", "color picker", "brush",
                        "eraser", "clone", "paint bucket", "magic wand", "pencil"),
             "vector": ("pan", "color picker", "vector select", "vector edit",
-                       "line", "rect", "ellipse"),
+                       "line", "rect", "ellipse", "point"),
         }
         for index, (label, tool, filename) in enumerate(tools):
             with Image.open(icon_dir / filename) as source_image:
@@ -3300,7 +3419,7 @@ class PaintApp:
         elif (self.tool == "magic wand" and self.layers and
               self.layers[self.active_layer].is_raster):
             self.wand_settings_frame.pack(side="left")
-        elif self.tool in ("line", "rect", "ellipse"):
+        elif self.tool in ("line", "rect", "ellipse", "point"):
             self.vector_settings_frame.pack(side="left")
         elif self.tool == "vector select":
             self.vector_select_settings_frame.pack(side="left", fill="x",
@@ -4206,34 +4325,42 @@ class PaintApp:
         self.raster_paint_image(self.last_x, self.last_y)
 
     def start_vector_operation(self, event, x, y):
-        if self.tool == "vector select":
-            vector_data = self.layers[self.active_layer].vector_data
-            obj, point_idx = (vector_data.get_object_at(x, y)
-                              if vector_data else (None, None))
+        if self.tool in ("vector select", "vector edit"):
+            data = self.layers[self.active_layer].vector_data
+            tolerance = 8 / self.zoom
+            obj, point_idx = None, None
+            selected = self.selected_vector_obj
+            if selected is not None and not isinstance(selected, Point):
+                rx, ry = rotation_handle(selected, self.zoom)
+                if math.hypot(x-rx, y-ry) <= tolerance:
+                    obj, point_idx = selected, "rotate"
+            candidates = ([selected] if selected is not None else []) + [
+                item for item in reversed(data.objects) if item is not selected]
+            if obj is None:
+                for candidate in candidates:
+                    for i, (px, py) in enumerate(candidate.get_points()):
+                        if math.hypot(x-px, y-py) <= tolerance:
+                            obj, point_idx = candidate, i
+                            break
+                    if obj is None:
+                        cx, cy = vector_center(candidate)
+                        if math.hypot(x-cx, y-cy) <= tolerance:
+                            obj, point_idx = candidate, "move"
+                    if obj is not None:
+                        break
+            if obj is None:
+                obj = data.get_object_near(x, y, tolerance)
+                point_idx = "move" if obj else None
+            self.selected_vector_obj = obj
+            self.selected_point_index = point_idx
+            self.is_dragging_point = obj is not None
             if obj is not None:
-                self.selected_vector_obj = obj
-                self.selected_point_index = point_idx
-                self.is_dragging_point = True
                 self.snapshot()
-            else:
-                self.selected_vector_obj = (
-                    vector_data.get_object_near(x, y) if vector_data else None)
-                self.selected_point_index = None
+                self._vector_drag_original = copy.deepcopy(obj)
+                self._vector_drag_start = (x, y)
             self._load_selected_vector_attributes()
             self.request_redraw()
-        elif self.tool == "vector edit":
-            # Try to edit a vector object
-            if self.layers[self.active_layer].vector_data:
-                obj, point_idx = self.layers[self.active_layer].vector_data.get_object_at(x, y)
-                if obj:
-                    self.is_dragging_point = True
-                    self.selected_vector_obj = obj
-                    self.selected_point_index = point_idx
-                    self.snapshot()
-                else:
-                    self.selected_vector_obj = None
-                    self.selected_point_index = None
-        elif self.tool in ["line", "rect", "ellipse"]:
+        elif self.tool in ["line", "rect", "ellipse", "point"]:
             # Start drawing a new vector object
             self.vector_start_x = x
             self.vector_start_y = y
@@ -5589,18 +5716,41 @@ class PaintApp:
 
     def vector_operation(self, event, x, y):
         if self.is_dragging_point and self.selected_vector_obj:
-            # Update the point position
-            self.selected_vector_obj.update_point(self.selected_point_index, x, y)
+            obj = self.selected_vector_obj
+            original = self._vector_drag_original
+            obj.__dict__.update(copy.deepcopy(original.__dict__))
+            index = self.selected_point_index
+            if index == "move":
+                dx, dy = x-self._vector_drag_start[0], y-self._vector_drag_start[1]
+                transform_vector(obj, lambda px, py: (px+dx, py+dy))
+            elif index == "rotate":
+                cx, cy = vector_center(original)
+                sx, sy = self._vector_drag_start
+                angle = math.atan2(y-cy, x-cx)-math.atan2(sy-cy, sx-cx)
+                if event.state & 1:
+                    angle = round(angle/(math.pi/12))*(math.pi/12)
+                c, s = math.cos(angle), math.sin(angle)
+                transform_vector(obj, lambda px, py:
+                    (cx+(px-cx)*c-(py-cy)*s, cy+(px-cx)*s+(py-cy)*c))
+            else:
+                if isinstance(obj, Line) and event.state & 1:
+                    x, y = snap_line_endpoint(obj.get_points()[1-index], (x, y))
+                if isinstance(obj, Shape):
+                    obj.update_point(index, x, y, square=bool(event.state & 1))
+                else:
+                    obj.update_point(index, x, y)
             if self.tool == "vector select":
                 self._refresh_selected_vector_points()
             self.layers[self.active_layer].render_vector()
             self.request_redraw()
             self.notify_globe_document_changed()
-        elif self.tool in ["line", "rect", "ellipse"] and self.vector_start_x is not None:
+        elif self.tool in ["line", "rect", "ellipse", "point"] and self.vector_start_x is not None:
             # Preview the shape (by redrawing)
             self.layers[self.active_layer].render_vector()
             self.request_redraw()
             # Draw temporary preview
+            if self.tool == "line" and event.state & 1:
+                x, y = snap_line_endpoint((self.vector_start_x, self.vector_start_y), (x, y))
             self.draw_vector_preview(self.vector_start_x, self.vector_start_y, x, y)
 
     def draw_vector_preview(self, x1, y1, x2, y2):
@@ -5666,6 +5816,10 @@ class PaintApp:
 
     def make_vector_object(self, preset, points, space="flat"):
         """Build the same vector object for previews and finalized gestures."""
+        if preset == "point" and points:
+            return Point(*points[-1], self._color_with_opacity("primary"),
+                         self.vector_line_width(), self.vector_antialias_enabled(),
+                         self.vector_hardness())
         if len(points) < 2:
             return None
         if preset == "line":
@@ -5675,6 +5829,14 @@ class PaintApp:
                         antialias=self.vector_antialias_enabled(),
                         hardness=self.vector_hardness())
         if preset in ("rect", "ellipse"):
+            if space == "flat" and len(points) == 2:
+                (x1, y1), (x2, y2) = points
+                # Keep an editable frame even for a horizontal/vertical gesture.
+                if abs(x2-x1) < 1:
+                    x2 = x1 + math.copysign(1, x2-x1)
+                if abs(y2-y1) < 1:
+                    y2 = y1 + math.copysign(1, y2-y1)
+                points = [(x1, y1), (x2, y2)]
             return self.make_shape_preset(preset, points, space)
         return None
 
@@ -5803,15 +5965,18 @@ class PaintApp:
                 self._schedule_layer_previews()
         else:  # vector layer
             if self.is_dragging_point:
+                self.vector_operation(event, x, y)
                 self.is_dragging_point = False
                 self.selected_point_index = None
                 if self.tool == "vector select":
                     self._refresh_selected_vector_points()
                 else:
                     self.selected_vector_obj = None
-            elif self.tool in ["line", "rect", "ellipse"] and self.vector_start_x is not None:
-                # Only create if there's a significant size
-                if abs(x - self.vector_start_x) > 2 or abs(y - self.vector_start_y) > 2:
+            elif self.tool in ["line", "rect", "ellipse", "point"] and self.vector_start_x is not None:
+                if self.tool == "line" and event.state & 1:
+                    x, y = snap_line_endpoint((self.vector_start_x, self.vector_start_y), (x, y))
+                if (self.tool == "point" or abs(x - self.vector_start_x) > 2
+                        or abs(y - self.vector_start_y) > 2):
                     self.create_vector_object(self.vector_start_x, self.vector_start_y, x, y)
                 self.vector_start_x = None
                 self.vector_start_y = None
@@ -6417,6 +6582,17 @@ class PaintApp:
         
         # Draw vector handles if in proper mode and on vector layer
         if self.tool in ("vector select", "vector edit") and current_layer.layer_type == "vector" and current_layer.vector_data:
+            for candidate in current_layer.vector_data.objects:
+                sx, sy = self.screen_coords(*vector_center(candidate))
+                self.canvas.create_oval(sx-4, sy-4, sx+4, sy+4,
+                                        fill="white", outline="#007f99", width=2,
+                                        tags=("overlay",))
+            if self.selected_vector_obj and not isinstance(self.selected_vector_obj, Point):
+                cx, cy = self.screen_coords(*vector_center(self.selected_vector_obj))
+                rx, ry = self.screen_coords(*rotation_handle(self.selected_vector_obj, self.zoom))
+                self.canvas.create_line(cx, cy, rx, ry, fill="#00a080", tags=("overlay",))
+                self.canvas.create_oval(rx-5, ry-5, rx+5, ry+5, fill="#00a080",
+                                        outline="white", tags=("overlay",))
             visible_objects = (current_layer.vector_data.objects
                                if self.tool == "vector edit"
                                else ([self.selected_vector_obj]
