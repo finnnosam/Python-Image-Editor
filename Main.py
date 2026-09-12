@@ -659,6 +659,8 @@ class VectorLayer:
 class Layer:
     MASK_LAYERS_UNDERNEATH = "layers_underneath"
     MASK_LAYER_BELOW = "layer_below"
+    MASK_VISIBLE_ONLY = "visible_only"
+    MASK_ALL_BELOW = "all_below"
 
     def __init__(self, width, height, name, layer_type="raster"):
         self.name = name
@@ -668,6 +670,7 @@ class Layer:
         self.masked = False
         self.anti_mask = False
         self.mask_mode = self.MASK_LAYERS_UNDERNEATH
+        self.mask_visibility = self.MASK_VISIBLE_ONLY
         self.width = width
         self.height = height
         
@@ -2148,7 +2151,7 @@ class PaintApp:
     def _document_preview_key(state):
         return (state["doc_w"], state["doc_h"], state["bg_color"], tuple(
             (id(layer), layer.visible, layer.opacity, layer.masked,
-             layer.anti_mask, layer.mask_mode,
+             layer.anti_mask, layer.mask_mode, layer.mask_visibility,
              json.dumps(layer.vector_data.to_dict(), sort_keys=True)
              if layer.vector_data is not None else
              (id(layer.image), layer._mipmap_revision)) for layer in state["layers"]))
@@ -2169,14 +2172,11 @@ class PaintApp:
             rendered_layers.append(layer.image_with_opacity(
                 source.resize(size, Image.Resampling.LANCZOS, reducing_gap=3)))
         result = Image.new("RGBA", size, state["bg_color"])
-        underlying_alpha = Image.new("L", size)
-        for index, (layer, rendered) in enumerate(zip(state["layers"], rendered_layers)):
+        rendered_layers = self._apply_layer_masks(state["layers"], rendered_layers)
+        for layer, rendered in zip(state["layers"], rendered_layers):
             if not layer.visible:
                 continue
-            below = rendered_layers[index - 1].getchannel("A") if index else None
-            rendered = self._cap_masked_layer(layer, rendered, underlying_alpha, below)
             result.alpha_composite(rendered)
-            underlying_alpha = ImageChops.lighter(underlying_alpha, rendered.getchannel("A"))
         thumbnail_layer = Layer(*size, "Preview")
         thumbnail_layer.image = result
         thumbnail_layer.reset_mipmaps()
@@ -2212,6 +2212,7 @@ class PaintApp:
                 not layer.visible or layer.opacity != 100 or layer.masked or
                 layer.anti_mask or
                 layer.mask_mode != Layer.MASK_LAYERS_UNDERNEATH or
+                layer.mask_visibility != Layer.MASK_VISIBLE_ONLY or
                 layer.image.size != (self.doc_w, self.doc_h) or
                 any(band.getbbox() is not None for band in layer.image.split())):
             return None
@@ -2439,6 +2440,7 @@ class PaintApp:
             n.masked = l.masked
             n.anti_mask = l.anti_mask
             n.mask_mode = l.mask_mode
+            n.mask_visibility = l.mask_visibility
             n.image = l.image.copy()
             n.draw = ImageDraw.Draw(n.image)
             n.reset_mipmaps()
@@ -2874,6 +2876,7 @@ class PaintApp:
                     'masked': layer.masked,
                     'anti_mask': layer.anti_mask,
                     'mask_mode': layer.mask_mode,
+                    'mask_visibility': layer.mask_visibility,
                     'layer_type': layer.layer_type,
                     'image_data': img_base64,
                     'width': self.doc_w,
@@ -2991,6 +2994,16 @@ class PaintApp:
             if layer.mask_mode not in (
                     Layer.MASK_LAYERS_UNDERNEATH, Layer.MASK_LAYER_BELOW):
                 layer.mask_mode = Layer.MASK_LAYERS_UNDERNEATH
+            # Old aggregate masks used visible layers only, while old
+            # single-layer masks included the layer even when it was hidden.
+            legacy_visibility = (Layer.MASK_ALL_BELOW
+                                 if layer.mask_mode == Layer.MASK_LAYER_BELOW
+                                 else Layer.MASK_VISIBLE_ONLY)
+            layer.mask_visibility = layer_info.get(
+                'mask_visibility', legacy_visibility)
+            if layer.mask_visibility not in (
+                    Layer.MASK_VISIBLE_ONLY, Layer.MASK_ALL_BELOW):
+                layer.mask_visibility = legacy_visibility
             layer.draw = ImageDraw.Draw(layer.image)
             layer.reset_mipmaps()
 
@@ -3242,6 +3255,7 @@ class PaintApp:
         duplicate.masked = source.masked
         duplicate.anti_mask = source.anti_mask
         duplicate.mask_mode = source.mask_mode
+        duplicate.mask_visibility = source.mask_visibility
         duplicate.image = source.image.copy()
         duplicate.draw = ImageDraw.Draw(duplicate.image)
         if source.vector_data is not None:
@@ -3265,36 +3279,17 @@ class PaintApp:
         if layer.layer_type == "vector" and layer.vector_data:
             layer.render_vector()
 
-        underlying_alpha = Image.new("L", (self.doc_w, self.doc_h), 0)
-        for index, candidate in enumerate(self.layers[:layer_index]):
-            if not candidate.visible:
-                continue
+        rendered_layers = []
+        for candidate in self.layers:
             if candidate.layer_type == "vector" and candidate.vector_data:
                 candidate.render_vector()
-            rendered = candidate.image_with_opacity()
-            below_alpha = None
-            if index > 0 and candidate.mask_mode == Layer.MASK_LAYER_BELOW:
-                below = self.layers[index - 1]
-                if below.layer_type == "vector" and below.vector_data:
-                    below.render_vector()
-                below_alpha = below.image_with_opacity().getchannel("A")
-            rendered = self._cap_masked_layer(
-                candidate, rendered, underlying_alpha, below_alpha)
-            underlying_alpha = ImageChops.lighter(
-                underlying_alpha, rendered.getchannel("A"))
-
-        below_alpha = None
-        if layer_index > 0 and layer.mask_mode == Layer.MASK_LAYER_BELOW:
-            below = self.layers[layer_index - 1]
-            if below.layer_type == "vector" and below.vector_data:
-                below.render_vector()
-            below_alpha = below.image_with_opacity().getchannel("A")
-
-        layer.image = self._cap_masked_layer(
-            layer, layer.image_with_opacity(), underlying_alpha, below_alpha)
+            rendered_layers.append(candidate.image_with_opacity())
+        layer.image = self._apply_layer_masks(
+            self.layers, rendered_layers)[layer_index]
         layer.opacity = 100
         layer.masked = False
         layer.anti_mask = False
+        layer.mask_visibility = Layer.MASK_VISIBLE_ONLY
         layer.layer_type = "raster"
         layer.vector_data = None
         layer.draw = ImageDraw.Draw(layer.image)
@@ -3377,6 +3372,7 @@ class PaintApp:
         original_masked = layer.masked
         original_anti_mask = layer.anti_mask
         original_mask_mode = layer.mask_mode
+        original_mask_visibility = layer.mask_visibility
         self.active_layer = layer_index
         self.layer_list.selection_set(row)
         self.layer_list.focus(row)
@@ -3411,20 +3407,37 @@ class PaintApp:
             row=2, column=1, columnspan=3, sticky="w",
             padx=(18, 0), pady=(0, 10))
 
-        mask_mode_var = tk.StringVar(value=layer.mask_mode)
-        underneath_radio = ttk.Radiobutton(
-            body, text="Masked by layers underneath",
-            variable=mask_mode_var, value=Layer.MASK_LAYERS_UNDERNEATH)
-        underneath_radio.grid(
-            row=3, column=1, columnspan=3, sticky="w", padx=(18, 0))
-        below_radio = ttk.Radiobutton(
-            body, text="Masked by layer below",
-            variable=mask_mode_var, value=Layer.MASK_LAYER_BELOW)
-        below_radio.grid(
-            row=4, column=1, columnspan=3, sticky="w",
-            padx=(18, 0), pady=(0, 10))
+        visibility_labels = {
+            Layer.MASK_VISIBLE_ONLY: "Only Visible",
+            Layer.MASK_ALL_BELOW: "Visible or Hidden",
+        }
+        visibility_values = {label: value
+                             for value, label in visibility_labels.items()}
+        mask_visibility_var = tk.StringVar(
+            value=visibility_labels[layer.mask_visibility])
+        ttk.Label(body, text="Visibility:").grid(
+            row=3, column=0, sticky="w", padx=(0, 8), pady=(0, 6))
+        visibility_combo = ttk.Combobox(
+            body, textvariable=mask_visibility_var,
+            values=tuple(visibility_labels.values()), state="readonly", width=18)
+        visibility_combo.grid(
+            row=3, column=1, columnspan=3, sticky="ew", pady=(0, 6))
 
-        apply_mask_button = ttk.Button(body, text="Apply Mask")
+        mode_labels = {
+            Layer.MASK_LAYERS_UNDERNEATH: "All Below",
+            Layer.MASK_LAYER_BELOW: "One Below",
+        }
+        mode_values = {label: value for value, label in mode_labels.items()}
+        mask_mode_var = tk.StringVar(value=mode_labels[layer.mask_mode])
+        ttk.Label(body, text="Considered Layers:").grid(
+            row=4, column=0, sticky="w", padx=(0, 8), pady=(0, 10))
+        mode_combo = ttk.Combobox(
+            body, textvariable=mask_mode_var, values=tuple(mode_labels.values()),
+            state="readonly", width=18)
+        mode_combo.grid(
+            row=4, column=1, columnspan=3, sticky="ew", pady=(0, 10))
+
+        apply_mask_button = ttk.Button(body, text="Bake Mask")
         apply_mask_button.grid(
             row=5, column=1, columnspan=3, sticky="w", pady=(0, 10))
 
@@ -3498,11 +3511,13 @@ class PaintApp:
 
         def masked_changed():
             layer.masked = masked_var.get()
-            radio_state = "normal" if layer.masked else "disabled"
-            anti_mask_check.configure(state=radio_state)
-            underneath_radio.configure(state=radio_state)
-            below_radio.configure(state=radio_state)
-            apply_mask_button.configure(state=radio_state)
+            control_state = "readonly" if layer.masked else "disabled"
+            anti_mask_check.configure(
+                state="normal" if layer.masked else "disabled")
+            visibility_combo.configure(state=control_state)
+            mode_combo.configure(state=control_state)
+            apply_mask_button.configure(
+                state="normal" if layer.masked else "disabled")
             self.refresh_layers()
             schedule_preview()
 
@@ -3515,10 +3530,16 @@ class PaintApp:
         anti_mask_check.configure(command=anti_mask_changed)
 
         def mask_mode_changed(*_args):
-            layer.mask_mode = mask_mode_var.get()
+            layer.mask_mode = mode_values[mask_mode_var.get()]
             schedule_preview()
 
         mask_mode_var.trace_add("write", mask_mode_changed)
+
+        def mask_visibility_changed(*_args):
+            layer.mask_visibility = visibility_values[mask_visibility_var.get()]
+            schedule_preview()
+
+        mask_visibility_var.trace_add("write", mask_visibility_changed)
         masked_changed()
 
         def apply_mask():
@@ -3533,12 +3554,14 @@ class PaintApp:
             current_opacity = layer.opacity
             current_masked = masked_var.get()
             current_anti_mask = anti_mask_var.get()
-            current_mask_mode = mask_mode_var.get()
+            current_mask_mode = mode_values[mask_mode_var.get()]
+            current_mask_visibility = visibility_values[mask_visibility_var.get()]
             layer.name = original_name
             layer.opacity = original_opacity
             layer.masked = original_masked
             layer.anti_mask = original_anti_mask
             layer.mask_mode = original_mask_mode
+            layer.mask_visibility = original_mask_visibility
             if layer.vector_data:
                 layer.vector_data.name = original_name
             self.snapshot()
@@ -3548,6 +3571,7 @@ class PaintApp:
             layer.masked = current_masked
             layer.anti_mask = current_anti_mask
             layer.mask_mode = current_mask_mode
+            layer.mask_visibility = current_mask_visibility
             if layer.vector_data:
                 layer.vector_data.name = current_name
             self._bake_layer_mask(layer_index)
@@ -3579,12 +3603,14 @@ class PaintApp:
             # restore the originals so Undo records the pre-dialog state.
             new_masked = masked_var.get()
             new_anti_mask = anti_mask_var.get()
-            new_mask_mode = mask_mode_var.get()
+            new_mask_mode = mode_values[mask_mode_var.get()]
+            new_mask_visibility = visibility_values[mask_visibility_var.get()]
             layer.name = original_name
             layer.opacity = original_opacity
             layer.masked = original_masked
             layer.anti_mask = original_anti_mask
             layer.mask_mode = original_mask_mode
+            layer.mask_visibility = original_mask_visibility
             if layer.vector_data:
                 layer.vector_data.name = original_name
             self.snapshot()
@@ -3593,6 +3619,7 @@ class PaintApp:
             layer.masked = new_masked
             layer.anti_mask = new_anti_mask
             layer.mask_mode = new_mask_mode
+            layer.mask_visibility = new_mask_visibility
             if layer.vector_data:
                 layer.vector_data.name = name
             self.refresh_layers()
@@ -3610,6 +3637,7 @@ class PaintApp:
             layer.masked = original_masked
             layer.anti_mask = original_anti_mask
             layer.mask_mode = original_mask_mode
+            layer.mask_visibility = original_mask_visibility
             if layer.vector_data:
                 layer.vector_data.name = original_name
             self.refresh_layers()
@@ -5205,25 +5233,14 @@ class PaintApp:
         # layer for the duration of the drag.
         preview_composite = Image.new(
             "RGBA", (self.doc_w, self.doc_h), (0, 0, 0, 0))
-        underlying_alpha = Image.new("L", (self.doc_w, self.doc_h), 0)
-        for index, candidate in enumerate(self.layers):
-            if not candidate.visible:
-                continue
+        rendered_layers = []
+        for candidate in self.layers:
             candidate_image = preview_img if candidate is layer else candidate.image
-            rendered = candidate.image_with_opacity(candidate_image)
-            below_alpha = None
-            if index > 0 and candidate.mask_mode == Layer.MASK_LAYER_BELOW:
-                below = self.layers[index - 1]
-                if below.layer_type == "vector" and below.vector_data:
-                    below.render_vector()
-                below_image = preview_img if below is layer else below.image
-                below_alpha = below.image_with_opacity(
-                    below_image).getchannel("A")
-            rendered = self._cap_masked_layer(
-                candidate, rendered, underlying_alpha, below_alpha)
-            preview_composite.alpha_composite(rendered)
-            underlying_alpha = ImageChops.lighter(
-                underlying_alpha, rendered.getchannel("A"))
+            rendered_layers.append(candidate.image_with_opacity(candidate_image))
+        rendered_layers = self._apply_layer_masks(self.layers, rendered_layers)
+        for candidate, rendered in zip(self.layers, rendered_layers):
+            if candidate.visible:
+                preview_composite.alpha_composite(rendered)
 
         self.display_image(preview_composite)
 
@@ -5667,40 +5684,56 @@ class PaintApp:
 
     def composite_image(self):
         result = Image.new("RGBA", (self.doc_w, self.doc_h), self.bg_color)
-        underlying_alpha = Image.new("L", (self.doc_w, self.doc_h), 0)
-        for index, layer in enumerate(self.layers):
+        rendered_layers = []
+        for layer in self.layers:
+            if layer.layer_type == "vector" and layer.vector_data:
+                layer.render_vector()
+            rendered_layers.append(layer.image_with_opacity())
+        rendered_layers = self._apply_layer_masks(self.layers, rendered_layers)
+        for layer, rendered in zip(self.layers, rendered_layers):
             if layer.visible:
-                if layer.layer_type == "vector" and layer.vector_data:
-                    layer.render_vector()
-                rendered = layer.image_with_opacity()
-                below_alpha = None
-                if index > 0 and layer.mask_mode == Layer.MASK_LAYER_BELOW:
-                    below = self.layers[index - 1]
-                    if below.layer_type == "vector" and below.vector_data:
-                        below.render_vector()
-                    below_alpha = below.image_with_opacity().getchannel("A")
-                rendered = self._cap_masked_layer(
-                    layer, rendered, underlying_alpha, below_alpha)
                 result.alpha_composite(rendered)
-                underlying_alpha = ImageChops.lighter(
-                    underlying_alpha, rendered.getchannel("A"))
         return result
 
     @staticmethod
-    def _cap_masked_layer(layer, rendered, underlying_alpha, below_alpha=None):
-        """Cap a masked layer using its selected source-alpha mode."""
-        if not layer.masked:
-            return rendered
-        mask_alpha = underlying_alpha
-        if layer.mask_mode == Layer.MASK_LAYER_BELOW:
-            mask_alpha = (below_alpha if below_alpha is not None
-                          else Image.new("L", rendered.size, 0))
-        if layer.anti_mask:
-            mask_alpha = ImageOps.invert(mask_alpha)
-        capped = rendered.copy()
-        capped.putalpha(ImageChops.darker(
-            rendered.getchannel("A"), mask_alpha))
-        return capped
+    def _apply_layer_masks(layers, rendered_layers):
+        """Apply each layer's independent depth and visibility mask scopes."""
+        alpha_cache = {}
+
+        def masked_alpha(index):
+            if index in alpha_cache:
+                return alpha_cache[index]
+            layer = layers[index]
+            alpha = rendered_layers[index].getchannel("A")
+            if layer.masked:
+                if layer.mask_mode == Layer.MASK_LAYER_BELOW:
+                    source_indices = [index - 1] if index else []
+                else:
+                    source_indices = range(index)
+                source_alpha = Image.new("L", alpha.size, 0)
+                for source_index in source_indices:
+                    source = layers[source_index]
+                    if (layer.mask_visibility == Layer.MASK_VISIBLE_ONLY
+                            and not source.visible):
+                        continue
+                    source_layer_alpha = (
+                        rendered_layers[source_index].getchannel("A")
+                        if layer.mask_mode == Layer.MASK_LAYER_BELOW
+                        else masked_alpha(source_index))
+                    source_alpha = ImageChops.lighter(
+                        source_alpha, source_layer_alpha)
+                if layer.anti_mask:
+                    source_alpha = ImageOps.invert(source_alpha)
+                alpha = ImageChops.darker(alpha, source_alpha)
+            alpha_cache[index] = alpha
+            return alpha
+
+        masked = []
+        for index, rendered in enumerate(rendered_layers):
+            capped = rendered.copy()
+            capped.putalpha(masked_alpha(index))
+            masked.append(capped)
+        return masked
 
     def composite_region(self, box, output_size=None):
         """Composite only a document-space rectangle for interactive display.
@@ -5737,7 +5770,6 @@ class PaintApp:
         # checkerboard after compositing the layers; beginning with an opaque
         # white image would permanently cover that backdrop.
         result = Image.new("RGBA", size, (0, 0, 0, 0))
-        underlying_alpha = Image.new("L", size, 0)
         def transformed_layer(layer):
             source = layer.get_mipmap(level)
             extent = (left / factor, top / factor,
@@ -5747,22 +5779,14 @@ class PaintApp:
                 resample=Image.Resampling.NEAREST)
             return layer.image_with_opacity(transformed)
 
-        for index, layer in enumerate(self.layers):
+        for layer in self.layers:
+            if layer.layer_type == "vector" and layer.vector_data:
+                layer.render_vector()
+        rendered_layers = self._apply_layer_masks(
+            self.layers, [transformed_layer(layer) for layer in self.layers])
+        for layer, rendered in zip(self.layers, rendered_layers):
             if layer.visible:
-                if layer.layer_type == "vector" and layer.vector_data:
-                    layer.render_vector()
-                rendered = transformed_layer(layer)
-                below_alpha = None
-                if index > 0 and layer.mask_mode == Layer.MASK_LAYER_BELOW:
-                    below = self.layers[index - 1]
-                    if below.layer_type == "vector" and below.vector_data:
-                        below.render_vector()
-                    below_alpha = transformed_layer(below).getchannel("A")
-                rendered = self._cap_masked_layer(
-                    layer, rendered, underlying_alpha, below_alpha)
                 result.alpha_composite(rendered)
-                underlying_alpha = ImageChops.lighter(
-                    underlying_alpha, rendered.getchannel("A"))
         return result
 
     def get_checker_backdrop_pil(self, cw, ch):
