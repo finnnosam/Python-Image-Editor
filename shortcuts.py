@@ -34,6 +34,18 @@ def key_sequence(value):
     return "<" + "-".join(modifiers + ["KeyPress", key]) + ">"
 
 
+def shortcut_label(sequence):
+    """Convert a normalized Tk key sequence back to a compact UI label."""
+    parts = sequence.removeprefix("<").removesuffix(">").split("-")
+    parts = [part for part in parts if part != "KeyPress"]
+    aliases = {"Control": "Ctrl", "equal": "=", "plus": "+",
+               "minus": "-", "Return": "Enter", "BackSpace": "Backspace",
+               "Prior": "PageUp", "Next": "PageDown", "KP_Add": "Numpad+",
+               "KP_Subtract": "Numpad-"}
+    return "+".join(aliases.get(part, part.upper() if len(part) == 1 else part)
+                    for part in parts)
+
+
 def read_shortcuts(path, actions):
     """Return valid action/sequence pairs and readable errors for invalid lines."""
     bindings, errors, used = [], [], {}

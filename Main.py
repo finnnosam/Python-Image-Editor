@@ -13,8 +13,51 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from windows_clipboard import copy_image, paste_image
-from shortcuts import read_shortcuts
+from shortcuts import read_shortcuts, shortcut_label
 from pdn import read_pdn, write_pdn, RasterLayer, PDNError
+
+
+class DelayedToolTip:
+    """A small pointer-adjacent tooltip displayed after a hover delay."""
+
+    def __init__(self, widget, text, delay=500):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self.pending = None
+        self.window = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        self.pending = self.widget.after(self.delay, self._show)
+
+    def _cancel(self):
+        if self.pending is not None:
+            self.widget.after_cancel(self.pending)
+            self.pending = None
+
+    def _show(self):
+        self.pending = None
+        if self.window is not None or not self.widget.winfo_containing(
+                self.widget.winfo_pointerx(), self.widget.winfo_pointery()):
+            return
+        x = self.widget.winfo_pointerx() + 12
+        y = self.widget.winfo_pointery() + 16
+        self.window = tk.Toplevel(self.widget)
+        self.window.wm_overrideredirect(True)
+        self.window.wm_geometry(f"+{x}+{y}")
+        tk.Label(self.window, text=self.text, padx=6, pady=3,
+                 relief="solid", borderwidth=1,
+                 background="#ffffe0").pack()
+
+    def _hide(self, _event=None):
+        self._cancel()
+        if self.window is not None:
+            self.window.destroy()
+            self.window = None
 
 
 def _apply_hardness_to_alpha(alpha, hardness, softness_scale):
@@ -954,6 +997,8 @@ class PaintApp:
         self.tool_blocked_overlay = ImageTk.PhotoImage(
             Image.new("RGBA", (32, 32), (28, 28, 28, 255)))
         self.tool_buttons = {}
+        self.tool_button_labels = {}
+        self.tool_tooltips = []
         self.tools_by_layer_type = {
             "raster": ("selection", "move", "move selection",
                        "brush selection", "pan", "color picker", "brush",
@@ -993,6 +1038,7 @@ class PaintApp:
                 "<Leave>",
                 lambda event: self.tool_hint_var.set(self.tool.title()))
             self.tool_buttons[tool] = button
+            self.tool_button_labels[tool] = label
         self.tool_button_background = next(
             iter(self.tool_buttons.values())).cget("background")
         self.brush_build_up_var = tk.BooleanVar(value=False)
@@ -1998,6 +2044,27 @@ class PaintApp:
                     self.root.bind(sequence, invoke)
             except tk.TclError as error:
                 errors.append(f"{action}: {error}")
+        tool_actions = {
+            "pan": "pan", "color_picker": "color picker", "brush": "brush",
+            "pencil": "pencil", "eraser": "eraser", "clone": "clone",
+            "paint_bucket": "paint bucket", "vector_edit": "vector edit",
+            "line": "line", "rectangle": "rect", "ellipse": "ellipse",
+            "selection": "selection", "brush_selection": "brush selection",
+            "magic_wand": "magic wand", "move": "move",
+            "move_selection": "move selection"}
+        shortcuts_by_action = {}
+        for action, sequence in bindings:
+            shortcuts_by_action.setdefault(action, []).append(shortcut_label(sequence))
+        for action, tool in tool_actions.items():
+            label = self.tool_button_labels[tool]
+            shortcuts = shortcuts_by_action.get(action, [])
+            if not shortcuts and tool in {
+                    "selection", "brush selection", "magic wand"}:
+                shortcuts = shortcuts_by_action.get("cycle_selection", [])
+            elif not shortcuts and tool in {"move", "move selection"}:
+                shortcuts = shortcuts_by_action.get("cycle_move", [])
+            text = f"{label} ({', '.join(shortcuts)})" if shortcuts else label
+            self.tool_tooltips.append(DelayedToolTip(self.tool_buttons[tool], text))
         if errors:
             message = f"Check {path}:\n\n" + "\n".join(errors)
             self.root.after_idle(lambda: messagebox.showwarning("Keyboard shortcuts", message))
