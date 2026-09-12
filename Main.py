@@ -15,6 +15,11 @@ from pathlib import Path
 from windows_clipboard import copy_image, paste_image
 from shortcuts import read_shortcuts, shortcut_label
 from pdn import read_pdn, write_pdn, RasterLayer, PDNError
+from blend_modes import (
+    composite as blend_composite,
+    mode_labels as blend_mode_labels,
+    normalize_mode,
+)
 
 
 class DelayedToolTip:
@@ -699,6 +704,7 @@ class Layer:
         self.name = name
         self.visible = True
         self.opacity = 100
+        self.blend_mode = "normal"
         self.layer_type = layer_type  # "raster" or "vector"
         self.masked = False
         self.anti_mask = False
@@ -936,7 +942,13 @@ class PaintApp:
 
     def _commit_active_entry(self, event):
         """Commit and unfocus an entry when the user clicks outside it."""
-        focused = self.root.focus_get()
+        try:
+            focused = self.root.focus_get()
+        except (KeyError, tk.TclError):
+            # ttk.Combobox uses a temporary Tcl popdown window that is not in
+            # Tkinter's Python widget tree. Clicking its list can briefly put
+            # focus there, so there is no Entry widget for us to commit.
+            return
         if focused is None or focused.winfo_class() not in {
                 "Entry", "TEntry", "Spinbox", "TSpinbox"}:
             return
@@ -2227,7 +2239,7 @@ class PaintApp:
     @staticmethod
     def _document_preview_key(state):
         return (state["doc_w"], state["doc_h"], state["bg_color"], tuple(
-            (id(layer), layer.visible, layer.opacity, layer.masked,
+            (id(layer), layer.visible, layer.opacity, layer.blend_mode, layer.masked,
              layer.anti_mask, layer.mask_mode, layer.mask_visibility,
              json.dumps(layer.vector_data.to_dict(), sort_keys=True)
              if layer.vector_data is not None else
@@ -2253,7 +2265,7 @@ class PaintApp:
         for layer, rendered in zip(state["layers"], rendered_layers):
             if not layer.visible:
                 continue
-            result.alpha_composite(rendered)
+            result = blend_composite(result, rendered, layer.blend_mode)
         thumbnail_layer = Layer(*size, "Preview")
         thumbnail_layer.image = result
         thumbnail_layer.reset_mipmaps()
@@ -2286,7 +2298,8 @@ class PaintApp:
             return None
         layer = self.layers[0]
         if (not layer.is_raster or layer.name != "Background" or
-                not layer.visible or layer.opacity != 100 or layer.masked or
+                not layer.visible or layer.opacity != 100 or
+                layer.blend_mode != "normal" or layer.masked or
                 layer.anti_mask or
                 layer.mask_mode != Layer.MASK_LAYERS_UNDERNEATH or
                 layer.mask_visibility != Layer.MASK_VISIBLE_ONLY or
@@ -2514,6 +2527,7 @@ class PaintApp:
             n = Layer(self.doc_w, self.doc_h, l.name, l.layer_type)
             n.visible = l.visible
             n.opacity = l.opacity
+            n.blend_mode = l.blend_mode
             n.masked = l.masked
             n.anti_mask = l.anti_mask
             n.mask_mode = l.mask_mode
@@ -2930,9 +2944,10 @@ class PaintApp:
         try:
             if Path(filename).suffix.lower() == '.pdn':
                 if not self._pdn_save_supported():
-                    raise PDNError('PDN saving requires raster layers without masks. '
-                                   'Save as .pypaint to keep vectors and masks editable, '
-                                   'or rasterize vectors and apply masks first.')
+                    raise PDNError(
+                        'PDN saving requires Normal-blend raster layers without masks. '
+                        'Save as .pypaint to preserve blend modes, vectors, and masks, '
+                        'or flatten unsupported layer features first.')
                 write_pdn(filename, self.doc_w, self.doc_h, [
                     RasterLayer(layer.name, layer.image, layer.visible,
                                 round(layer.opacity * 255 / 100))
@@ -2950,6 +2965,7 @@ class PaintApp:
                     'name': layer.name,
                     'visible': layer.visible,
                     'opacity': layer.opacity,
+                    'blend_mode': layer.blend_mode,
                     'masked': layer.masked,
                     'anti_mask': layer.anti_mask,
                     'mask_mode': layer.mask_mode,
@@ -2986,7 +3002,7 @@ class PaintApp:
     def _pdn_save_supported(self):
         return bool(self.layers) and all(
             layer.layer_type == 'raster' and not layer.masked
-            and not layer.anti_mask
+            and not layer.anti_mask and layer.blend_mode == 'normal'
             and not (layer.vector_data and layer.vector_data.objects)
             for layer in self.layers)
 
@@ -3064,6 +3080,7 @@ class PaintApp:
             layer.image = img
             layer.visible = layer_info['visible']
             layer.opacity = max(0, min(100, float(layer_info.get('opacity', 100))))
+            layer.blend_mode = normalize_mode(layer_info.get('blend_mode', 'normal'))
             layer.masked = bool(layer_info.get('masked', saved_type == 'mask'))
             layer.anti_mask = bool(layer_info.get('anti_mask', False))
             layer.mask_mode = layer_info.get(
@@ -3333,6 +3350,7 @@ class PaintApp:
             self.doc_w, self.doc_h, f"{source.name} copy", source.layer_type)
         duplicate.visible = source.visible
         duplicate.opacity = source.opacity
+        duplicate.blend_mode = source.blend_mode
         duplicate.masked = source.masked
         duplicate.anti_mask = source.anti_mask
         duplicate.mask_mode = source.mask_mode
@@ -3450,6 +3468,7 @@ class PaintApp:
         layer = self.layers[layer_index]
         original_name = layer.name
         original_opacity = layer.opacity
+        original_blend_mode = layer.blend_mode
         original_masked = layer.masked
         original_anti_mask = layer.anti_mask
         original_mask_mode = layer.mask_mode
@@ -3536,6 +3555,16 @@ class PaintApp:
         opacity_spinbox.grid(row=6, column=2, padx=(8, 0))
         ttk.Label(body, text="%").grid(row=6, column=3, sticky="w", padx=(3, 0))
 
+        blend_labels = blend_mode_labels()
+        blend_values = {label: mode for mode, label in blend_labels.items()}
+        blend_var = tk.StringVar(value=blend_labels[layer.blend_mode])
+        ttk.Label(body, text="Blend Mode:").grid(
+            row=7, column=0, sticky="w", padx=(0, 8), pady=(10, 0))
+        ttk.Combobox(
+            body, textvariable=blend_var, values=tuple(blend_values),
+            state="readonly", width=18).grid(
+                row=7, column=1, columnspan=3, sticky="ew", pady=(10, 0))
+
         syncing = False
         preview_after_id = None
 
@@ -3590,6 +3619,12 @@ class PaintApp:
         opacity_var.trace_add("write", number_changed)
         name_var.trace_add("write", name_changed)
 
+        def blend_changed(*_args):
+            layer.blend_mode = blend_values[blend_var.get()]
+            schedule_preview()
+
+        blend_var.trace_add("write", blend_changed)
+
         def masked_changed():
             layer.masked = masked_var.get()
             control_state = "readonly" if layer.masked else "disabled"
@@ -3633,12 +3668,14 @@ class PaintApp:
             # before the dialog so the bake remains a single undoable action.
             current_name = name_var.get().strip() or original_name
             current_opacity = layer.opacity
+            current_blend_mode = layer.blend_mode
             current_masked = masked_var.get()
             current_anti_mask = anti_mask_var.get()
             current_mask_mode = mode_values[mask_mode_var.get()]
             current_mask_visibility = visibility_values[mask_visibility_var.get()]
             layer.name = original_name
             layer.opacity = original_opacity
+            layer.blend_mode = original_blend_mode
             layer.masked = original_masked
             layer.anti_mask = original_anti_mask
             layer.mask_mode = original_mask_mode
@@ -3649,6 +3686,7 @@ class PaintApp:
 
             layer.name = current_name
             layer.opacity = current_opacity
+            layer.blend_mode = current_blend_mode
             layer.masked = current_masked
             layer.anti_mask = current_anti_mask
             layer.mask_mode = current_mask_mode
@@ -3683,11 +3721,13 @@ class PaintApp:
             # The controls have already previewed their values. Temporarily
             # restore the originals so Undo records the pre-dialog state.
             new_masked = masked_var.get()
+            new_blend_mode = blend_values[blend_var.get()]
             new_anti_mask = anti_mask_var.get()
             new_mask_mode = mode_values[mask_mode_var.get()]
             new_mask_visibility = visibility_values[mask_visibility_var.get()]
             layer.name = original_name
             layer.opacity = original_opacity
+            layer.blend_mode = original_blend_mode
             layer.masked = original_masked
             layer.anti_mask = original_anti_mask
             layer.mask_mode = original_mask_mode
@@ -3697,6 +3737,7 @@ class PaintApp:
             self.snapshot()
             layer.name = name
             layer.opacity = opacity
+            layer.blend_mode = new_blend_mode
             layer.masked = new_masked
             layer.anti_mask = new_anti_mask
             layer.mask_mode = new_mask_mode
@@ -3715,6 +3756,7 @@ class PaintApp:
                 preview_after_id = None
             layer.name = original_name
             layer.opacity = original_opacity
+            layer.blend_mode = original_blend_mode
             layer.masked = original_masked
             layer.anti_mask = original_anti_mask
             layer.mask_mode = original_mask_mode
@@ -3727,7 +3769,7 @@ class PaintApp:
             dialog.destroy()
 
         buttons = ttk.Frame(body)
-        buttons.grid(row=7, column=0, columnspan=4, sticky="e", pady=(14, 0))
+        buttons.grid(row=8, column=0, columnspan=4, sticky="e", pady=(14, 0))
         ttk.Button(buttons, text="Cancel", command=cancel).pack(
             side="right", padx=(6, 0))
         ttk.Button(buttons, text="OK", command=accept).pack(side="right")
@@ -3796,7 +3838,8 @@ class PaintApp:
         content = (json.dumps(layer.vector_data.to_dict(), sort_keys=True)
                    if layer.vector_data is not None else
                    (id(layer.image), layer._mipmap_revision))
-        key = (content, layer.visible, layer.opacity, layer.layer_type)
+        key = (content, layer.visible, layer.opacity, layer.blend_mode,
+               layer.layer_type)
         cached = self.layer_preview_cache.get(layer)
         if cached is not None and cached[0] == key:
             return cached[1]
@@ -5583,7 +5626,8 @@ class PaintApp:
         rendered_layers = self._apply_layer_masks(self.layers, rendered_layers)
         for candidate, rendered in zip(self.layers, rendered_layers):
             if candidate.visible:
-                preview_composite.alpha_composite(rendered)
+                preview_composite = blend_composite(
+                    preview_composite, rendered, candidate.blend_mode)
 
         self.display_image(preview_composite)
 
@@ -6038,7 +6082,7 @@ class PaintApp:
         rendered_layers = self._apply_layer_masks(self.layers, rendered_layers)
         for layer, rendered in zip(self.layers, rendered_layers):
             if layer.visible:
-                result.alpha_composite(rendered)
+                result = blend_composite(result, rendered, layer.blend_mode)
         return result
 
     @staticmethod
@@ -6132,7 +6176,7 @@ class PaintApp:
             self.layers, [transformed_layer(layer) for layer in self.layers])
         for layer, rendered in zip(self.layers, rendered_layers):
             if layer.visible:
-                result.alpha_composite(rendered)
+                result = blend_composite(result, rendered, layer.blend_mode)
         return result
 
     def get_checker_backdrop_pil(self, cw, ch):
