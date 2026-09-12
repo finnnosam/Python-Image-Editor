@@ -3,6 +3,7 @@ __pycache__/
 .cwtools-ai/
 .agents/
 /testing_tools/
+/tests/
 #Files
 Debug_Version.py
 Debug_Version_Main.py
@@ -11,3 +12,4 @@ Debug_Version_old.py
 Debug_Example.py
 Performance_Reports.txt
 wishlist.txt
+PERFORMANCE.md

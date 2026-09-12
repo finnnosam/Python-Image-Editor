@@ -191,6 +191,40 @@ def _pencil_path(x0, y0, x1, y1):
         yield x0, y0
 
 
+def _connected_region_mask(matches, pixel_x, pixel_y):
+    """Flood four-connected runs, without a Python set entry per pixel."""
+    height, width = matches.shape
+    pending = [(pixel_x, pixel_y)]
+    remaining = bytearray(matches.astype(np.uint8).tobytes())
+    result = Image.new("L", (width, height), 0)
+    while pending:
+        x, y = pending.pop()
+        row = y * width
+        if not remaining[row + x]:
+            continue
+        left = max(row, remaining.rfind(b"\x00", row, row + x) + 1)
+        right = remaining.find(b"\x00", row + x, row + width)
+        if right < 0:
+            right = row + width
+        remaining[left:right] = b"\x00" * (right - left)
+        left -= row
+        right -= row
+        result.paste(255, (left, y, right, y + 1))
+        for neighbor in (y - 1, y + 1):
+            if not 0 <= neighbor < height:
+                continue
+            offset = neighbor * width
+            end = offset + right
+            start = remaining.find(b"\x01", offset + left, end)
+            while start >= 0:
+                pending.append((start - offset, neighbor))
+                stop = remaining.find(b"\x00", start, end)
+                if stop < 0:
+                    break
+                start = remaining.find(b"\x01", stop, end)
+    return result
+
+
 class VectorObject:
     """Base class for vector objects"""
     def __init__(self, color="#000000", width=2, antialias=True, hardness=75):
@@ -849,6 +883,8 @@ class Layer:
         """Discard reduced previews after replacing the whole layer image."""
         self._mipmaps = [self.image]
         self._mipmap_revision += 1
+        if getattr(self, "_vector_render_image", None) is not self.image:
+            self._vector_render_image = None
 
     @property
     def is_raster(self):
@@ -894,11 +930,21 @@ class Layer:
     def render_vector(self):
         """Render vector objects to the raster image"""
         if self.layer_type == "vector" and self.vector_data:
+            # Objects can be edited through handles, settings, or the table.
+            # A value key catches all those mutations without rerasterizing
+            # unchanged geometry on every viewport/globe/thumbnail request.
+            key = (self.width, self.height,
+                   json.dumps(self.vector_data.to_dict(), sort_keys=True))
+            if (getattr(self, "_vector_render_key", None) == key and
+                    getattr(self, "_vector_render_image", None) is self.image):
+                return
             # Clear the image
             self.image = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
             self.draw = ImageDraw.Draw(self.image)
             self.vector_data.render(self.image)
             self.reset_mipmaps()
+            self._vector_render_key = key
+            self._vector_render_image = self.image
 
     def image_with_opacity(self, image=None):
         """Return a compositing copy with this layer's opacity applied."""
@@ -928,6 +974,7 @@ class PaintApp:
         self.redraw_pending = False
         self.last_redraw = 0.0
         self.redraw_after_id = None
+        self.overlay_after_id = None
         self.pending_redraw_box = None
         self.mipmap_after_id = None
         self.pending_mipmap_level = None
@@ -1000,6 +1047,7 @@ class PaintApp:
         self.selection_start = None
         self.selection_bounds = None
         self.selection_mask = Image.new("L", (self.doc_w, self.doc_h), 0)
+        self._selection_mask_bounds = None
         self.selection_operation = None
         self.selection_base_mask = None
         self.selection_edges = []
@@ -1733,6 +1781,17 @@ class PaintApp:
         self.pending_redraw_box = None
         self.redraw(dirty_box)
 
+    def request_overlay_redraw(self):
+        """Pointer movement changes overlays, not document pixels."""
+        if self.active_view != "main" or self.overlay_after_id is not None:
+            return
+        self.overlay_after_id = self.root.after(16, self._scheduled_overlay_redraw)
+
+    def _scheduled_overlay_redraw(self):
+        self.overlay_after_id = None
+        if self.active_view == "main" and self.redraw_after_id is None:
+            self._draw_overlays()
+
     def request_mipmap_level(self, level):
         """Build a missing zoom level after wheel input has settled.
 
@@ -1757,13 +1816,16 @@ class PaintApp:
         self.pending_mipmap_level = None
         if level is None:
             return
-        jobs = [(layer, layer._mipmap_revision, layer.image)
-                for layer in self.layers if layer.visible]
+        required = self._compositing_layer_indices(self.layers)
+        jobs = [(layer, layer._mipmap_revision, layer.image, list(layer._mipmaps))
+                for index, layer in enumerate(self.layers)
+                if index in required and len(layer._mipmaps) <= level]
+        if not jobs:
+            return
 
         def build_levels():
             results = []
-            for layer, revision, base in jobs:
-                pyramid = [base]
+            for layer, revision, base, pyramid in jobs:
                 while len(pyramid) <= level:
                     previous = pyramid[-1]
                     size = (max(1, (previous.width + 1) // 2),
@@ -2296,7 +2358,7 @@ class PaintApp:
             "offset_x offset_y tool bg_color last_x last_y vector_start_x "
             "vector_start_y current_vector_obj selected_vector_obj "
             "selected_point_index is_dragging_point selection_start "
-            "selection_bounds selection_mask selection_operation selection_base_mask "
+            "selection_bounds selection_mask _selection_mask_bounds selection_operation selection_base_mask "
             "selection_edges selection_dash_offset move_start move_source_box "
             "move_pixels move_is_paste move_mask move_base_image move_selection_bounds "
             "move_selection_edges "
@@ -2643,19 +2705,15 @@ class PaintApp:
     def snapshot(self):
         snap = []
         for l in self.layers:
-            n = Layer(self.doc_w, self.doc_h, l.name, l.layer_type)
-            n.visible = l.visible
-            n.opacity = l.opacity
-            n.blend_mode = l.blend_mode
-            n.masked = l.masked
-            n.anti_mask = l.anti_mask
-            n.mask_mode = l.mask_mode
-            n.mask_visibility = l.mask_visibility
+            # Do not allocate and immediately discard a blank full-size
+            # image for every layer before making the actual undo copy.
+            n = copy.copy(l)
             n.image = l.image.copy()
             n.draw = ImageDraw.Draw(n.image)
             n.reset_mipmaps()
             if l.layer_type == "vector" and l.vector_data:
                 n.vector_data = copy.deepcopy(l.vector_data)
+                n._vector_render_image = n.image
             snap.append(n)
         self.undo_stack.append((snap, self.active_layer, self.doc_w, self.doc_h))
         if len(self.undo_stack) > 20:
@@ -4670,18 +4728,18 @@ class PaintApp:
         elif tolerance == 100:
             matches = np.ones((image.height, image.width), dtype=bool)
         else:
-            differences = (pixels.astype(np.int32) -
-                           target.astype(np.int32))
-            distance_squared = np.sum(
-                differences * differences, axis=2)
+            # Accumulate one channel at a time instead of allocating two
+            # document-sized RGBA int32 arrays and an int64 reduction.
+            distance_squared = np.zeros(pixels.shape[:2], dtype=np.int32)
+            for channel in range(4):
+                difference = pixels[..., channel].astype(np.int32)
+                difference -= int(target[channel])
+                difference *= difference
+                distance_squared += difference
             maximum_distance = math.sqrt(4 * 255 * 255)
             threshold = maximum_distance * tolerance / 100
             matches = distance_squared <= threshold * threshold
-        flood_source = Image.fromarray(
-            np.where(matches, 0, 255).astype(np.uint8)).copy()
-        ImageDraw.floodfill(flood_source, (pixel_x, pixel_y), 128)
-        fill_mask = flood_source.point(
-            lambda value: 255 if value == 128 else 0)
+        fill_mask = _connected_region_mask(matches, pixel_x, pixel_y)
 
         if antialias and self.bucket_antialias_var.get():
             fill_mask = fill_mask.filter(ImageFilter.GaussianBlur(0.65))
@@ -4898,15 +4956,21 @@ class PaintApp:
         layer = self.layers[self.active_layer]
         # Keep the layer at its cut-out base while the pixels float.  Drawing
         # the float as an overlay preserves pixels beyond the document bounds.
-        layer.image.paste(self.move_base_image)
-        layer.reset_mipmaps()
+        base_changed = layer.image is not self.move_base_image
+        if base_changed:
+            layer.image = self.move_base_image
+            layer.draw = ImageDraw.Draw(layer.image)
+            layer.reset_mipmaps()
 
         self.selection_mask = Image.new("L", (self.doc_w, self.doc_h), 0)
         self.selection_mask.paste(
             self.move_mask, (source_left + dx, source_top + dy))
         self._update_selection_geometry()
         self.move_offset = (dx, dy)
-        self.request_redraw()
+        if base_changed:
+            self.request_redraw()
+        else:
+            self.request_overlay_redraw()
 
     def _release_selection_move(self):
         """End one drag while keeping the selected pixels floating."""
@@ -5019,6 +5083,9 @@ class PaintApp:
         if self.selection_bounds is None and self.move_pixels is None:
             return
         self.selection_dash_offset = (self.selection_dash_offset + 1) % 10
+        if self.active_view != "main":
+            self._ensure_selection_animation()
+            return
         try:
             # Recreate only the lightweight outline items so the animation is
             # independent of Tk's platform-specific dashed-line repainting.
@@ -5065,6 +5132,8 @@ class PaintApp:
         # dashoffset changes, whereas changing line coordinates always paints.
         dash_length = 6
         period = 10
+        viewport_width = self.canvas.winfo_width()
+        viewport_height = self.canvas.winfo_height()
 
         def draw_moving_edge(start_x, start_y, end_x, end_y):
             dx = end_x - start_x
@@ -5073,10 +5142,32 @@ class PaintApp:
             if length <= 0:
                 return
             unit_x, unit_y = dx / length, dy / length
+            visible_start, visible_end = 0, length
+            for origin, direction, limit in (
+                    (start_x, unit_x, viewport_width),
+                    (start_y, unit_y, viewport_height)):
+                if direction == 0:
+                    if origin < -2 or origin > limit + 2:
+                        return
+                else:
+                    low, high = sorted(((-2 - origin) / direction,
+                                        (limit + 2 - origin) / direction))
+                    visible_start = max(visible_start, low)
+                    visible_end = min(visible_end, high)
+            if visible_end <= visible_start:
+                return
+            self.canvas.create_line(
+                start_x + unit_x * visible_start,
+                start_y + unit_y * visible_start,
+                start_x + unit_x * visible_end,
+                start_y + unit_y * visible_end,
+                fill="black", width=3, tags=tags)
             distance = self.selection_dash_offset - period
-            while distance < length:
-                segment_start = max(0, distance)
-                segment_end = min(length, distance + dash_length)
+            distance += max(0, math.floor(
+                (visible_start - distance - dash_length) / period)) * period
+            while distance < visible_end:
+                segment_start = max(visible_start, distance)
+                segment_end = min(visible_end, distance + dash_length)
                 if segment_end > segment_start:
                     self.canvas.create_line(
                         start_x + unit_x * segment_start,
@@ -5089,8 +5180,6 @@ class PaintApp:
         for left, top, right, bottom in edges:
             x0, y0 = self.screen_coords(left, top)
             x1, y1 = self.screen_coords(right, bottom)
-            self.canvas.create_line(
-                x0, y0, x1, y1, fill="black", width=3, tags=tags)
             draw_moving_edge(x0, y0, x1, y1)
 
     def _pixel_box_from_bounds(self, bounds):
@@ -5106,6 +5195,7 @@ class PaintApp:
     def _update_selection_geometry(self):
         """Cache the exact outline segments for the current selection mask."""
         self.selection_bounds = self.selection_mask.getbbox()
+        self._selection_mask_bounds = self.selection_bounds
         self.selection_edges = []
         if self.selection_bounds is None:
             return
@@ -5115,13 +5205,13 @@ class PaintApp:
         height, width = selected.shape
 
         def add_runs(values, make_segment):
-            start = None
-            for index, value in enumerate(np.append(values, False)):
-                if value and start is None:
-                    start = index
-                elif not value and start is not None:
-                    self.selection_edges.append(make_segment(start, index))
-                    start = None
+            padded = np.empty(len(values) + 2, dtype=bool)
+            padded[0] = padded[-1] = False
+            padded[1:-1] = values
+            transitions = np.flatnonzero(padded[1:] != padded[:-1])
+            self.selection_edges.extend(
+                make_segment(int(start), int(end))
+                for start, end in zip(transitions[::2], transitions[1::2]))
 
         for row in range(height + 1):
             above = selected[row - 1] if row > 0 else np.zeros(width, bool)
@@ -5144,7 +5234,8 @@ class PaintApp:
         """Return the active selection's exact nonempty pixel extent."""
         if self.selection_mask.size != (self.doc_w, self.doc_h):
             self.selection_mask = Image.new("L", (self.doc_w, self.doc_h), 0)
-        return self.selection_mask.getbbox()
+            self._selection_mask_bounds = None
+        return self._selection_mask_bounds
 
     def _point_in_selection(self, x, y):
         """Return whether a document point lies in an actually selected pixel."""
@@ -5154,10 +5245,9 @@ class PaintApp:
 
     def _selection_mask_for_box(self, box):
         """Build a selection mask local to a document-space patch box."""
-        mask = Image.new("L", (box[2] - box[0], box[3] - box[1]), 0)
         selection_box = self._selection_pixel_box()
         if selection_box is None:
-            return Image.new("L", mask.size, 255)
+            return Image.new("L", (box[2] - box[0], box[3] - box[1]), 255)
         return self.selection_mask.crop(box)
 
     def apply_raster_result(self, layer, result, box=None, mask=None):
@@ -5185,6 +5275,8 @@ class PaintApp:
 
     def _clip_raster_mask_to_selection(self, box, mask):
         """Restrict a raster tool mask to the active selection."""
+        if self._selection_pixel_box() is None:
+            return mask
         return ImageChops.multiply(mask, self._selection_mask_for_box(box))
 
     def _paint_brush_shape(self, layer, bounds, color, paint_mask,
@@ -5773,7 +5865,8 @@ class PaintApp:
         for candidate in self.layers:
             candidate_image = preview_img if candidate is layer else candidate.image
             rendered_layers.append(candidate.image_with_opacity(candidate_image))
-        rendered_layers = self._apply_layer_masks(self.layers, rendered_layers)
+        rendered_layers = self._apply_layer_masks(
+            self.layers, rendered_layers, visible_only=True)
         for candidate, rendered in zip(self.layers, rendered_layers):
             if candidate.visible:
                 preview_composite = blend_composite(
@@ -6028,19 +6121,13 @@ class PaintApp:
             box = (left, top, right, bottom)
             source = (self.composite_region(box) if composite
                       else layer.image.crop(box))
-            totals = [0, 0, 0, 0]
-            count = 0
             radius_squared = radius * radius
-            for y in range(top, bottom):
-                for x in range(left, right):
-                    if ((x + 0.5 - center_x) ** 2 +
-                            (y + 0.5 - center_y) ** 2 > radius_squared):
-                        continue
-                    sample = source.getpixel((x - left, y - top))
-                    for channel in range(4):
-                        totals[channel] += sample[channel]
-                    count += 1
-            rgba = tuple(round(total / count) for total in totals)
+            xs = np.arange(left, right) + 0.5 - center_x
+            ys = np.arange(top, bottom) + 0.5 - center_y
+            inside = ys[:, None] ** 2 + xs[None, :] ** 2 <= radius_squared
+            samples = np.asarray(source)[inside]
+            totals = samples.sum(axis=0, dtype=np.uint64)
+            rgba = tuple(round(int(total) / len(samples)) for total in totals)
         elif composite:
             rgba = self.composite_region(
                 (pixel_x, pixel_y, pixel_x + 1, pixel_y + 1)).getpixel((0, 0))
@@ -6121,7 +6208,7 @@ class PaintApp:
     def mouse_move(self, event):
         self.mouse_x = event.x
         self.mouse_y = event.y
-        self.request_redraw()
+        self.request_overlay_redraw()
 
     def _clipboard_text_focus(self, event):
         return event is not None and event.widget.winfo_class() in {
@@ -6239,19 +6326,52 @@ class PaintApp:
 
     def composite_image(self):
         result = Image.new("RGBA", (self.doc_w, self.doc_h), self.bg_color)
+        required = self._compositing_layer_indices(self.layers)
         rendered_layers = []
-        for layer in self.layers:
+        for index, layer in enumerate(self.layers):
+            if index not in required:
+                rendered_layers.append(None)
+                continue
             if layer.layer_type == "vector" and layer.vector_data:
                 layer.render_vector()
             rendered_layers.append(layer.image_with_opacity())
-        rendered_layers = self._apply_layer_masks(self.layers, rendered_layers)
+        rendered_layers = self._apply_layer_masks(
+            self.layers, rendered_layers, visible_only=True)
         for layer, rendered in zip(self.layers, rendered_layers):
             if layer.visible:
                 result = blend_composite(result, rendered, layer.blend_mode)
         return result
 
     @staticmethod
-    def _apply_layer_masks(layers, rendered_layers):
+    def _compositing_layer_indices(layers):
+        """Include visible layers and the hidden layers their masks require."""
+        required = set()
+
+        def include(index, apply_mask=True):
+            already_included = index in expanded
+            required.add(index)
+            if not apply_mask or already_included:
+                return
+            expanded.add(index)
+            layer = layers[index]
+            if not layer.masked:
+                return
+            sources = ([index - 1] if index else []) if (
+                layer.mask_mode == Layer.MASK_LAYER_BELOW) else range(index)
+            for source in sources:
+                if (layer.mask_visibility == Layer.MASK_VISIBLE_ONLY and
+                        not layers[source].visible):
+                    continue
+                include(source, layer.mask_mode != Layer.MASK_LAYER_BELOW)
+
+        expanded = set()
+        for index, layer in enumerate(layers):
+            if layer.visible:
+                include(index)
+        return required
+
+    @staticmethod
+    def _apply_layer_masks(layers, rendered_layers, visible_only=False):
         """Apply each layer's independent depth and visibility mask scopes."""
         alpha_cache = {}
 
@@ -6285,9 +6405,13 @@ class PaintApp:
 
         masked = []
         for index, rendered in enumerate(rendered_layers):
-            capped = rendered.copy()
-            capped.putalpha(masked_alpha(index))
-            masked.append(capped)
+            if (rendered is not None and layers[index].masked and
+                    (not visible_only or layers[index].visible)):
+                capped = rendered.copy()
+                capped.putalpha(masked_alpha(index))
+                masked.append(capped)
+            else:
+                masked.append(rendered)
         return masked
 
     def composite_region(self, box, output_size=None):
@@ -6310,9 +6434,12 @@ class PaintApp:
         max_level = int(math.floor(math.log2(max(1, min(self.doc_w, self.doc_h)))))
         desired_level = min(desired_level, max_level)
 
+        required = self._compositing_layer_indices(self.layers)
         available_level = desired_level
-        for layer in self.layers:
-            if layer.visible:
+        for index, layer in enumerate(self.layers):
+            if index in required:
+                if layer.layer_type == "vector" and layer.vector_data:
+                    layer.render_vector()
                 if not layer._mipmaps or layer._mipmaps[0] is not layer.image:
                     layer.reset_mipmaps()
                 available_level = min(available_level, len(layer._mipmaps) - 1)
@@ -6334,11 +6461,10 @@ class PaintApp:
                 resample=Image.Resampling.NEAREST)
             return layer.image_with_opacity(transformed)
 
-        for layer in self.layers:
-            if layer.layer_type == "vector" and layer.vector_data:
-                layer.render_vector()
         rendered_layers = self._apply_layer_masks(
-            self.layers, [transformed_layer(layer) for layer in self.layers])
+            self.layers, [transformed_layer(layer) if index in required else None
+                          for index, layer in enumerate(self.layers)],
+            visible_only=True)
         for layer, rendered in zip(self.layers, rendered_layers):
             if layer.visible:
                 result = blend_composite(result, rendered, layer.blend_mode)
@@ -6493,6 +6619,14 @@ class PaintApp:
                                           image=self.tkimg, state="normal")
             self._display_geometry = geometry
 
+        self._draw_overlays()
+
+    def _draw_overlays(self):
+        """Refresh interaction feedback without compositing the viewport."""
+        self.canvas.delete("overlay")
+        cw = max(1, self.canvas.winfo_width())
+        ch = max(1, self.canvas.winfo_height())
+
         # Floating move/paste pixels are intentionally not part of the
         # document image yet.  Showing them as a canvas overlay lets the full
         # temporary object remain visible outside the document; committing the
@@ -6501,17 +6635,29 @@ class PaintApp:
             source_left, source_top, _, _ = self.move_source_box
             float_x = source_left + self.move_offset[0]
             float_y = source_top + self.move_offset[1]
+            float_sx, float_sy = self.screen_coords(float_x, float_y)
             float_image = self.move_pixels
             scaled_width = max(1, round(float_image.width * self.zoom))
             scaled_height = max(1, round(float_image.height * self.zoom))
-            if (scaled_width, scaled_height) != float_image.size:
-                float_image = float_image.resize(
-                    (scaled_width, scaled_height), Image.Resampling.NEAREST)
-            self._floating_move_tkimg = ImageTk.PhotoImage(float_image)
-            float_sx, float_sy = self.screen_coords(float_x, float_y)
-            self.canvas.create_image(
-                float_sx, float_sy, image=self._floating_move_tkimg,
-                anchor="nw", tags=("overlay", "floating_move"))
+            # A large paste at high zoom can have a multi-gigabyte scaled
+            # footprint. Sample only the portion that reaches the viewport.
+            px0 = max(0, math.floor(-float_sx))
+            py0 = max(0, math.floor(-float_sy))
+            px1 = min(scaled_width, math.ceil(cw - float_sx))
+            py1 = min(scaled_height, math.ceil(ch - float_sy))
+            if px1 > px0 and py1 > py0:
+                xscale = float_image.width / scaled_width
+                yscale = float_image.height / scaled_height
+                float_image = float_image.transform(
+                    (px1 - px0, py1 - py0), Image.Transform.EXTENT,
+                    (px0 * xscale, py0 * yscale,
+                     px1 * xscale, py1 * yscale),
+                    resample=Image.Resampling.NEAREST)
+                self._floating_move_tkimg = ImageTk.PhotoImage(float_image)
+                self.canvas.create_image(
+                    float_sx + px0, float_sy + py0,
+                    image=self._floating_move_tkimg,
+                    anchor="nw", tags=("overlay", "floating_move"))
 
         # Draw brush cursor for raster layers
         current_layer = self.layers[self.active_layer]
