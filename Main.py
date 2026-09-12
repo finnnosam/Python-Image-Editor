@@ -44,14 +44,42 @@ class DelayedToolTip:
         if self.window is not None or not self.widget.winfo_containing(
                 self.widget.winfo_pointerx(), self.widget.winfo_pointery()):
             return
-        x = self.widget.winfo_pointerx() + 12
-        y = self.widget.winfo_pointery() + 16
+        pointer_x = self.widget.winfo_pointerx()
+        pointer_y = self.widget.winfo_pointery()
+        app = self.widget.winfo_toplevel()
+        app.update_idletasks()
+        app_left = app.winfo_rootx()
+        app_top = app.winfo_rooty()
+        app_right = app_left + app.winfo_width()
+        app_bottom = app_top + app.winfo_height()
+        margin = 4
+        offset_x = 12
+        offset_y = 16
+
         self.window = tk.Toplevel(self.widget)
         self.window.wm_overrideredirect(True)
-        self.window.wm_geometry(f"+{x}+{y}")
+        self.window.withdraw()
         tk.Label(self.window, text=self.text, padx=6, pady=3,
                  relief="solid", borderwidth=1,
-                 background="#ffffe0").pack()
+                 background="#ffffe0",
+                 wraplength=max(
+                     1, app_right - app_left - 2 * margin - 14)).pack()
+        self.window.update_idletasks()
+        width = self.window.winfo_reqwidth()
+        height = self.window.winfo_reqheight()
+
+        x = pointer_x + offset_x
+        if x + width > app_right - margin:
+            x = pointer_x - width - offset_x
+        y = pointer_y + offset_y
+        if y + height > app_bottom - margin:
+            y = pointer_y - height - offset_y
+        x = max(app_left + margin, min(x, app_right - width - margin))
+        y = max(app_top + margin, min(y, app_bottom - height - margin))
+
+        self.window.wm_geometry(f"+{x}+{y}")
+        self.window.deiconify()
+        self.window.lift()
 
     def _hide(self, _event=None):
         self._cancel()
@@ -1005,7 +1033,6 @@ class PaintApp:
                        "eraser", "clone", "paint bucket", "magic wand", "pencil"),
             "vector": ("pan", "color picker", "vector edit", "line", "rect", "ellipse"),
         }
-        self.tool_hint_var = tk.StringVar(value="Brush")
         for index, (label, tool, filename) in enumerate(tools):
             with Image.open(icon_dir / filename) as source_image:
                 icon_image = source_image.convert("RGBA").resize(
@@ -1031,12 +1058,6 @@ class PaintApp:
                 button.grid(row=5, column=1, padx=2, pady=2, sticky="w")
             else:
                 button.grid(row=index - 4, column=0, padx=2, pady=2, sticky="w")
-            button.bind(
-                "<Enter>",
-                lambda event, name=label: self.tool_hint_var.set(name))
-            button.bind(
-                "<Leave>",
-                lambda event: self.tool_hint_var.set(self.tool.title()))
             self.tool_buttons[tool] = button
             self.tool_button_labels[tool] = label
         self.tool_button_background = next(
@@ -1058,9 +1079,6 @@ class PaintApp:
         self.picker_sample_area_var = tk.BooleanVar(value=False)
         self.vector_antialias_var = self.brush_antialias_var
         self.vector_hardness_var = self.brush_hardness_var
-        tk.Label(self.left_panel_content, textvariable=self.tool_hint_var).pack(
-            pady=(2, 0))
-
         # ── Color Selector ─────────────────────────────────────────────
         # Keep the whole group anchored to the bottom of the sidebar. The
         # unused height between Tools and Colors expands with the window.
@@ -1449,9 +1467,9 @@ class PaintApp:
             ("Move Layer Down", "move-layer-down.png", self.move_layer_down),
         ]
         action_frame = tk.Frame(self.right_panel_content)
-        action_frame.pack(padx=4, pady=(4, 0))
+        action_frame.pack(padx=4, pady=4)
         self.layer_action_icons = {}
-        self.layer_action_hint = tk.StringVar(value="Layer Actions")
+        self.layer_action_tooltips = []
         for index, (label, filename, command) in enumerate(layer_actions):
             with Image.open(icon_dir / filename) as icon_image:
                 icon_image = icon_image.convert("RGBA").resize(
@@ -1462,15 +1480,7 @@ class PaintApp:
                 action_frame, image=icon, width=26, height=26,
                 command=command, takefocus=True)
             button.grid(row=0, column=index, padx=1, pady=1)
-            button.bind(
-                "<Enter>",
-                lambda event, name=label: self.layer_action_hint.set(name))
-            button.bind(
-                "<Leave>",
-                lambda event: self.layer_action_hint.set("Layer Actions"))
-        tk.Label(
-            self.right_panel_content, textvariable=self.layer_action_hint
-        ).pack(pady=(1, 4))
+            self.layer_action_tooltips.append(DelayedToolTip(button, label))
 
     @staticmethod
     def _union_boxes(first, second):
@@ -2257,8 +2267,6 @@ class PaintApp:
             ("pan", "move", "move selection") else "crosshair"))
         for name, button in getattr(self, "tool_buttons", {}).items():
             button.configure(relief="sunken" if name == self.tool else "raised")
-        if hasattr(self, "tool_hint_var"):
-            self.tool_hint_var.set(self.tool.title())
         self.update_title()
         self._highlight_document_tabs()
         self._update_document_preview()
@@ -3078,7 +3086,6 @@ class PaintApp:
         if hasattr(self, "tool_buttons"):
             for name, button in self.tool_buttons.items():
                 button.configure(relief="sunken" if name == tool else "raised")
-            self.tool_hint_var.set(tool.title())
         self.update_tool_settings_visibility()
         # Reset vector drawing state
         self.vector_start_x = None
