@@ -638,6 +638,34 @@ class VectorLayer:
                 if abs(px - x) <= tolerance and abs(py - y) <= tolerance:
                     return obj, points.index((px, py))
         return None, None
+
+    def get_object_near(self, x, y, tolerance=10):
+        """Return the topmost object whose rendered path is near a point."""
+        tolerance_sq = tolerance * tolerance
+        for obj in reversed(self.objects):
+            if isinstance(obj, Line):
+                points = obj.sampled_points(self.width, self.height)
+            elif isinstance(obj, Shape):
+                points = obj._outline(self.width, self.height)
+            else:
+                points = obj.get_points()
+            if any(self._point_segment_distance_sq(x, y, a, b) <= tolerance_sq
+                   for a, b in zip(points, points[1:])):
+                return obj
+        return None
+
+    @staticmethod
+    def _point_segment_distance_sq(x, y, start, end):
+        x1, y1 = start
+        x2, y2 = end
+        dx, dy = x2 - x1, y2 - y1
+        length_sq = dx * dx + dy * dy
+        if length_sq == 0:
+            return (x - x1) ** 2 + (y - y1) ** 2
+        amount = max(0.0, min(1.0,
+                     ((x - x1) * dx + (y - y1) * dy) / length_sq))
+        nearest_x, nearest_y = x1 + amount * dx, y1 + amount * dy
+        return (x - nearest_x) ** 2 + (y - nearest_y) ** 2
     
     def to_dict(self):
         return {
@@ -1016,6 +1044,7 @@ class PaintApp:
             ("Eraser",     "eraser",      "eraser.png"),
             ("Clone",      "clone",       "clone.png"),
             ("Paint Bucket", "paint bucket", "paint-bucket.png"),
+            ("Vector Select", "vector select", "selection.png"),
             ("Vector Edit", "vector edit", "vector-edit.png"),
             ("Line",       "line",        "line.png"),
             ("Rectangle",  "rect",        "rect.png"),
@@ -1034,7 +1063,8 @@ class PaintApp:
             "raster": ("selection", "move", "move selection",
                        "brush selection", "pan", "color picker", "brush",
                        "eraser", "clone", "paint bucket", "magic wand", "pencil"),
-            "vector": ("pan", "color picker", "vector edit", "line", "rect", "ellipse"),
+            "vector": ("pan", "color picker", "vector select", "vector edit",
+                       "line", "rect", "ellipse"),
         }
         for index, (label, tool, filename) in enumerate(tools):
             with Image.open(icon_dir / filename) as source_image:
@@ -1160,6 +1190,7 @@ class PaintApp:
                 self.size_var.set(str(val))
             except ValueError:
                 self.size_var.set("2")  # revert to default on invalid input
+            self._apply_selected_vector_size()
 
         def adjust_size(delta):
             """Adjust tool size by delta while preserving its valid range."""
@@ -1168,6 +1199,7 @@ class PaintApp:
             except ValueError:
                 current = 2
             self.size_var.set(str(max(1, min(999, current + delta))))
+            self._apply_selected_vector_size()
             self.request_redraw()
 
         def adjust_size_with_control(delta):
@@ -1350,6 +1382,12 @@ class PaintApp:
             self.vector_settings_frame, text="Reset",
             command=lambda: self.vector_hardness_var.set(75)
         ).pack(side="left", padx=(3, 0))
+
+        self.vector_select_settings_frame = tk.Frame(self.tool_settings_bar)
+        self.vector_points_var = tk.StringVar(value="Points: —")
+        tk.Label(self.vector_select_settings_frame,
+                 textvariable=self.vector_points_var, anchor="w",
+                 justify="left").pack(side="left", padx=(8, 0))
 
         def validate_spacing(variable):
             try:
@@ -1836,6 +1874,7 @@ class PaintApp:
             self.primary_opacity = opacity
         else:
             self.secondary_opacity = opacity
+        self._apply_selected_vector_color(self.active_color_slot)
         self.request_redraw()
 
     def _set_selected_color(self, color, preserve_hsv=False):
@@ -1848,6 +1887,7 @@ class PaintApp:
             self.secondary_square.config(bg=color)
         self._sync_picker_to_active_color(
             preserve_hsv=preserve_hsv)
+        self._apply_selected_vector_color(self.active_color_slot)
         self.request_redraw()
 
     def _color_with_opacity(self, slot):
@@ -1900,6 +1940,8 @@ class PaintApp:
         self.primary_square.config(bg=self.primary_color)
         self.secondary_square.config(bg=self.secondary_color)
         self._sync_picker_to_active_color()
+        self._apply_selected_vector_color("primary")
+        self._apply_selected_vector_color("secondary")
         self.request_redraw()
 
     def _panel_layout_changed(self):
@@ -3180,7 +3222,8 @@ class PaintApp:
         for frame in (self.size_frame, self.picker_settings_frame,
                       self.brush_settings_frame, self.clone_settings_frame,
                       self.bucket_settings_frame, self.wand_settings_frame,
-                      self.vector_settings_frame):
+                      self.vector_settings_frame,
+                      self.vector_select_settings_frame):
             frame.pack_forget()
 
         uses_size = (self.tool not in
@@ -3207,6 +3250,9 @@ class PaintApp:
             self.wand_settings_frame.pack(side="left")
         elif self.tool in ("line", "rect", "ellipse"):
             self.vector_settings_frame.pack(side="left")
+        elif self.tool == "vector select":
+            self.vector_select_settings_frame.pack(side="left", fill="x",
+                                                   expand=True)
         self.request_redraw()
 
     def add_layer(self, layer_type="raster"):
@@ -3917,7 +3963,22 @@ class PaintApp:
         self.raster_paint_image(self.last_x, self.last_y)
 
     def start_vector_operation(self, event, x, y):
-        if self.tool == "vector edit":
+        if self.tool == "vector select":
+            vector_data = self.layers[self.active_layer].vector_data
+            obj, point_idx = (vector_data.get_object_at(x, y)
+                              if vector_data else (None, None))
+            if obj is not None:
+                self.selected_vector_obj = obj
+                self.selected_point_index = point_idx
+                self.is_dragging_point = True
+                self.snapshot()
+            else:
+                self.selected_vector_obj = (
+                    vector_data.get_object_near(x, y) if vector_data else None)
+                self.selected_point_index = None
+            self._load_selected_vector_attributes()
+            self.request_redraw()
+        elif self.tool == "vector edit":
             # Try to edit a vector object
             if self.layers[self.active_layer].vector_data:
                 obj, point_idx = self.layers[self.active_layer].vector_data.get_object_at(x, y)
@@ -3934,6 +3995,86 @@ class PaintApp:
             self.vector_start_x = x
             self.vector_start_y = y
             self.snapshot()
+
+    @staticmethod
+    def _split_vector_color(color):
+        """Return a UI hex color and alpha from a stored Pillow color."""
+        if isinstance(color, str) and color.startswith("#"):
+            value = color[1:]
+            if len(value) == 8:
+                return "#" + value[:6].lower(), int(value[6:], 16)
+            if len(value) == 6:
+                return "#" + value.lower(), 255
+        return "#000000", 255
+
+    def _load_selected_vector_attributes(self):
+        """Load a selected vector object's properties into the editor controls."""
+        obj = self.selected_vector_obj
+        if obj is None:
+            self.vector_points_var.set("Points: —")
+            return
+
+        self.size_var.set(str(max(1, min(999, int(round(obj.width))))))
+        primary, primary_alpha = self._split_vector_color(obj.color)
+        secondary, secondary_alpha = self._split_vector_color(
+            obj.fill if isinstance(obj, Shape) and obj.fill else obj.color)
+        self.primary_color, self.primary_opacity = primary, primary_alpha
+        self.secondary_color, self.secondary_opacity = secondary, secondary_alpha
+        self.color = primary
+        self.primary_square.config(bg=primary)
+        self.secondary_square.config(bg=secondary)
+        self._sync_picker_to_active_color()
+
+        self._refresh_selected_vector_points()
+
+    def _refresh_selected_vector_points(self):
+        obj = self.selected_vector_obj
+        if obj is None:
+            self.vector_points_var.set("Points: —")
+            return
+
+        def number(value):
+            return str(int(value)) if float(value).is_integer() else f"{value:.2f}"
+        point_text = ", ".join(
+            f"({number(px)}, {number(py)})" for px, py in obj.get_points())
+        self.vector_points_var.set(f"Points: {point_text}")
+
+    def _apply_selected_vector_size(self):
+        """Apply the Size control while Vector Select owns an object."""
+        obj = getattr(self, "selected_vector_obj", None)
+        if self.tool != "vector select" or obj is None:
+            return
+        obj.width = self.vector_line_width()
+        if isinstance(obj, Shape):
+            for line in obj.lines:
+                line.width = obj.width
+        self._render_selected_vector_change()
+
+    def _apply_selected_vector_color(self, slot):
+        """Apply the left stroke or right fill color to the selected object."""
+        obj = getattr(self, "selected_vector_obj", None)
+        if self.tool != "vector select" or obj is None:
+            return
+        color = self._color_with_opacity(slot)
+        if slot == "primary":
+            obj.color = color
+            if isinstance(obj, Shape):
+                for line in obj.lines:
+                    line.color = color
+        elif isinstance(obj, Shape):
+            obj.fill = color
+            obj._spherical_fill_cache = None
+        elif hasattr(obj, "fill"):
+            obj.fill = color
+        self._render_selected_vector_change()
+
+    def _render_selected_vector_change(self):
+        layer = self.layers[self.active_layer]
+        if layer.layer_type != "vector" or layer.vector_data is None:
+            return
+        layer.render_vector()
+        self.request_redraw()
+        self.notify_globe_document_changed()
 
     def on_mouse_move(self, event):
         # Tk dispatches B1/B3-Motion to this handler instead of mouse_move(),
@@ -5207,6 +5348,8 @@ class PaintApp:
         if self.is_dragging_point and self.selected_vector_obj:
             # Update the point position
             self.selected_vector_obj.update_point(self.selected_point_index, x, y)
+            if self.tool == "vector select":
+                self._refresh_selected_vector_points()
             self.layers[self.active_layer].render_vector()
             self.request_redraw()
             self.notify_globe_document_changed()
@@ -5417,8 +5560,11 @@ class PaintApp:
         else:  # vector layer
             if self.is_dragging_point:
                 self.is_dragging_point = False
-                self.selected_vector_obj = None
                 self.selected_point_index = None
+                if self.tool == "vector select":
+                    self._refresh_selected_vector_points()
+                else:
+                    self.selected_vector_obj = None
             elif self.tool in ["line", "rect", "ellipse"] and self.vector_start_x is not None:
                 # Only create if there's a significant size
                 if abs(x - self.vector_start_x) > 2 or abs(y - self.vector_start_y) > 2:
@@ -6026,14 +6172,29 @@ class PaintApp:
                 fill="#00ff80", width=1, tags=("overlay",))
         
         # Draw vector handles if in proper mode and on vector layer
-        if self.tool == "vector edit" and current_layer.layer_type == "vector" and current_layer.vector_data:
-            for obj in current_layer.vector_data.objects:
+        if self.tool in ("vector select", "vector edit") and current_layer.layer_type == "vector" and current_layer.vector_data:
+            visible_objects = (current_layer.vector_data.objects
+                               if self.tool == "vector edit"
+                               else ([self.selected_vector_obj]
+                                     if self.selected_vector_obj else []))
+            for obj in visible_objects:
                 points = obj.get_points()
                 for px, py in points:
                     sx, sy = self.screen_coords(px, py)
                     self.canvas.create_rectangle(sx - 3, sy - 3, sx + 3, sy + 3,
                                                outline="cyan", fill="cyan", width=1,
                                                tags=("overlay",))
+            if self.tool == "vector select" and self.selected_vector_obj:
+                points = self.selected_vector_obj.get_points()
+                screen_points = [self.screen_coords(px, py) for px, py in points]
+                if len(screen_points) > 2:
+                    self.canvas.create_polygon(
+                        *screen_points, outline="#00ffff", fill="", width=2,
+                        tags=("overlay",))
+                elif len(screen_points) == 2:
+                    self.canvas.create_line(
+                        *screen_points, fill="#00ffff", width=2,
+                        tags=("overlay",))
 
         # A committed selection is document-space state; a floating selection
         # can also occupy the surrounding workspace until it is finalized.
