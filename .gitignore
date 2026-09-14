@@ -1,15 +1,55 @@
-#Folders
-__pycache__/
-.cwtools-ai/
-.agents/
+# Runtime-only repository: keep development and verification material local
 /testing_tools/
 /tests/
-#Files
+/benchmarks/
+/.github/
+/docs/
+/requirements-dev.txt
+
+# Python bytecode, environments and tool caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+.nox/
+
+# Packaging and build products (retain pyproject.toml and package resources)
+/build/
+/dist/
+*.egg-info/
+.eggs/
+
+# Local coverage output
+.coverage
+.coverage.*
+/htmlcov/
+/coverage.xml
+
+# Local development helpers and migration workspaces
+.cwtools-ai/
+.agents/
+/.migration/
+
+# Legacy local debug scripts and reports
 Debug_Version.py
 Debug_Version_Main.py
 Debug_Version_GlobeView.py
 Debug_Version_old.py
 Debug_Example.py
 Performance_Reports.txt
-wishlist.txt
-PERFORMANCE.md
+
+# Local environment settings (keep shareable examples available)
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Interrupted atomic saves and OS-generated files
+*.tmp
+.DS_Store
+Thumbs.db
+Desktop.ini

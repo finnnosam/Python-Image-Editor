@@ -25,27 +25,25 @@ from __future__ import annotations
 
 import tkinter as tk
 
-from PIL import Image
-from PIL import ImageTk
-
 import numpy as np
+from PIL import Image, ImageTk
 
-from sphere_math import (
+from pypaint.globe_rendering import GlobeProjection, GlobeTexture
+from pypaint.sphere import (
     Vec3,
+    apply_globe_rotation,
+    close_equirectangular_brush,
     make_camera_ray,
     ray_sphere_intersection,
-    vec_to_uv,
-    uv_to_vec,
+    remove_globe_rotation,
     spherical_brush_points,
     spherical_brush_uv,
-    close_equirectangular_brush,
-    apply_globe_rotation,
-    remove_globe_rotation,
+    uv_to_vec,
+    vec_to_uv,
 )
 
 
 class GlobeView(tk.Frame):
-
     DEFAULT_SIZE = 700
     INTERACTIVE_RENDER_SIZE = 512
 
@@ -54,6 +52,10 @@ class GlobeView(tk.Frame):
         super().__init__(parent, bg="#303030")
 
         self.app = app
+        self.document = app._capture_document().document
+        self.projection = GlobeProjection()
+        self.checker_style = (app.checker_size, app.checker_light, app.checker_dark)
+        self.texture_service = GlobeTexture(self.document, app._renderer())
         self.view_id = view_id
 
         #
@@ -123,69 +125,37 @@ class GlobeView(tk.Frame):
 
         self.update_texture()
 
-        self.after(
-            1,
-            self.redraw
-        )
+        self.after(1, self.redraw)
 
     # --------------------------------------------------
 
     def build_ui(self):
 
-        self.canvas = tk.Canvas(
-            self,
-            bg="#303030",
-            cursor="crosshair",
-            highlightthickness=0
-        )
+        self.canvas = tk.Canvas(self, bg="#303030", cursor="crosshair", highlightthickness=0)
 
-        self.canvas.pack(
-            fill="both",
-            expand=True
-        )
+        self.canvas.pack(fill="both", expand=True)
 
     # --------------------------------------------------
 
     def bind_events(self):
 
-        self.canvas.bind(
-            "<Configure>",
-            self.on_resize
-        )
+        self.canvas.bind("<Configure>", self.on_resize)
 
-        self.canvas.bind(
-            "<ButtonPress-1>",
-            self.on_left_press
-        )
+        self.canvas.bind("<ButtonPress-1>", self.on_left_press)
 
-        self.canvas.bind(
-            "<B1-Motion>",
-            self.on_left_drag
-        )
+        self.canvas.bind("<B1-Motion>", self.on_left_drag)
 
-        self.canvas.bind(
-            "<ButtonRelease-1>",
-            self.on_left_release
-        )
+        self.canvas.bind("<ButtonRelease-1>", self.on_left_release)
 
         self.canvas.bind("<ButtonPress-3>", self.on_right_press)
         self.canvas.bind("<B3-Motion>", self.on_right_drag)
         self.canvas.bind("<ButtonRelease-3>", self.on_right_release)
 
-        self.canvas.bind(
-            "<ButtonPress-2>",
-            self.on_middle_press
-        )
+        self.canvas.bind("<ButtonPress-2>", self.on_middle_press)
 
-        self.canvas.bind(
-            "<B2-Motion>",
-            self.on_middle_drag
-        )
+        self.canvas.bind("<B2-Motion>", self.on_middle_drag)
 
-        self.canvas.bind(
-            "<ButtonRelease-2>",
-            self.on_middle_release
-        )
+        self.canvas.bind("<ButtonRelease-2>", self.on_middle_release)
 
         #
         # Linux wheel
@@ -198,10 +168,7 @@ class GlobeView(tk.Frame):
         # Windows wheel
         #
 
-        self.canvas.bind(
-            "<MouseWheel>",
-            self.on_mousewheel
-        )
+        self.canvas.bind("<MouseWheel>", self.on_mousewheel)
         self.canvas.bind("<Control-MouseWheel>", self.on_mousewheel)
         self.canvas.bind("<Motion>", self.on_pointer_motion)
         self.canvas.bind("<Leave>", self.on_pointer_leave)
@@ -219,7 +186,7 @@ class GlobeView(tk.Frame):
         composited image.
         """
 
-        image = self.app.composite_image()
+        image = self.texture_service.update()
 
         self.texture = image
 
@@ -278,6 +245,8 @@ class GlobeView(tk.Frame):
         self.photo = None
         self.render_image = None
         self.texture = None
+        self.texture_service.release()
+        self.projection = GlobeProjection()
         self.texture_array = None
         self.projected_tx = None
         self.projected_ty = None
@@ -299,17 +268,18 @@ class GlobeView(tk.Frame):
     def _begin_interactive_render(self, settle_delay=140, rebuild=False):
         """Render responsively now, then replace it with native resolution."""
         self.interactive_render = True
-        desired = min(max(self.render_display_size)
-                      if hasattr(self, "render_display_size") else
-                      self.INTERACTIVE_RENDER_SIZE,
-                      self.INTERACTIVE_RENDER_SIZE)
+        desired = min(
+            max(self.render_display_size)
+            if hasattr(self, "render_display_size")
+            else self.INTERACTIVE_RENDER_SIZE,
+            self.INTERACTIVE_RENDER_SIZE,
+        )
         if rebuild or self.current_render_size != desired:
             self.build_lookup()
         self.redraw()
         if self.full_quality_after_id is not None:
             self.after_cancel(self.full_quality_after_id)
-        self.full_quality_after_id = self.after(
-            settle_delay, self._render_full_quality)
+        self.full_quality_after_id = self.after(settle_delay, self._render_full_quality)
 
     def _render_full_quality(self):
         self.full_quality_after_id = None
@@ -359,10 +329,7 @@ class GlobeView(tk.Frame):
         self.canvas.delete("all")
 
         self.canvas.create_image(
-            self.render_origin[0],
-            self.render_origin[1],
-            image=self.photo,
-            anchor="nw"
+            self.render_origin[0], self.render_origin[1], image=self.photo, anchor="nw"
         )
         self.draw_brush_cursor()
 
@@ -379,18 +346,15 @@ class GlobeView(tk.Frame):
     def draw_brush_cursor(self):
         """Draw the visible part of the geodesic brush outline."""
         self.canvas.delete("brush_cursor")
-        raster_clone = (
-            self.app.tool == "clone" and
-            self.app.layers[self.app.active_layer].is_raster)
-        area_picker = (
-            self.app.tool == "color picker" and
-            self.app.picker_sample_area_var.get())
-        if (self.cursor_mouse is None or self.texture is None or
-                self.app.tool not in
-                ("brush", "eraser", "clone", "color picker") or
-                not (self.app.can_paint_from_globe() or raster_clone or
-                     area_picker) or
-                not hasattr(self, "display_center")):
+        raster_clone = self.app.tool == "clone" and self.app.layers[self.app.active_layer].is_raster
+        area_picker = self.app.tool == "color picker" and self.app.picker_sample_area_var.get()
+        if (
+            self.cursor_mouse is None
+            or self.texture is None
+            or self.app.tool not in ("brush", "eraser", "clone", "color picker")
+            or not (self.app.can_paint_from_globe() or raster_clone or area_picker)
+            or not hasattr(self, "display_center")
+        ):
             return
 
         uv = self.screen_to_uv(*self.cursor_mouse)
@@ -405,37 +369,36 @@ class GlobeView(tk.Frame):
             elif self.app.clone_offset is None:
                 source_x, source_y = self.app.clone_source_center
                 source_uv = (
-                    ((source_x + 0.5) / self.texture.width) % 1.0,
-                    max(0.0, min(1.0,
-                        (source_y + 0.5) / self.texture.height)),
+                    ((source_x + 0.5) / self.document.doc_w) % 1.0,
+                    max(0.0, min(1.0, (source_y + 0.5) / self.document.doc_h)),
                 )
             else:
                 destination_x, destination_y = self.uv_to_image(*uv)
                 source_x = destination_x + self.app.clone_offset[0]
                 source_y = destination_y + self.app.clone_offset[1]
                 source_uv = (
-                    ((source_x + 0.5) / self.texture.width) % 1.0,
-                    max(0.0, min(1.0,
-                        (source_y + 0.5) / self.texture.height)),
+                    ((source_x + 0.5) / self.document.doc_w) % 1.0,
+                    max(0.0, min(1.0, (source_y + 0.5) / self.document.doc_h)),
                 )
             self.draw_spherical_outline(source_uv, "black", "#00ff80")
 
     def draw_spherical_outline(self, uv, outer_color, inner_color):
         """Project one brush-sized geodesic outline onto the visible globe."""
         radius = max(0.5, int(self.app.size_var.get()) / 2)
-        angular_radius = (2 * np.pi * radius) / self.texture.width
+        angular_radius = (2 * np.pi * radius) / self.document.doc_w
         center = uv_to_vec((1.0 - uv[0]) % 1.0, uv[1])
-        boundary = spherical_brush_points(
-            center, angular_radius, rings=1, segments=64)[1:]
+        boundary = spherical_brush_points(center, angular_radius, rings=1, segments=64)[1:]
         projected = []
         cx, cy = self.display_center
         for point in boundary:
             point = apply_globe_rotation(point, self.yaw, self.pitch)
-            projected.append((
-                cx + point.x * self.display_radius,
-                cy - point.y * self.display_radius,
-                point.z >= 0.0,
-            ))
+            projected.append(
+                (
+                    cx + point.x * self.display_radius,
+                    cy - point.y * self.display_radius,
+                    point.z >= 0.0,
+                )
+            )
 
         # Draw only front-facing boundary segments.  The outline therefore
         # stops naturally at the globe silhouette instead of showing through.
@@ -443,104 +406,27 @@ class GlobeView(tk.Frame):
             following = projected[(index + 1) % len(projected)]
             if not (current[2] and following[2]):
                 continue
-            coordinates = (current[0], current[1],
-                           following[0], following[1])
+            coordinates = (current[0], current[1], following[0], following[1])
             self.canvas.create_line(
-                *coordinates, fill=outer_color, width=3,
-                tags=("overlay", "brush_cursor"))
+                *coordinates, fill=outer_color, width=3, tags=("overlay", "brush_cursor")
+            )
             self.canvas.create_line(
-                *coordinates, fill=inner_color, width=1,
-                tags=("overlay", "brush_cursor"))
+                *coordinates, fill=inner_color, width=1, tags=("overlay", "brush_cursor")
+            )
 
     # --------------------------------------------------
 
     def render_numpy(self):
-
-        tex = self.texture_array
-
-        h, w = self.lookup_mask.shape
-
-        # Match the canvas background outside the sphere.  Transparent pixels
-        # on the sphere are composited over a screen-anchored checkerboard
-        # below, rather than being confused with the area around the globe.
-        out = np.empty((h, w, 3), dtype=np.uint8)
-        out[...] = (48, 48, 48)
-
-        # This array is only read below.  Copying the full screen-sized normal
-        # map for every frame was a substantial allocation during painting.
-        normals = self.lookup_normals
-
-        #
-        # Rotate globe
-        #
-
-        yaw = self.yaw
-        pitch = self.pitch
-
-        cy = np.cos(yaw)
-        sy = np.sin(yaw)
-
-        cp = np.cos(pitch)
-        sp = np.sin(pitch)
-
-        x = normals[...,0]
-        y = normals[...,1]
-        z = normals[...,2]
-
-        tw = tex.shape[1]
-        th = tex.shape[0]
-        projection_key = (self.yaw, self.pitch, tw, th,
-                          self.lookup_mask.shape)
-        if projection_key != self.projection_key:
-            # Map screen normals back into texture space.  These coordinates
-            # remain valid across paint frames until rotation or size changes.
-            yy = cp*y + sp*z
-            zz = -sp*y + cp*z
-            xr = cy*x - sy*zz
-            zr = sy*x + cy*zz
-            lon = np.arctan2(zr, xr)
-            lat = np.arcsin(np.clip(yy, -1.0, 1.0))
-            u = (1.0 - (lon + np.pi) / (2*np.pi)) % 1.0
-            v = 0.5 - lat / np.pi
-            self.projected_tx = (u * tw).astype(np.int32) % tw
-            self.projected_ty = np.clip(
-                (v * (th-1)).astype(np.int32), 0, th-1)
-            self.projection_key = projection_key
-
-        tx = self.projected_tx
-        ty = self.projected_ty
-
-        mask = self.lookup_mask
-
-        sampled = tex[ty[mask], tx[mask]]
-
-        if sampled.shape[1] >= 4:
-            # Evaluate the pattern in canvas/screen coordinates.  Its squares
-            # therefore retain their pixel size and phase while the globe is
-            # zoomed or otherwise moved relative to the document texture.
-            display_w, display_h = self.render_display_size
-            origin_x, origin_y = self.render_origin
-            screen_x = origin_x + (np.arange(w) + 0.5) * (display_w / w)
-            screen_y = origin_y + (np.arange(h) + 0.5) * (display_h / h)
-            checker_parity = (
-                (screen_y[:, None] // self.app.checker_size).astype(np.int32)
-                + (screen_x[None, :] // self.app.checker_size).astype(np.int32)
-            ) & 1
-            light = np.asarray(self.app.checker_light[:3], dtype=np.uint8)
-            dark = np.asarray(self.app.checker_dark[:3], dtype=np.uint8)
-            checker = np.where(checker_parity[..., None] == 0, light, dark)
-
-            alpha = sampled[:, 3:4].astype(np.uint16)
-            source_rgb = sampled[:, :3].astype(np.uint16)
-            checker_rgb = checker[mask].astype(np.uint16)
-            out[mask] = (
-                (source_rgb * alpha + checker_rgb * (255 - alpha) + 127)
-                // 255
-            ).astype(np.uint8)
-        else:
-            out[mask] = sampled[:, :3]
-
-        return out
+        return self.projection.render(
+            self.texture_array,
+            self.lookup_normals,
+            self.lookup_mask,
+            self.yaw,
+            self.pitch,
+            self.render_display_size,
+            self.render_origin,
+            self.checker_style,
+        )
 
     # --------------------------------------------------
 
@@ -571,25 +457,16 @@ class GlobeView(tk.Frame):
         # Normal in viewer space.
         #
 
-        normal = Vec3(
-            float(dx),
-            float(-dy),
-            float(np.sqrt(max(0.0, 1.0 - r2)))
-        )
+        normal = Vec3(float(dx), float(-dy), float(np.sqrt(max(0.0, 1.0 - r2))))
 
         #
         # Undo globe rotation.
         #
 
-        normal = remove_globe_rotation(
-            normal,
-            self.yaw,
-            self.pitch
-        )
+        normal = remove_globe_rotation(normal, self.yaw, self.pitch)
 
         u, v = vec_to_uv(normal)
         return ((1.0 - u) % 1.0, v)
-
 
     # --------------------------------------------------
 
@@ -598,13 +475,10 @@ class GlobeView(tk.Frame):
         if self.texture is None:
             return None
 
-        w = self.texture.width
-        h = self.texture.height
+        w = self.document.doc_w
+        h = self.document.doc_h
 
-        return (
-            int((u % 1.0) * w),
-            max(0, min(h - 1, int(v * h)))
-        )
+        return (int((u % 1.0) * w), max(0, min(h - 1, int(v * h))))
 
     # --------------------------------------------------
 
@@ -637,8 +511,7 @@ class GlobeView(tk.Frame):
         display_h = max(2, bottom - top)
 
         if self.interactive_render:
-            scale = min(1.0, self.INTERACTIVE_RENDER_SIZE /
-                        max(display_w, display_h))
+            scale = min(1.0, self.INTERACTIVE_RENDER_SIZE / max(display_w, display_h))
         else:
             scale = 1.0
         render_w = max(2, int(display_w * scale))
@@ -678,11 +551,7 @@ class GlobeView(tk.Frame):
         normals[..., 1] = -dy
         normals[..., 2] = dz
 
-        length = np.linalg.norm(
-            normals,
-            axis=2,
-            keepdims=True
-        )
+        length = np.linalg.norm(normals, axis=2, keepdims=True)
 
         length[length == 0] = 1.0
 
@@ -716,7 +585,6 @@ class GlobeView(tk.Frame):
         elif self.app.tool == "clone" and self.painting:
             self.clone_from_mouse(event.x, event.y)
         elif self.painting:
-
             if self.vector_start_screen is not None:
                 self.last_mouse = (event.x, event.y)
             else:
@@ -768,8 +636,7 @@ class GlobeView(tk.Frame):
             ix, iy = self.uv_to_image(*uv)
             if event.state & 0x4:
                 self.app.set_external_clone_source(ix, iy)
-                self.clone_source_vector = uv_to_vec(
-                    (1.0 - uv[0]) % 1.0, uv[1])
+                self.clone_source_vector = uv_to_vec((1.0 - uv[0]) % 1.0, uv[1])
                 self.clone_rotation = None
                 self.draw_brush_cursor()
                 return
@@ -782,8 +649,7 @@ class GlobeView(tk.Frame):
             # point whenever the user clicked again.
             if self.clone_rotation is None:
                 destination = uv_to_vec((1.0 - uv[0]) % 1.0, uv[1])
-                self.clone_rotation = self.rotation_between(
-                    destination, self.clone_source_vector)
+                self.clone_rotation = self.rotation_between(destination, self.clone_source_vector)
             self.update_globe_clone_offset(uv)
             self.paint_button = button
             self.painting = self.app.begin_external_clone(ix, iy, button)
@@ -822,8 +688,9 @@ class GlobeView(tk.Frame):
             self.last_uv = None
             return
         if self.vector_start_screen is not None:
-            self.finish_globe_vector(self.vector_start_screen,
-                                     self.last_mouse or self.vector_start_screen)
+            self.finish_globe_vector(
+                self.vector_start_screen, self.last_mouse or self.vector_start_screen
+            )
             self.vector_start_screen = None
             self.painting = False
             self.last_mouse = None
@@ -868,11 +735,8 @@ class GlobeView(tk.Frame):
             axis /= np.linalg.norm(axis)
             return 2.0 * np.outer(axis, axis) - np.identity(3)
         kx, ky, kz = cross
-        skew = np.array(((0.0, -kz, ky),
-                         (kz, 0.0, -kx),
-                         (-ky, kx, 0.0)))
-        return (np.identity(3) + skew +
-                skew @ skew * ((1.0 - cosine) / (sine * sine)))
+        skew = np.array(((0.0, -kz, ky), (kz, 0.0, -kx), (-ky, kx, 0.0)))
+        return np.identity(3) + skew + skew @ skew * ((1.0 - cosine) / (sine * sine))
 
     def update_globe_clone_offset(self, destination_uv):
         """Set the flat raster offset from the globe-relative clone mapping."""
@@ -882,17 +746,15 @@ class GlobeView(tk.Frame):
         destination_x, destination_y = self.uv_to_image(*destination_uv)
         source_x, source_y = self.uv_to_image(*source_uv)
         offset_x = source_x - destination_x
-        if offset_x > self.texture.width / 2:
-            offset_x -= self.texture.width
-        elif offset_x < -self.texture.width / 2:
-            offset_x += self.texture.width
+        if offset_x > self.document.doc_w / 2:
+            offset_x -= self.document.doc_w
+        elif offset_x < -self.document.doc_w / 2:
+            offset_x += self.document.doc_w
         self.app.clone_offset = (offset_x, source_y - destination_y)
 
     def globe_clone_source_uv(self, destination_uv):
-        destination = uv_to_vec(
-            (1.0 - destination_uv[0]) % 1.0, destination_uv[1])
-        source_array = self.clone_rotation @ np.array(
-            (destination.x, destination.y, destination.z))
+        destination = uv_to_vec((1.0 - destination_uv[0]) % 1.0, destination_uv[1])
+        source_array = self.clone_rotation @ np.array((destination.x, destination.y, destination.z))
         source_u, source_v = vec_to_uv(Vec3(*source_array))
         return ((1.0 - source_u) % 1.0, source_v)
 
@@ -905,10 +767,12 @@ class GlobeView(tk.Frame):
         elif self.app.tool == "rect":
             samples = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
         else:
-            cx, cy = (x1+x2)/2, (y1+y2)/2
-            rx, ry = abs(x2-x1)/2, abs(y2-y1)/2
-            samples = [(cx + rx*np.cos(t), cy + ry*np.sin(t))
-                       for t in np.linspace(0, 2*np.pi, 32, endpoint=False)]
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            rx, ry = abs(x2 - x1) / 2, abs(y2 - y1) / 2
+            samples = [
+                (cx + rx * np.cos(t), cy + ry * np.sin(t))
+                for t in np.linspace(0, 2 * np.pi, 32, endpoint=False)
+            ]
         image_points = []
         for sx, sy in samples:
             uv = self.screen_to_uv(int(sx), int(sy))
@@ -921,10 +785,7 @@ class GlobeView(tk.Frame):
 
         self.rotating = True
 
-        self.last_mouse = (
-            event.x,
-            event.y
-        )
+        self.last_mouse = (event.x, event.y)
 
     def on_middle_drag(self, event):
 
@@ -936,10 +797,7 @@ class GlobeView(tk.Frame):
         dx = event.x - lx
         dy = event.y - ly
 
-        self.last_mouse = (
-            event.x,
-            event.y
-        )
+        self.last_mouse = (event.x, event.y)
         self.cursor_mouse = (event.x, event.y)
 
         # Match wheel rotation while retaining two-axis free rotation as an
@@ -949,10 +807,7 @@ class GlobeView(tk.Frame):
         self.yaw += dx * rotation_speed
 
         limit = np.pi / 2.0 - 0.02
-        self.pitch = max(
-            -limit,
-            min(limit, self.pitch + dy * rotation_speed)
-        )
+        self.pitch = max(-limit, min(limit, self.pitch + dy * rotation_speed))
 
         self._begin_interactive_render()
 
@@ -1001,11 +856,7 @@ class GlobeView(tk.Frame):
         self._begin_interactive_render()
         return "break"
 
-    def begin_external_raster_draw(
-        self,
-        x,
-        y
-    ):
+    def begin_external_raster_draw(self, x, y):
         self.snapshot()
         self.last_x = x
         self.last_y = y
@@ -1023,7 +874,7 @@ class GlobeView(tk.Frame):
             return
 
         radius = max(0.5, int(self.app.size_var.get()) / 2)
-        angular_radius = (2 * np.pi * radius) / self.texture.width
+        angular_radius = (2 * np.pi * radius) / self.document.doc_w
 
         # sphere_math uses the physical longitude direction; the displayed
         # texture is mirrored horizontally, just as it is in render_numpy().
@@ -1045,8 +896,7 @@ class GlobeView(tk.Frame):
             texture_boundary,
             uv,
             angular_radius,
-            edge_padding_uv=(0.5 / self.texture.width,
-                             0.5 / self.texture.height),
+            edge_padding_uv=(0.5 / self.document.doc_w, 0.5 / self.document.doc_h),
         )
 
         center_x, center_y = self.uv_to_image(*uv)
@@ -1060,12 +910,7 @@ class GlobeView(tk.Frame):
 
     # --------------------------------------------------
 
-    def paint_from_mouse(
-        self,
-        x,
-        y,
-        first=False
-    ):
+    def paint_from_mouse(self, x, y, first=False):
         """
         Convert a mouse position into image coordinates
         and forward them to Main.py's existing raster
@@ -1100,7 +945,7 @@ class GlobeView(tk.Frame):
         # Continue the stroke along the sphere.
         #
 
-        from sphere_math import arc_to_uv
+        from pypaint.sphere import arc_to_uv
 
         # last_uv / uv are texture coordinates, whose U axis is mirrored
         # relative to sphere_math's physical longitude coordinate.
@@ -1111,15 +956,13 @@ class GlobeView(tk.Frame):
         # fixed quarter-degree step oversampled ordinary brushes heavily,
         # creating many redundant PIL stamps for a single mouse event.
         radius = max(0.5, int(self.app.size_var.get()) / 2)
-        spacing = max(
-            1, radius * 2 * self.app.brush_spacing() / 100)
-        step_radians = (2 * np.pi * spacing) / self.texture.width
+        spacing = max(1, radius * 2 * self.app.brush_spacing() / 100)
+        step_radians = (2 * np.pi * spacing) / self.document.doc_w
         samples = arc_to_uv(start, end, step_radians=step_radians)
 
         # The first sample is the previous event's endpoint, which has already
         # been painted.  Skipping it avoids an extra seam-wrapped stamp.
         for su, sv in samples[1:]:
-
             su = (1.0 - su) % 1.0
 
             # Stamp each spherical sample independently.  Connecting their

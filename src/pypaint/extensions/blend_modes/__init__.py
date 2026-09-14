@@ -1,10 +1,13 @@
 """Discoverable layer blend modes and their shared alpha compositor."""
 
+import logging
 from importlib import import_module
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
+
+FAILED_MODES = {}
 
 
 def _load_modes():
@@ -15,14 +18,28 @@ def _load_modes():
         "xor": 2,
         "set_brightness": 3,
     }
-    paths = sorted(Path(__file__).parent.glob("*.py"),
-                   key=lambda path: (preferred_order.get(path.stem, 100),
-                                     path.stem))
+    paths = sorted(
+        Path(__file__).parent.glob("*.py"),
+        key=lambda path: (preferred_order.get(path.stem, 100), path.stem),
+    )
     for path in paths:
         if path.stem.startswith("_"):
             continue
-        module = import_module(f"{__name__}.{path.stem}")
-        modes[str(module.ID).strip().lower()] = module
+        try:
+            module = import_module(f"{__name__}.{path.stem}")
+            identifier = str(module.ID).strip().lower()
+            if (
+                not identifier
+                or identifier in modes
+                or not isinstance(module.LABEL, str)
+                or not callable(module.blend_rgb)
+                or getattr(module, "API_VERSION", 1) != 1
+            ):
+                raise ValueError(f"Invalid or duplicate blend mode: {identifier}")
+            modes[identifier] = module
+        except Exception as error:
+            FAILED_MODES[path.stem] = str(error)
+            logging.getLogger(__name__).warning("Unavailable blend mode %s: %s", path.stem, error)
     if "normal" not in modes:
         raise RuntimeError("The required Normal blend mode is missing")
     return modes
@@ -37,11 +54,17 @@ def mode_labels():
 
 def normalize_mode(mode):
     mode = str(mode).lower()
-    return mode if mode in MODES else "normal"
+    if mode not in MODES:
+        raise ValueError(f"Unavailable blend mode: {mode}")
+    return mode
 
 
 def composite(backdrop, source, mode="normal"):
     """Composite an RGBA source over a same-sized RGBA backdrop."""
+    if hasattr(backdrop, "materialize"):
+        backdrop = backdrop.materialize()
+    if hasattr(source, "materialize"):
+        source = source.materialize()
     mode = normalize_mode(mode)
     if mode == "normal":
         result = backdrop.copy()
@@ -56,8 +79,7 @@ def composite(backdrop, source, mode="normal"):
         return backdrop.copy()
     if source_bounds != (0, 0, source.width, source.height):
         result = backdrop.copy()
-        blended_region = composite(
-            backdrop.crop(source_bounds), source.crop(source_bounds), mode)
+        blended_region = composite(backdrop.crop(source_bounds), source.crop(source_bounds), mode)
         result.paste(blended_region, source_bounds)
         return result
 
@@ -67,11 +89,11 @@ def composite(backdrop, source, mode="normal"):
     cs, source_alpha = foreground[..., :3], foreground[..., 3:4]
     blended = MODES[mode].blend_rgb(cb, cs)
     alpha = source_alpha + ab * (1.0 - source_alpha)
-    premultiplied = (source_alpha * (1.0 - ab) * cs
-                     + ab * (1.0 - source_alpha) * cb
-                     + source_alpha * ab * blended)
-    rgb = np.divide(premultiplied, alpha, out=np.zeros_like(premultiplied),
-                    where=alpha > 0)
+    premultiplied = (
+        source_alpha * (1.0 - ab) * cs
+        + ab * (1.0 - source_alpha) * cb
+        + source_alpha * ab * blended
+    )
+    rgb = np.divide(premultiplied, alpha, out=np.zeros_like(premultiplied), where=alpha > 0)
     pixels = np.concatenate((rgb, alpha), axis=2)
-    return Image.fromarray(np.uint8(np.clip(pixels * 255.0 + 0.5, 0, 255)),
-                           "RGBA")
+    return Image.fromarray(np.uint8(np.clip(pixels * 255.0 + 0.5, 0, 255)), "RGBA")

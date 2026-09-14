@@ -35,8 +35,8 @@ Part 2 will add:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 
 EPSILON = 1e-9
 TAU = math.pi * 2.0
@@ -46,6 +46,7 @@ TAU = math.pi * 2.0
 # Vector
 # --------------------------------------------------------------------
 
+
 @dataclass(slots=True)
 class Vec3:
     x: float
@@ -53,40 +54,24 @@ class Vec3:
     z: float
 
     def __add__(self, other):
-        return Vec3(
-            self.x + other.x,
-            self.y + other.y,
-            self.z + other.z
-        )
+        return Vec3(self.x + other.x, self.y + other.y, self.z + other.z)
 
     def __sub__(self, other):
-        return Vec3(
-            self.x - other.x,
-            self.y - other.y,
-            self.z - other.z
-        )
+        return Vec3(self.x - other.x, self.y - other.y, self.z - other.z)
 
     def __mul__(self, scalar: float):
-        return Vec3(
-            self.x * scalar,
-            self.y * scalar,
-            self.z * scalar
-        )
+        return Vec3(self.x * scalar, self.y * scalar, self.z * scalar)
 
     __rmul__ = __mul__
 
     def dot(self, other) -> float:
-        return (
-            self.x * other.x +
-            self.y * other.y +
-            self.z * other.z
-        )
+        return self.x * other.x + self.y * other.y + self.z * other.z
 
     def cross(self, other):
         return Vec3(
             self.y * other.z - self.z * other.y,
             self.z * other.x - self.x * other.z,
-            self.x * other.y - self.y * other.x
+            self.x * other.y - self.y * other.x,
         )
 
     def length(self) -> float:
@@ -98,16 +83,13 @@ class Vec3:
         if l < EPSILON:
             return Vec3(0.0, 0.0, 0.0)
 
-        return Vec3(
-            self.x / l,
-            self.y / l,
-            self.z / l
-        )
+        return Vec3(self.x / l, self.y / l, self.z / l)
 
 
 # --------------------------------------------------------------------
 # Clamp / wrapping helpers
 # --------------------------------------------------------------------
+
 
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
@@ -138,6 +120,7 @@ def wrap_angle(theta):
 # Sphere <-> latitude / longitude
 # --------------------------------------------------------------------
 
+
 def latlon_to_vec(latitude, longitude):
     """
     latitude:
@@ -150,11 +133,7 @@ def latlon_to_vec(latitude, longitude):
 
     clat = math.cos(latitude)
 
-    return Vec3(
-        clat * math.cos(longitude),
-        math.sin(latitude),
-        clat * math.sin(longitude)
-    )
+    return Vec3(clat * math.cos(longitude), math.sin(latitude), clat * math.sin(longitude))
 
 
 def vec_to_latlon(v: Vec3):
@@ -169,10 +148,7 @@ def vec_to_latlon(v: Vec3):
 
     latitude = math.asin(clamp(v.y, -1.0, 1.0))
 
-    longitude = math.atan2(
-        v.z,
-        v.x
-    )
+    longitude = math.atan2(v.z, v.x)
 
     return latitude, longitude
 
@@ -180,6 +156,7 @@ def vec_to_latlon(v: Vec3):
 # --------------------------------------------------------------------
 # Equirectangular mapping
 # --------------------------------------------------------------------
+
 
 def uv_to_latlon(u, v):
     """
@@ -208,10 +185,7 @@ def latlon_to_uv(latitude, longitude):
 
     v = 0.5 - (latitude / math.pi)
 
-    return (
-        wrap01(u),
-        clamp(v, 0.0, 1.0)
-    )
+    return (wrap01(u), clamp(v, 0.0, 1.0))
 
 
 def uv_to_vec(u, v):
@@ -228,49 +202,35 @@ def vec_to_uv(v):
 # Image coordinate conversions
 # --------------------------------------------------------------------
 
+
 def image_to_uv(x, y, width, height):
 
-    return (
-        x / width,
-        y / height
-    )
+    return (x / width, y / height)
 
 
 def uv_to_image(u, v, width, height):
 
-    return (
-        u * width,
-        v * height
-    )
+    return (u * width, v * height)
 
 
 def image_to_vec(x, y, width, height):
 
-    return uv_to_vec(
-        x / width,
-        y / height
-    )
+    return uv_to_vec(x / width, y / height)
 
 
 def vec_to_image(v, width, height):
 
     u, vv = vec_to_uv(v)
 
-    return (
-        u * width,
-        vv * height
-    )
+    return (u * width, vv * height)
 
 
 # --------------------------------------------------------------------
 # Ray / sphere
 # --------------------------------------------------------------------
 
-def ray_sphere_intersection(
-    origin: Vec3,
-    direction: Vec3,
-    radius=1.0
-):
+
+def ray_sphere_intersection(origin: Vec3, direction: Vec3, radius=1.0):
     """
     Returns the nearest hit point on the sphere.
 
@@ -311,12 +271,8 @@ def ray_sphere_intersection(
 # Camera helpers
 # --------------------------------------------------------------------
 
-def screen_to_ndc(
-    px,
-    py,
-    width,
-    height
-):
+
+def screen_to_ndc(px, py, width, height):
     """
     Convert screen pixel into normalized device coordinates.
 
@@ -326,24 +282,14 @@ def screen_to_ndc(
         y in [-1,+1]
     """
 
-    x = (
-        (px + 0.5) / width
-    ) * 2.0 - 1.0
+    x = ((px + 0.5) / width) * 2.0 - 1.0
 
-    y = 1.0 - (
-        (py + 0.5) / height
-    ) * 2.0
+    y = 1.0 - ((py + 0.5) / height) * 2.0
 
     return x, y
 
 
-def make_camera_ray(
-    px,
-    py,
-    width,
-    height,
-    fov_deg=45.0
-):
+def make_camera_ray(px, py, width, height, fov_deg=45.0):
     """
     Camera is assumed to sit at
 
@@ -354,32 +300,23 @@ def make_camera_ray(
     Globe window can rotate this ray later.
     """
 
-    x, y = screen_to_ndc(
-        px,
-        py,
-        width,
-        height
-    )
+    x, y = screen_to_ndc(px, py, width, height)
 
     aspect = width / height
 
-    scale = math.tan(
-        math.radians(fov_deg) * 0.5
-    )
+    scale = math.tan(math.radians(fov_deg) * 0.5)
 
     dx = x * aspect * scale
     dy = y * scale
     dz = -1.0
 
-    return Vec3(
-        dx,
-        dy,
-        dz
-    ).normalized()
+    return Vec3(dx, dy, dz).normalized()
+
 
 # --------------------------------------------------------------------
 # Rotation helpers
 # --------------------------------------------------------------------
+
 
 def rotate_x(v: Vec3, angle: float) -> Vec3:
     """Rotate a vector around +X."""
@@ -421,6 +358,7 @@ def rotate_z(v: Vec3, angle: float) -> Vec3:
 # Globe orientation
 # --------------------------------------------------------------------
 
+
 def apply_globe_rotation(v: Vec3, yaw=0.0, pitch=0.0):
     """
     Rotate the globe.
@@ -428,25 +366,20 @@ def apply_globe_rotation(v: Vec3, yaw=0.0, pitch=0.0):
     Positive yaw spins east-west.
     Positive pitch tips the north pole upward.
     """
-    return rotate_x(
-        rotate_y(v, yaw),
-        pitch
-    )
+    return rotate_x(rotate_y(v, yaw), pitch)
 
 
 def remove_globe_rotation(v: Vec3, yaw=0.0, pitch=0.0):
     """
     Inverse of apply_globe_rotation().
     """
-    return rotate_y(
-        rotate_x(v, -pitch),
-        -yaw
-    )
+    return rotate_y(rotate_x(v, -pitch), -yaw)
 
 
 # --------------------------------------------------------------------
 # Visibility
 # --------------------------------------------------------------------
+
 
 def is_front_facing(v: Vec3):
     """
@@ -461,17 +394,12 @@ def is_front_facing(v: Vec3):
 # Angular distances
 # --------------------------------------------------------------------
 
+
 def angular_distance(a: Vec3, b: Vec3):
     """
     Great-circle distance in radians.
     """
-    d = clamp(
-        a.normalized().dot(
-            b.normalized()
-        ),
-        -1.0,
-        1.0
-    )
+    d = clamp(a.normalized().dot(b.normalized()), -1.0, 1.0)
 
     return math.acos(d)
 
@@ -479,6 +407,7 @@ def angular_distance(a: Vec3, b: Vec3):
 # --------------------------------------------------------------------
 # Great-circle interpolation
 # --------------------------------------------------------------------
+
 
 def slerp(a: Vec3, b: Vec3, t: float):
     """
@@ -491,10 +420,7 @@ def slerp(a: Vec3, b: Vec3, t: float):
     dot = clamp(a.dot(b), -1.0, 1.0)
 
     if dot > 0.9999:
-        return (
-            a * (1.0 - t) +
-            b * t
-        ).normalized()
+        return (a * (1.0 - t) + b * t).normalized()
 
     theta = math.acos(dot)
 
@@ -503,21 +429,15 @@ def slerp(a: Vec3, b: Vec3, t: float):
     wa = math.sin((1.0 - t) * theta) / s
     wb = math.sin(t * theta) / s
 
-    return (
-        a * wa +
-        b * wb
-    ).normalized()
+    return (a * wa + b * wb).normalized()
 
 
 # --------------------------------------------------------------------
 # Stroke sampling
 # --------------------------------------------------------------------
 
-def sample_arc(
-    start: Vec3,
-    end: Vec3,
-    step_radians=math.radians(0.25)
-):
+
+def sample_arc(start: Vec3, end: Vec3, step_radians=math.radians(0.25)):
     """
     Sample evenly along the shortest path on the sphere.
     """
@@ -530,18 +450,13 @@ def sample_arc(
     # One segment is enough when the endpoints are already closer than the
     # requested brush spacing.  Callers commonly retain the previous endpoint,
     # so forcing two segments merely produces a redundant midpoint stamp.
-    count = max(
-        1,
-        int(math.ceil(angle / step_radians))
-    )
+    count = max(1, int(math.ceil(angle / step_radians)))
 
     pts = []
 
     for i in range(count + 1):
         t = i / count
-        pts.append(
-            slerp(start, end, t)
-        )
+        pts.append(slerp(start, end, t))
 
     return pts
 
@@ -549,6 +464,7 @@ def sample_arc(
 # --------------------------------------------------------------------
 # Seam helpers
 # --------------------------------------------------------------------
+
 
 def unwrap_u(u0, u1):
     """
@@ -585,27 +501,19 @@ def wrap_image_x(x, width):
 # UV stroke conversion
 # --------------------------------------------------------------------
 
-def arc_to_uv(
-    start: Vec3,
-    end: Vec3,
-    step_radians=math.radians(0.25)
-):
+
+def arc_to_uv(start: Vec3, end: Vec3, step_radians=math.radians(0.25)):
     """
     Convert a spherical stroke into UV samples.
     """
 
-    pts = sample_arc(
-        start,
-        end,
-        step_radians
-    )
+    pts = sample_arc(start, end, step_radians)
 
     out = []
 
     prev_u = None
 
     for p in pts:
-
         u, v = vec_to_uv(p)
 
         if prev_u is not None:
@@ -621,12 +529,8 @@ def arc_to_uv(
 # Brush footprint
 # --------------------------------------------------------------------
 
-def spherical_brush_points(
-    center: Vec3,
-    angular_radius,
-    rings=5,
-    segments=32
-):
+
+def spherical_brush_points(center: Vec3, angular_radius, rings=5, segments=32):
     """
     Generate sample points inside a circular brush on
     the sphere.
@@ -647,25 +551,17 @@ def spherical_brush_points(
     pts = [center]
 
     for r in range(1, rings + 1):
-
         rr = angular_radius * (r / rings)
 
         sinr = math.sin(rr)
         cosr = math.cos(rr)
 
         for i in range(segments):
-
             a = TAU * i / segments
 
-            direction = (
-                tangent * math.cos(a) +
-                bitangent * math.sin(a)
-            )
+            direction = tangent * math.cos(a) + bitangent * math.sin(a)
 
-            p = (
-                center * cosr +
-                direction * sinr
-            ).normalized()
+            p = (center * cosr + direction * sinr).normalized()
 
             pts.append(p)
 
@@ -676,31 +572,18 @@ def spherical_brush_points(
 # Brush conversion
 # --------------------------------------------------------------------
 
-def spherical_brush_uv(
-    center: Vec3,
-    angular_radius,
-    rings=5,
-    segments=32
-):
+
+def spherical_brush_uv(center: Vec3, angular_radius, rings=5, segments=32):
     """
     Convenience wrapper.
 
     Returns UV coordinates for every sample point.
     """
 
-    return [
-        vec_to_uv(v)
-        for v in spherical_brush_points(
-            center,
-            angular_radius,
-            rings,
-            segments
-        )
-    ]
+    return [vec_to_uv(v) for v in spherical_brush_points(center, angular_radius, rings, segments)]
 
 
-def close_equirectangular_brush(boundary_uv, center_uv, angular_radius,
-                                edge_padding_uv=(0.0, 0.0)):
+def close_equirectangular_brush(boundary_uv, center_uv, angular_radius, edge_padding_uv=(0.0, 0.0)):
     """Return a seam-safe polygon for a spherical brush boundary.
 
     A spherical disc that contains a pole maps to a polar cap, not an
@@ -720,10 +603,7 @@ def close_equirectangular_brush(boundary_uv, center_uv, angular_radius,
         pole_v = 1.0
 
     if pole_v is None:
-        return [
-            (center_u + ((u - center_u + 0.5) % 1.0 - 0.5), v)
-            for u, v in boundary_uv
-        ]
+        return [(center_u + ((u - center_u + 0.5) % 1.0 - 0.5), v) for u, v in boundary_uv]
 
     # Keep successive boundary vertices continuous while they wind around the
     # pole.  Relative-to-centre unwrapping would insert a jump halfway around.
@@ -744,11 +624,10 @@ def close_equirectangular_brush(boundary_uv, center_uv, angular_radius,
     padding_u, padding_v = edge_padding_uv
     padded_closing_u = closing_u + winding * padding_u
     padded_first_u = first_u - winding * padding_u
-    padded_pole_v = (-padding_v if pole_v == 0.0
-                     else 1.0 + padding_v)
-    polygon.extend(((closing_u, first_v),
-                    (padded_closing_u, padded_pole_v),
-                    (padded_first_u, padded_pole_v)))
+    padded_pole_v = -padding_v if pole_v == 0.0 else 1.0 + padding_v
+    polygon.extend(
+        ((closing_u, first_v), (padded_closing_u, padded_pole_v), (padded_first_u, padded_pole_v))
+    )
 
     # Longitude at a pole is arbitrary, and the tangent basis can place this
     # unwrapped turn one texture too far from the brush centre.  Keep it near
@@ -764,10 +643,8 @@ def close_equirectangular_brush(boundary_uv, center_uv, angular_radius,
 # Picking
 # --------------------------------------------------------------------
 
-def pick_uv(
-    ray_origin: Vec3,
-    ray_direction: Vec3
-):
+
+def pick_uv(ray_origin: Vec3, ray_direction: Vec3):
     """
     Cast a ray at the globe.
 
@@ -780,10 +657,7 @@ def pick_uv(
         None
     """
 
-    hit = ray_sphere_intersection(
-        ray_origin,
-        ray_direction
-    )
+    hit = ray_sphere_intersection(ray_origin, ray_direction)
 
     if hit is None:
         return None

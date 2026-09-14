@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pypaint-desktop"
+version = "0.3.0"
+description = "Raster and editable vector painting with flat and globe views"
+requires-python = ">=3.12,<3.13"
+dependencies = ["Pillow==12.3.0", "numpy==2.3.5"]
+
+[project.scripts]
+pypaint = "pypaint.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+pypaint = ["resources/icons/*.png", "resources/shortcuts.txt"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["F"]
+ignore = ["F401", "F403", "F405"]

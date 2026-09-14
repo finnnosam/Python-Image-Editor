@@ -2,16 +2,15 @@
 
 import numpy as np
 
-
 ID = "set_brightness"
 LABEL = "Push Brightness"
 
 _NEUTRAL = np.float32(128.0 / 255.0)
 
+
 def _luminance(rgb):
     # Spell this out to avoid allocating an extra RGB-sized product array.
-    return (rgb[..., 0:1] * 0.2126 + rgb[..., 1:2] * 0.7152
-            + rgb[..., 2:3] * 0.0722)
+    return rgb[..., 0:1] * 0.2126 + rgb[..., 1:2] * 0.7152 + rgb[..., 2:3] * 0.0722
 
 
 def blend_rgb(backdrop, source):
