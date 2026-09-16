@@ -4451,7 +4451,12 @@ class PaintApp:
         mask_strength = opacity
         if build_up:
             flow = self.clone_flow() / 100.0
-            spacing_fraction = min(1.0, self.clone_spacing() / 100.0)
+            diameter = radius * 2
+            # Keep the default two-pixel brush as the flow reference. Larger
+            # stamps cover a pixel for more travel, so taper each dab instead
+            # of allowing brush area to make them reach the opacity cap sooner.
+            size_weight = min(1.0, 2.0 / diameter)
+            spacing_fraction = min(1.0, self.clone_spacing() / 100.0 * size_weight)
             mask_strength = round((1.0 - ((1.0 - flow) ** spacing_fraction)) * 255)
             if flow > 0:
                 mask_strength = max(1, mask_strength)
@@ -5103,10 +5108,12 @@ class PaintApp:
             # Neighboring dabs overlap heavily at normal brush spacing. If
             # every dab used the full selected flow, a single pass at the
             # default 12.5% spacing would apply it about eight times. Convert
-            # the flow value to a per-dab value so one brush-width of travel
-            # lands near the requested strength while repeated passes still
-            # build up naturally.
-            spacing_fraction = min(1.0, self.brush_spacing() / 100.0)
+            # the flow value to a per-dab value. Use the default two-pixel
+            # brush as the response reference, then taper larger brushes so
+            # their wider footprint does not hit the opacity cap too quickly.
+            diameter = radius * 2
+            size_weight = min(1.0, 2.0 / diameter)
+            spacing_fraction = min(1.0, self.brush_spacing() / 100.0 * size_weight)
             normalized = 1.0 - ((1.0 - dab_opacity / 255.0) ** spacing_fraction)
             dab_opacity = max(1, round(normalized * 255))
         dabs = []
