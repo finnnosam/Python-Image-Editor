@@ -15,8 +15,10 @@ def _load_modes():
     preferred_order = {
         "normal": 0,
         "multiply": 1,
-        "xor": 2,
-        "set_brightness": 3,
+        "screen": 2,
+        "push_brightness": 3,
+        "xor": 4,
+
     }
     paths = sorted(
         Path(__file__).parent.glob("*.py"),

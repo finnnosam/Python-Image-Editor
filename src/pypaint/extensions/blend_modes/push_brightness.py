@@ -2,7 +2,7 @@
 
 import numpy as np
 
-ID = "set_brightness"
+ID = "push_brightness"
 LABEL = "Push Brightness"
 
 _NEUTRAL = np.float32(128.0 / 255.0)

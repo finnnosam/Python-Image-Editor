@@ -51,6 +51,8 @@ from pypaint.platform import resource, shortcuts_path
 from pypaint.rendering import render_vector_object
 from pypaint.tools import (
     _apply_hardness_to_alpha,
+    _accumulate_build_up_mask,
+    _build_up_opacity,
     _brush_ellipse_box,
     _brush_shape_mask,
     _composite_brush_shape,
@@ -4972,6 +4974,8 @@ class PaintApp:
         hardness = self.brush_hardness()
         build_up = self._stroke_base_image is None
         dab_opacity = self.primary_opacity if self.last_button == 1 else self.secondary_opacity
+        if build_up:
+            dab_opacity = _build_up_opacity(dab_opacity)
         if build_up and 0 < dab_opacity < 255:
             # Neighboring dabs overlap heavily at normal brush spacing. If
             # every dab used the full selected opacity, a single pass at the
@@ -5091,7 +5095,11 @@ class PaintApp:
             existing = combined.crop(
                 (offset[0], offset[1], offset[0] + mask.width, offset[1] + mask.height)
             )
-            merged = ImageChops.screen(existing, mask) if build_up else mask_lighter(existing, mask)
+            merged = (
+                _accumulate_build_up_mask(existing, mask)
+                if build_up
+                else mask_lighter(existing, mask)
+            )
             combined.paste(merged, offset)
 
         if self.tool == "eraser":
@@ -5121,7 +5129,10 @@ class PaintApp:
             source_color = color[:7] if build_up else color
             source = Image.new("RGBA", paint_mask.size, source_color)
             source.putalpha(mask_multiply(source.getchannel("A"), paint_mask))
+            existing_alpha = result.getchannel("A") if build_up else None
             result.alpha_composite(source)
+            if build_up:
+                result.putalpha(_accumulate_build_up_mask(existing_alpha, paint_mask))
 
         self.apply_raster_result(layer, result, union)
         return union

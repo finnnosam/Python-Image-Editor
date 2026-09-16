@@ -4,7 +4,7 @@ import math
 from typing import Protocol
 
 import numpy as np
-from PIL import Image, ImageChops, ImageDraw, ImageFilter
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
 
 from pypaint.history import Transaction
 from pypaint.jobs import Cancellation
@@ -32,6 +32,28 @@ def _apply_hardness_to_alpha(alpha, hardness, softness_scale):
         return alpha.point(lambda value: 255 if value >= 128 else 0)
     exponent = 1 / (1 + 3 * (hardness - 75) / 25)
     return alpha.point(lambda value: round(255 * ((value / 255) ** exponent)))
+
+
+def _build_up_opacity(opacity):
+    """Apply a gentler response curve to build-up brush opacity."""
+    opacity = max(0, min(255, int(opacity)))
+    if opacity == 0:
+        return 0
+    return max(1, round(255 * ((opacity / 255) ** 3)))
+
+
+def _accumulate_build_up_mask(existing, dab):
+    """Screen a dab into coverage without an 8-bit rounding ceiling."""
+    merged = ImageChops.screen(existing, dab)
+    stalled = ImageChops.difference(merged, existing).point(
+        lambda value: 255 if value == 0 else 0
+    )
+    stalled = ImageChops.multiply(stalled, dab.point(lambda value: 255 if value else 0))
+    stalled = ImageChops.multiply(
+        stalled, ImageOps.invert(existing).point(lambda value: 255 if value else 0)
+    )
+    stalled = stalled.point(lambda value: 1 if value else 0)
+    return ImageChops.add(merged, stalled)
 
 
 def _brush_shape_mask(image, bounds, paint_mask, antialias=False, hardness=75, softness_scale=None):
