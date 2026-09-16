@@ -34,14 +34,6 @@ def _apply_hardness_to_alpha(alpha, hardness, softness_scale):
     return alpha.point(lambda value: round(255 * ((value / 255) ** exponent)))
 
 
-def _build_up_opacity(opacity):
-    """Apply a gentler response curve to build-up brush opacity."""
-    opacity = max(0, min(255, int(opacity)))
-    if opacity == 0:
-        return 0
-    return max(1, round(255 * ((opacity / 255) ** 3)))
-
-
 def _accumulate_build_up_mask(existing, dab):
     """Screen a dab into coverage without an 8-bit rounding ceiling."""
     merged = ImageChops.screen(existing, dab)

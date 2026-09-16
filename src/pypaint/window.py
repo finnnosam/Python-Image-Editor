@@ -52,7 +52,6 @@ from pypaint.rendering import render_vector_object
 from pypaint.tools import (
     _apply_hardness_to_alpha,
     _accumulate_build_up_mask,
-    _build_up_opacity,
     _brush_ellipse_box,
     _brush_shape_mask,
     _composite_brush_shape,
@@ -191,6 +190,8 @@ class PaintApp:
         self.secondary_opacity = 255
         self._stroke_base_image = None
         self._stroke_coverage = None
+        self._build_up_base_image = None
+        self._build_up_coverage = None
         self.active_color_slot = "primary"
         self.picker_hue = 0.0
         self.picker_saturation = 0.0
@@ -521,6 +522,7 @@ class PaintApp:
         self.brush_build_up_var = tk.BooleanVar(value=False)
         self.brush_antialias_var = tk.BooleanVar(value=True)
         self.brush_hardness_var = tk.IntVar(value=75)
+        self.brush_flow_var = tk.IntVar(value=25)
         self.brush_spacing_var = tk.StringVar(value="12.5")
         # Same-named tool options are universal. Each tool presents its own
         # relevant controls, but all of those controls reference these shared
@@ -528,6 +530,7 @@ class PaintApp:
         self.clone_antialias_var = self.brush_antialias_var
         self.clone_build_up_var = self.brush_build_up_var
         self.clone_hardness_var = self.brush_hardness_var
+        self.clone_flow_var = self.brush_flow_var
         self.clone_spacing_var = self.brush_spacing_var
         self.bucket_antialias_var = self.brush_antialias_var
         self.bucket_hardness_var = self.brush_hardness_var
@@ -706,6 +709,47 @@ class PaintApp:
         ):
             widget.bind("<MouseWheel>", scroll_size)
 
+        self.tool_setting_tooltips = []
+
+        def add_percentage_control(frame, label, variable, default):
+            tk.Label(frame, text=f"{label}:").pack(side="left", padx=(10, 3))
+            tk.Scale(
+                frame,
+                from_=0,
+                to=100,
+                orient="horizontal",
+                length=90,
+                showvalue=False,
+                variable=variable,
+            ).pack(side="left")
+            entry = tk.Entry(frame, width=4, justify="right")
+            entry.insert(0, str(variable.get()))
+            entry.pack(side="left", padx=(3, 2))
+
+            def sync_entry(*_):
+                try:
+                    value = int(variable.get())
+                except (tk.TclError, ValueError):
+                    return
+                if entry.get() != str(value):
+                    entry.delete(0, "end")
+                    entry.insert(0, str(value))
+
+            def commit_entry(_event=None):
+                try:
+                    value = int(entry.get())
+                except ValueError:
+                    value = default
+                variable.set(max(0, min(100, value)))
+                sync_entry()
+
+            variable.trace_add("write", sync_entry)
+            entry.bind("<Return>", commit_entry)
+            entry.bind("<FocusOut>", commit_entry)
+            reset = tk.Button(frame, text="⤺", width=2, command=lambda: variable.set(default))
+            reset.pack(side="left")
+            self.tool_setting_tooltips.append(DelayedToolTip(reset, "reset to default"))
+
         self.brush_settings_frame = tk.Frame(self.tool_settings_bar)
         tk.Checkbutton(
             self.brush_settings_frame, text="Build up", variable=self.brush_build_up_var
@@ -713,18 +757,10 @@ class PaintApp:
         tk.Checkbutton(
             self.brush_settings_frame, text="Anti-alias", variable=self.brush_antialias_var
         ).pack(side="left")
-        tk.Label(self.brush_settings_frame, text="Hardness:").pack(side="left", padx=(10, 3))
-        tk.Scale(
-            self.brush_settings_frame,
-            from_=0,
-            to=100,
-            orient="horizontal",
-            length=110,
-            variable=self.brush_hardness_var,
-        ).pack(side="left")
-        tk.Button(
-            self.brush_settings_frame, text="Reset", command=lambda: self.brush_hardness_var.set(75)
-        ).pack(side="left", padx=(3, 0))
+        add_percentage_control(
+            self.brush_settings_frame, "Hardness", self.brush_hardness_var, 75
+        )
+        add_percentage_control(self.brush_settings_frame, "Flow", self.brush_flow_var, 25)
 
         self.clone_settings_frame = tk.Frame(self.tool_settings_bar)
         tk.Checkbutton(
@@ -733,18 +769,10 @@ class PaintApp:
         tk.Checkbutton(
             self.clone_settings_frame, text="Anti-alias", variable=self.clone_antialias_var
         ).pack(side="left")
-        tk.Label(self.clone_settings_frame, text="Hardness:").pack(side="left", padx=(10, 3))
-        tk.Scale(
-            self.clone_settings_frame,
-            from_=0,
-            to=100,
-            orient="horizontal",
-            length=110,
-            variable=self.clone_hardness_var,
-        ).pack(side="left")
-        tk.Button(
-            self.clone_settings_frame, text="Reset", command=lambda: self.clone_hardness_var.set(75)
-        ).pack(side="left", padx=(3, 0))
+        add_percentage_control(
+            self.clone_settings_frame, "Hardness", self.clone_hardness_var, 75
+        )
+        add_percentage_control(self.clone_settings_frame, "Flow", self.clone_flow_var, 25)
 
         self.bucket_settings_frame = tk.Frame(self.tool_settings_bar)
         tk.Checkbutton(
@@ -1147,6 +1175,13 @@ class PaintApp:
 
     def choose_secondary_color(self):
         self.active_color_slot = "secondary"
+        self._sync_picker_to_active_color()
+
+    def toggle_color_focus(self):
+        """Switch which color swatch is edited without swapping the colors."""
+        self.active_color_slot = (
+            "secondary" if self.active_color_slot == "primary" else "primary"
+        )
         self._sync_picker_to_active_color()
 
     @staticmethod
@@ -1579,6 +1614,7 @@ class PaintApp:
         actions = {
             "cycle_selection": self.select_selection_tool,
             "cycle_move": self.select_move_tool,
+            "cycle_vector_shapes": self.select_vector_shape_tool,
             "increase_size": lambda: adjust_size(1),
             "decrease_size": lambda: adjust_size(-1),
             "undo": self.undo,
@@ -1593,6 +1629,7 @@ class PaintApp:
             "commit_fill": self._finish_bucket_preview,
             "close_image": lambda: self.close_document(self.active_document),
             "swap_colors": self.swap_colors,
+            "focus_colors": self.toggle_color_focus,
             "zoom_in": lambda: self.zoom_keyboard(1),
             "zoom_out": lambda: self.zoom_keyboard(-1),
         }
@@ -1622,6 +1659,45 @@ class PaintApp:
             bindings, errors = read_shortcuts(path, actions)
         except (OSError, UnicodeError) as error:
             bindings, errors = [], [str(error)]
+        # Carry installations with the previous untouched defaults forward:
+        # C used to select Clone and L used to select Line. Explicit custom
+        # configurations, including any file that names focus_colors, remain
+        # authoritative.
+        configured_actions = {action for action, _sequence in bindings}
+        legacy_defaults = {
+            action: sequence for action, sequence in bindings if action in {"clone", "line"}
+        }
+        if (
+            "focus_colors" not in configured_actions
+            and legacy_defaults.get("clone") == "<KeyPress-c>"
+            and legacy_defaults.get("line") == "<KeyPress-l>"
+        ):
+            bindings = [
+                (action, sequence)
+                for action, sequence in bindings
+                if action not in {"clone", "line"}
+            ]
+            bindings.extend(
+                (("clone", "<KeyPress-l>"), ("focus_colors", "<KeyPress-c>"))
+            )
+        configured_actions = {action for action, _sequence in bindings}
+        legacy_shapes = {
+            action: sequence
+            for action, sequence in bindings
+            if action in {"line", "rectangle", "ellipse"}
+        }
+        if (
+            "cycle_vector_shapes" not in configured_actions
+            and "line" not in legacy_shapes
+            and legacy_shapes.get("rectangle") == "<KeyPress-r>"
+            and legacy_shapes.get("ellipse") == "<KeyPress-o>"
+        ):
+            bindings = [
+                (action, sequence)
+                for action, sequence in bindings
+                if action not in {"rectangle", "ellipse"}
+            ]
+            bindings.append(("cycle_vector_shapes", "<KeyPress-o>"))
         window_actions = {
             "copy",
             "paste",
@@ -1630,6 +1706,7 @@ class PaintApp:
             "commit_fill",
             "close_image",
             "swap_colors",
+            "focus_colors",
             "zoom_in",
             "zoom_out",
         }
@@ -1678,6 +1755,8 @@ class PaintApp:
                 shortcuts = shortcuts_by_action.get("cycle_selection", [])
             elif not shortcuts and tool in {"move", "move selection"}:
                 shortcuts = shortcuts_by_action.get("cycle_move", [])
+            elif not shortcuts and tool in {"line", "rect", "ellipse"}:
+                shortcuts = shortcuts_by_action.get("cycle_vector_shapes", [])
             text = f"{label} ({', '.join(shortcuts)})" if shortcuts else label
             self.tool_tooltips.append(DelayedToolTip(self.tool_buttons[tool], text))
         if errors:
@@ -2142,6 +2221,7 @@ class PaintApp:
         else:
             history_for(context_for(self).document).cancel(context_for(self).document)
         self._stroke_base_image = self._stroke_coverage = None
+        self._build_up_base_image = self._build_up_coverage = None
         self.clone_stroke_source = self.clone_stroke_base = self.clone_stroke_coverage = None
         self.move_pixels = self.move_mask = self.move_base_image = self.move_start = None
         self.last_x = self.last_y = None
@@ -2748,6 +2828,14 @@ class PaintApp:
     def select_selection_tool(self, event=None):
         """Cycle rectangle, brush selection, and magic wand with S."""
         tools = ("selection", "brush selection", "magic wand")
+        next_tool = (
+            tools[(tools.index(self.tool) + 1) % len(tools)] if self.tool in tools else tools[0]
+        )
+        self.set_tool(next_tool)
+
+    def select_vector_shape_tool(self, event=None):
+        """Cycle line, rectangle, and ellipse vector tools with O."""
+        tools = ("line", "rect", "ellipse")
         next_tool = (
             tools[(tools.index(self.tool) + 1) % len(tools)] if self.tool in tools else tools[0]
         )
@@ -4066,6 +4154,8 @@ class PaintApp:
         capped = self.tool == "pencil" or not self.brush_build_up_var.get()
         self._stroke_base_image = session.stroke.baseline if capped else None
         self._stroke_coverage = session.stroke.coverage if capped else None
+        self._build_up_base_image = session.stroke.baseline if not capped else None
+        self._build_up_coverage = session.stroke.coverage if not capped else None
 
     def _finish_raster_stroke(self):
         session = context_for(self).session
@@ -4074,6 +4164,8 @@ class PaintApp:
             session.stroke = None
         self._stroke_base_image = None
         self._stroke_coverage = None
+        self._build_up_base_image = None
+        self._build_up_coverage = None
 
     def brush_hardness(self):
         """Return the brush edge hardness as a validated percentage."""
@@ -4089,6 +4181,13 @@ class PaintApp:
         except (tk.TclError, ValueError):
             return 12.5
 
+    def brush_flow(self):
+        """Return build-up flow as a validated percentage."""
+        try:
+            return max(0, min(100, int(self.brush_flow_var.get())))
+        except (tk.TclError, ValueError):
+            return 25
+
     def clone_hardness(self):
         try:
             return max(0, min(100, int(self.clone_hardness_var.get())))
@@ -4100,6 +4199,12 @@ class PaintApp:
             return max(0.1, min(1000, float(self.clone_spacing_var.get())))
         except (tk.TclError, ValueError):
             return 12.5
+
+    def clone_flow(self):
+        try:
+            return max(0, min(100, int(self.clone_flow_var.get())))
+        except (tk.TclError, ValueError):
+            return 25
 
     def bucket_hardness(self):
         try:
@@ -4342,13 +4447,30 @@ class PaintApp:
             return None
         dab_mask = self._clip_raster_mask_to_selection(box, dab_mask)
         opacity = self.primary_opacity if self.last_button == 1 else self.secondary_opacity
-        if opacity < 255:
-            dab_mask = dab_mask.point(lambda value: (value * opacity + 127) // 255)
+        build_up = self.clone_build_up_var.get()
+        mask_strength = opacity
+        if build_up:
+            flow = self.clone_flow() / 100.0
+            spacing_fraction = min(1.0, self.clone_spacing() / 100.0)
+            mask_strength = round((1.0 - ((1.0 - flow) ** spacing_fraction)) * 255)
+            if flow > 0:
+                mask_strength = max(1, mask_strength)
+        if mask_strength < 255:
+            dab_mask = dab_mask.point(
+                lambda value: (value * mask_strength + 127) // 255
+            )
 
         if self.clone_stroke_coverage is not None:
-            coverage = mask_lighter(self.clone_stroke_coverage.crop(box), dab_mask)
+            previous = self.clone_stroke_coverage.crop(box)
+            coverage = (
+                _accumulate_build_up_mask(previous, dab_mask)
+                if build_up
+                else mask_lighter(previous, dab_mask)
+            )
             self.clone_stroke_coverage.paste(coverage, (box[0], box[1]))
-            composite_mask = coverage
+            composite_mask = (
+                coverage.point(lambda value: min(value, opacity)) if build_up else coverage
+            )
         else:
             composite_mask = dab_mask
 
@@ -4972,15 +5094,16 @@ class PaintApp:
         raster_radius = max(0, radius - 0.5)
         antialias = self.brush_antialias_var.get()
         hardness = self.brush_hardness()
-        build_up = self._stroke_base_image is None
-        dab_opacity = self.primary_opacity if self.last_button == 1 else self.secondary_opacity
+        build_up = self.brush_build_up_var.get()
+        stroke_opacity = self.primary_opacity if self.last_button == 1 else self.secondary_opacity
+        dab_opacity = stroke_opacity
         if build_up:
-            dab_opacity = _build_up_opacity(dab_opacity)
+            dab_opacity = round(self.brush_flow() * 255 / 100)
         if build_up and 0 < dab_opacity < 255:
             # Neighboring dabs overlap heavily at normal brush spacing. If
-            # every dab used the full selected opacity, a single pass at the
+            # every dab used the full selected flow, a single pass at the
             # default 12.5% spacing would apply it about eight times. Convert
-            # the pass opacity to a per-dab value so one brush-width of travel
+            # the flow value to a per-dab value so one brush-width of travel
             # lands near the requested strength while repeated passes still
             # build up naturally.
             spacing_fraction = min(1.0, self.brush_spacing() / 100.0)
@@ -5105,7 +5228,14 @@ class PaintApp:
         if self.tool == "eraser":
             if not build_up and dab_opacity < 255:
                 combined = combined.point(lambda value: (value * dab_opacity + 127) // 255)
-            if self._stroke_base_image is not None:
+            if build_up:
+                coverage = _accumulate_build_up_mask(
+                    self._build_up_coverage.crop(union), combined
+                )
+                self._build_up_coverage.paste(coverage, union[:2])
+                erase_mask = coverage.point(lambda value: min(value, stroke_opacity))
+                result = self._build_up_base_image.crop(union)
+            elif self._stroke_base_image is not None:
                 coverage = mask_lighter(self._stroke_coverage.crop(union), combined)
                 self._stroke_coverage.paste(coverage, union[:2])
                 result = self._stroke_base_image.crop(union)
@@ -5115,7 +5245,14 @@ class PaintApp:
                 erase_mask = combined
             result.putalpha(mask_multiply(result.getchannel("A"), ImageOps.invert(erase_mask)))
         else:
-            if self._stroke_base_image is not None:
+            if build_up:
+                coverage = _accumulate_build_up_mask(
+                    self._build_up_coverage.crop(union), combined
+                )
+                self._build_up_coverage.paste(coverage, union[:2])
+                paint_mask = coverage.point(lambda value: min(value, stroke_opacity))
+                result = self._build_up_base_image.crop(union)
+            elif self._stroke_base_image is not None:
                 coverage = mask_lighter(self._stroke_coverage.crop(union), combined)
                 self._stroke_coverage.paste(coverage, union[:2])
                 result = self._stroke_base_image.crop(union)
@@ -5129,10 +5266,7 @@ class PaintApp:
             source_color = color[:7] if build_up else color
             source = Image.new("RGBA", paint_mask.size, source_color)
             source.putalpha(mask_multiply(source.getchannel("A"), paint_mask))
-            existing_alpha = result.getchannel("A") if build_up else None
             result.alpha_composite(source)
-            if build_up:
-                result.putalpha(_accumulate_build_up_mask(existing_alpha, paint_mask))
 
         self.apply_raster_result(layer, result, union)
         return union
@@ -5746,12 +5880,8 @@ class PaintApp:
             context_for(self).document, self.layers[self.active_layer]
         )
         self.clone_stroke_source = session.clone_gesture.source
-        if self.clone_build_up_var.get():
-            self.clone_stroke_base = None
-            self.clone_stroke_coverage = None
-        else:
-            self.clone_stroke_base = self.clone_stroke_source
-            self.clone_stroke_coverage = session.clone_gesture.coverage
+        self.clone_stroke_base = self.clone_stroke_source
+        self.clone_stroke_coverage = session.clone_gesture.coverage
         self.clone_last = (x, y)
         self._paint_clone(x, y)
         return True

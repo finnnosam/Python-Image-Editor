@@ -10,18 +10,19 @@
 pan = H
 cycle_selection = S
 cycle_move = M
+cycle_vector_shapes = O
 color_picker = I
 brush = B
 pencil = P
 eraser = E
-clone = C
+clone = L
 paint_bucket = F
 vector_edit = V
-line = L
-rectangle = R
-ellipse = O
+line =
+rectangle =
+ellipse =
 
-# Optional direct tool shortcuts (S and M still cycle tools).
+# Optional direct tool shortcuts (S, M, and O still cycle tools).
 selection =
 brush_selection =
 magic_wand =
@@ -41,5 +42,6 @@ open = Ctrl+O
 commit_fill = Enter
 close_image = Ctrl+W
 swap_colors = X
+focus_colors = C
 zoom_in = Ctrl+Plus, Ctrl+Equals, Ctrl+NumpadPlus
 zoom_out = Ctrl+Minus, Ctrl+NumpadMinus
