@@ -162,6 +162,9 @@ class PaintApp:
         self.redraw_pending = False
         self.last_redraw = 0.0
         self.redraw_after_id = None
+        self.zoom_preview_after_id = None
+        self.zoom_redraw_after_id = None
+        self.last_zoom_preview = 0.0
         self.overlay_after_id = None
         self.pending_redraw_box = None
         self.mipmap_after_id = None
@@ -5776,9 +5779,62 @@ class PaintApp:
 
         self.offset_x = x - ix * self.zoom
         self.offset_y = y - iy * self.zoom
-        # Wheel events arrive in bursts.  Always schedule their redraw so the
-        # input queue can coalesce several events before expensive Tk upload.
-        self.request_redraw(navigation=True)
+        # Wheel events can arrive much faster than a resampled image can be
+        # uploaded to Tk. Coalesce the burst to at most one preview per frame,
+        # then do exact compositing once input settles.
+        display = getattr(self, "_display_surface", None)
+        if display is not None and getattr(display, "flat", None) is not None:
+            if self.redraw_after_id is not None:
+                self.root.after_cancel(self.redraw_after_id)
+                self.redraw_after_id = None
+                self.pending_redraw_box = None
+            if getattr(self, "zoom_preview_after_id", None) is None:
+                elapsed = time.perf_counter() - getattr(self, "last_zoom_preview", 0.0)
+                delay = max(1, math.ceil((self.target_frame_time - elapsed) * 1000))
+                self.zoom_preview_after_id = self.root.after(delay, self._render_zoom_preview)
+            if self.zoom_redraw_after_id is not None:
+                self.root.after_cancel(self.zoom_redraw_after_id)
+            self.zoom_redraw_after_id = self.root.after(75, self._finish_zoom_preview)
+        else:
+            self.request_redraw(navigation=True)
+
+    def _render_zoom_preview(self):
+        self.zoom_preview_after_id = None
+        display = getattr(self, "_display_surface", None)
+        if display is None or not display.preview_zoom(
+            (max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())),
+            self.zoom,
+            (self.offset_x, self.offset_y),
+        ):
+            self.request_redraw(navigation=True)
+            return
+        self.last_zoom_preview = time.perf_counter()
+        self._draw_overlays()
+
+    def _finish_zoom_preview(self):
+        self.zoom_redraw_after_id = None
+        preview_after_id = getattr(self, "zoom_preview_after_id", None)
+        if preview_after_id is not None:
+            self.root.after_cancel(preview_after_id)
+            self.zoom_preview_after_id = None
+        self.last_redraw = time.perf_counter()
+        inputs = getattr(self, "_display_inputs", None)
+        document = context_for(self).document
+        if inputs is not None:
+            snapshot = inputs[0]
+            reusable = (
+                snapshot.document_id == document.id
+                and snapshot.generation == document.generation
+                and snapshot.state_id == document.state_id
+                and getattr(self, "_effect_preview", None) is None
+                and getattr(self, "_vector_preview", None) is None
+                and not self.raster_stroke_active
+                and self.bucket_pending is None
+                and self.move_pixels is None
+            )
+        else:
+            reusable = False
+        self.redraw(inputs=inputs if reusable else None)
 
     def mouse_move(self, event):
         self.mouse_x = event.x
@@ -6060,7 +6116,7 @@ class PaintApp:
 
         self._canvas_image_id = self.canvas.create_image(sx, sy, image=self.tkimg, anchor="nw")
 
-    def redraw(self, dirty_box=None):
+    def redraw(self, dirty_box=None, *, inputs=None):
         if hasattr(self, "active_view") and self.active_view != "main":
             if getattr(self, "_display_surface", None) is not None:
                 self._display_surface.prefetch.cancel()
@@ -6073,7 +6129,7 @@ class PaintApp:
             self._canvas_image_id = None
             self.tkimg = None
         viewport = (max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height()))
-        inputs = self._composite_inputs()
+        inputs = inputs or self._composite_inputs()
         snapshot, pyramids = inputs
         zoom = self.zoom
         required = self._compositing_layer_indices(self.layers)
@@ -6121,6 +6177,7 @@ class PaintApp:
                 inputs=inputs,
                 sampling_grid=(zoom, round(box[0] * zoom), round(box[1] * zoom)),
             ),
+            checker_period=self.checker_size * 2,
         )
         # Keep the identity keys' owners alive until the next draw completes.
         self._display_inputs = inputs

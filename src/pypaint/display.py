@@ -7,6 +7,36 @@ from types import SimpleNamespace
 from PIL import Image, ImageTk
 
 
+def checker_crop(checker, box, period):
+    """Return a document-anchored checker crop for a screen-space box."""
+    left, top, right, bottom = box
+    width, height = right - left, bottom - top
+    period = max(1, min(period, checker.width, checker.height))
+    tile = checker.crop((0, 0, period, period)).convert("RGB")
+    phase_x, phase_y = left % period, top % period
+    target_width, target_height = width + phase_x, height + phase_y
+    if checker.mode == "RGB" and checker.width >= target_width and checker.height >= target_height:
+        return checker.crop((phase_x, phase_y, phase_x + width, phase_y + height))
+    pattern = tile
+    while pattern.width < target_width:
+        expanded = Image.new("RGB", (min(target_width, pattern.width * 2), pattern.height))
+        expanded.paste(pattern, (0, 0))
+        expanded.paste(pattern, (pattern.width, 0))
+        pattern = expanded
+    while pattern.height < target_height:
+        expanded = Image.new("RGB", (pattern.width, min(target_height, pattern.height * 2)))
+        expanded.paste(pattern, (0, 0))
+        expanded.paste(pattern, (0, pattern.height))
+        pattern = expanded
+    return pattern.crop((phase_x, phase_y, phase_x + width, phase_y + height))
+
+
+def flatten_over_checker(rgb, mask, checker, box, period):
+    result = checker_crop(checker, box, period)
+    result.paste(rgb, (0, 0), mask)
+    return result
+
+
 class DisplayPrefetch:
     MAX_BYTES = 32 * 1024**2
 
@@ -28,7 +58,7 @@ class DisplayPrefetch:
         if state is not None and (state.key != key or state.layout != layout or dirty):
             self.cancel()
 
-    def start(self, key, layout, box, source_box, source, render, zoom):
+    def start(self, key, layout, box, source_box, source, render, zoom, checker, checker_period):
 
         width, height = box[2] - box[0], box[3] - box[1]
         # Account conservatively for Pillow's padded RGB storage, alpha, RGBA,
@@ -69,7 +99,10 @@ class DisplayPrefetch:
             rgba=None,
             rgb=None,
             mask=None,
+            flat=None,
             photo=None,
+            checker=checker,
+            checker_period=checker_period,
             stage="allocate",
         )
         self._schedule()
@@ -113,10 +146,24 @@ class DisplayPrefetch:
                 elif state.stage == "alpha":
                     state.mask = state.rgba.getchannel("A")
                     state.alpha = state.mask.getextrema()
-                    state.stage = "photo" if state.alpha == (255, 255) else "ready"
+                    state.stage = "flatten"
+                elif state.stage == "flatten":
+                    state.flat = (
+                        state.rgb
+                        if state.alpha == (255, 255)
+                        else flatten_over_checker(
+                            state.rgb,
+                            state.mask,
+                            state.checker,
+                            state.box,
+                            state.checker_period,
+                        )
+                    )
+                    state.checker = None
+                    state.stage = "photo"
                 elif state.stage == "photo":
                     # Unbound RGB photos avoid the fragmented-alpha Tk repaint path.
-                    state.photo = ImageTk.PhotoImage(state.rgb)
+                    state.photo = ImageTk.PhotoImage(state.flat)
                     state.stage = "ready"
                 if state.stage == "ready":
                     state.render = None
@@ -178,11 +225,15 @@ class DisplaySurface:
     def __init__(self, canvas):
         self.canvas = canvas
         self.photo = self.item = self.box = self.rgba = None
-        self.rgb = self.mask = None
+        self.rgb = self.mask = self.flat = None
         self.display_box = self.display_offset = None
         self.alpha = (0, 0)
         self.key = self.layout = None
-        self.checker = self.checker_photo = None
+        self.checker = self.checker_photo = self.checker_pattern = None
+        self.checker_period = 36
+        self.zoom_photo = self.zoom_item = None
+        self.render_zoom = None
+        self.document_size = None
         self.backdrop_items = []
         self.backdrop_geometry = None
         self.last_stats = {}
@@ -192,14 +243,121 @@ class DisplaySurface:
         self.prefetch.cancel()
         self.canvas.delete("document-display")
         self.photo = self.item = self.box = self.rgba = None
-        self.rgb = self.mask = None
+        self.rgb = self.mask = self.flat = None
         self.display_box = self.display_offset = None
         self.alpha = (0, 0)
         self.backdrop_items.clear()
-        self.checker = self.checker_photo = None
+        self.checker = self.checker_photo = self.checker_pattern = None
+        self.checker_period = 36
+        if self.zoom_item is not None:
+            self.canvas.delete(self.zoom_item)
+        self.zoom_photo = self.zoom_item = None
+        self.render_zoom = None
+        self.document_size = None
         self.key = self.layout = self.backdrop_geometry = None
 
-    def draw(self, size, viewport, zoom, offset, key, layout, dirty_box, checker, render):
+    def preview_zoom(self, viewport, zoom, offset):
+        """Display an immediate scaled preview while an exact zoom settles."""
+        if self.flat is None or self.box is None or self.render_zoom is None:
+            return False
+        old_zoom = self.render_zoom
+        if old_zoom <= 0 or zoom <= 0:
+            return False
+        scale = old_zoom / zoom
+        source_x = -offset[0] * scale - self.box[0]
+        source_y = -offset[1] * scale - self.box[1]
+        # Tk accepts platform color names such as ``gray25`` that Pillow does
+        # not understand. Resolve through Tk so uncovered preview pixels match
+        # the actual workspace instead of falling back to a light fill.
+        background = tuple(
+            (component + 128) // 257
+            for component in self.canvas.winfo_rgb(self.canvas.cget("background"))
+        )
+        transform = (scale, 0, source_x, 0, scale, source_y)
+        left, top = rounded(-offset[0]), rounded(-offset[1])
+        checker_box = (left, top, left + viewport[0], top + viewport[1])
+        if self.alpha == (255, 255):
+            preview = self.rgb.transform(
+                viewport,
+                Image.Transform.AFFINE,
+                transform,
+                Image.Resampling.NEAREST,
+                fillcolor=(0, 0, 0),
+            )
+        elif self.alpha == (0, 0):
+            preview = checker_crop(self.checker_pattern, checker_box, self.checker_period)
+        else:
+            preview_rgb = self.rgb.transform(
+                viewport,
+                Image.Transform.AFFINE,
+                transform,
+                Image.Resampling.NEAREST,
+                fillcolor=(0, 0, 0),
+            )
+            preview_mask = self.mask.transform(
+                viewport,
+                Image.Transform.AFFINE,
+                transform,
+                Image.Resampling.NEAREST,
+                fillcolor=0,
+            )
+            preview = flatten_over_checker(
+                preview_rgb,
+                preview_mask,
+                self.checker_pattern,
+                checker_box,
+                self.checker_period,
+            )
+        # Outside the scaled document uses the workspace rather than the
+        # transparency checker.
+        document_left = max(0, rounded(offset[0]))
+        document_top = max(0, rounded(offset[1]))
+        document_right = min(viewport[0], math.ceil(offset[0] + self.document_size[0] * zoom))
+        document_bottom = min(viewport[1], math.ceil(offset[1] + self.document_size[1] * zoom))
+        document_box = (document_left, document_top, document_right, document_bottom)
+        if document_box != (0, 0, *viewport):
+            workspace = Image.new("RGB", viewport, background)
+            if document_right > document_left and document_bottom > document_top:
+                workspace.paste(preview.crop(document_box), document_box[:2])
+            preview = workspace
+        if (
+            self.zoom_photo is None
+            or (self.zoom_photo.width(), self.zoom_photo.height()) != preview.size
+        ):
+            self.zoom_photo = ImageTk.PhotoImage(preview)
+        else:
+            self.zoom_photo.paste(preview)
+        if self.zoom_item is None:
+            self.zoom_item = self.canvas.create_image(
+                0,
+                0,
+                image=self.zoom_photo,
+                anchor="nw",
+                tags=("document-display", "zoom-preview"),
+            )
+        else:
+            self.canvas.itemconfigure(self.zoom_item, image=self.zoom_photo)
+        return True
+
+    def _clear_zoom_preview(self):
+        if self.zoom_item is not None:
+            self.canvas.delete(self.zoom_item)
+        self.zoom_photo = self.zoom_item = None
+
+    def draw(
+        self,
+        size,
+        viewport,
+        zoom,
+        offset,
+        key,
+        layout,
+        dirty_box,
+        checker,
+        render,
+        checker_period=36,
+    ):
+        self._clear_zoom_preview()
         box = visible_box(size, viewport, zoom, offset)
         visible = box
         self.prefetch.validate(key, layout, dirty_box is not None)
@@ -211,7 +369,12 @@ class DisplaySurface:
             self.prefetch.cancel()
             ready = None
         if ready is not None and box is not None and intersection(box, ready.box) == box:
-            self.rgba, self.rgb, self.mask = ready.rgba, ready.rgb, ready.mask
+            self.rgba, self.rgb, self.mask, self.flat = (
+                ready.rgba,
+                ready.rgb,
+                ready.mask,
+                ready.flat,
+            )
             self.box, self.alpha = ready.box, ready.alpha
             if ready.photo is not None and self.item is not None:
                 self.photo = ready.photo
@@ -219,8 +382,9 @@ class DisplaySurface:
                 self.display_box = ready.box
             self.prefetch.ready = None
         checker_changed = self.checker is not checker
-        self._backdrop(size, viewport, zoom, offset, checker)
-        full = self.layout != layout or (self.key != key and dirty_box is None)
+        self._backdrop(size, viewport, zoom, offset, checker, checker_period)
+        checker_pattern = self.checker_pattern
+        full = checker_changed or self.layout != layout or (self.key != key and dirty_box is None)
         if box is not None and self.layout == layout and self.box is not None:
             margin = 128
             bounded = (
@@ -255,8 +419,9 @@ class DisplaySurface:
             if self.item is not None:
                 self.canvas.delete(self.item)
             self.photo = self.item = self.box = self.rgba = None
-            self.rgb = self.mask = None
+            self.rgb = self.mask = self.flat = None
             self.display_box = self.display_offset = None
+            self.render_zoom = None
             self.alpha = (0, 0)
             self.last_stats = dict(rendered_regions=0, uploaded_pixels=0, retained_pixels=0)
             return
@@ -296,55 +461,42 @@ class DisplaySurface:
             self.rgba.paste(patch, (l - box[0], t - box[1]))
             if not rebased:
                 mask = patch.getchannel("A")
-                self.rgb.paste(patch.convert("RGB"), (l - box[0], t - box[1]))
+                rgb = patch.convert("RGB")
+                destination = (l - box[0], t - box[1])
+                self.rgb.paste(rgb, destination)
                 self.mask.paste(mask, (l - box[0], t - box[1]))
+                if self.flat is self.rgb:
+                    self.flat = self.rgb.copy()
+                flat = flatten_over_checker(
+                    rgb, mask, checker_pattern, (l, t, r, b), checker_period
+                )
+                self.flat.paste(flat, destination)
                 lo, hi = mask.getextrema()
                 self.alpha = min(self.alpha[0], lo), max(self.alpha[1], hi)
         if rebased:
             self.rgb = self.rgba.convert("RGB")
             self.mask = self.rgba.getchannel("A")
             self.alpha = self.mask.getextrema()
+            self.flat = (
+                self.rgb
+                if self.alpha == (255, 255)
+                else flatten_over_checker(self.rgb, self.mask, checker_pattern, box, checker_period)
+            )
         self.box = box
         uploaded = 0
-        if self.alpha == (0, 0):
-            if self.item is not None:
-                self.canvas.delete(self.item)
-            self.photo = self.item = self.display_box = None
-        else:
-            opaque = self.alpha == (255, 255)
-            target = box if opaque else visible_box(size, viewport, zoom, offset)
+        if self.alpha != (0, 0) or self.flat is not None:
+            target = box
             position = (offset[0] + target[0], offset[1] + target[1])
-            changed_position = self.display_offset != offset
 
             # Never hand Tk a fragmented alpha image: Windows Tk can spend
-            # seconds constructing its transparency region. Flatten to RGB first.
+            # seconds constructing its transparency region. The retained flat
+            # buffer includes a document-anchored checker so it can move during
+            # a pan without recompositing or re-uploading the visible viewport.
             def pixels(rect):
                 l, t, r, b = rect
-                if opaque:
-                    return self.rgb.crop((l - box[0], t - box[1], r - box[0], b - box[1]))
-                sx, sy = rounded(offset[0] + l), rounded(offset[1] + t)
-                background = self.checker_rgb.crop((sx, sy, sx + r - l, sy + b - t))
-                # The checker is opaque: an RGB masked paste is exactly the
-                # same blend, without RGBA conversion or cropped source copies.
-                background.paste(self.rgb, (box[0] - l, box[1] - t), self.mask)
-                # EXTENT can enclose one pixel beyond the actual Tk viewport.
-                # Preserve the old transparent-outside-checker crop semantics.
-                bounds = (0, 0, r - l, b - t)
-                covered = intersection(bounds, (-sx, -sy, checker.width - sx, checker.height - sy))
-                for x0, y0, x1, y1 in exposed_boxes(bounds, covered):
-                    outside = self.rgba.crop(
-                        (l - box[0] + x0, t - box[1] + y0, l - box[0] + x1, t - box[1] + y1)
-                    )
-                    empty = Image.new("RGBA", outside.size)
-                    background.paste(Image.alpha_composite(empty, outside).convert("RGB"), (x0, y0))
-                return background
+                return self.flat.crop((l - box[0], t - box[1], r - box[0], b - box[1]))
 
-            complete = (
-                self.photo is None
-                or target != self.display_box
-                or full
-                or (not opaque and (changed_position or checker_changed))
-            )
+            complete = self.photo is None or target != self.display_box or full
             if complete:
                 image = pixels(target)
                 resized = (
@@ -384,6 +536,8 @@ class DisplaySurface:
             self.display_box = target
         previous_offset = self.display_offset
         self.display_offset = offset
+        self.render_zoom = zoom
+        self.document_size = size
         self.last_stats = dict(
             rendered_regions=len(regions),
             rendered_pixels=sum((r - l) * (b - t) for l, t, r, b in regions),
@@ -397,10 +551,33 @@ class DisplaySurface:
             and offset != previous_offset
         ):
             self._prefetch_next(
-                size, viewport, zoom, offset, previous_offset, visible, key, layout, render
+                size,
+                viewport,
+                zoom,
+                offset,
+                previous_offset,
+                visible,
+                key,
+                layout,
+                render,
+                checker_pattern,
+                checker_period,
             )
 
-    def _prefetch_next(self, size, viewport, zoom, offset, previous, visible, key, layout, render):
+    def _prefetch_next(
+        self,
+        size,
+        viewport,
+        zoom,
+        offset,
+        previous,
+        visible,
+        key,
+        layout,
+        render,
+        checker,
+        checker_period,
+    ):
         dx, dy = previous[0] - offset[0], previous[1] - offset[1]
         if max(abs(dx), abs(dy)) > 48:
             # Rapid jumps can outrun the cooperative producer. Spend the UI
@@ -432,17 +609,38 @@ class DisplaySurface:
             (0, 0, math.ceil(size[0] * zoom), math.ceil(size[1] * zoom)),
         )
         if target is not None and target != self.box:
-            self.prefetch.start(key, layout, target, self.box, self.rgba, render, zoom)
+            self.prefetch.start(
+                key,
+                layout,
+                target,
+                self.box,
+                self.rgba,
+                render,
+                zoom,
+                checker,
+                checker_period,
+            )
             if self.prefetch.pending is not None:
                 self.prefetch.pending.direction = dx, dy
 
-    def _backdrop(self, size, viewport, zoom, offset, checker):
+    def _backdrop(self, size, viewport, zoom, offset, checker, checker_period):
         # Four rectangles clip the fixed checkerboard to the document footprint.
         if self.checker is not checker:
             for item in self.backdrop_items:
                 self.canvas.delete(item)
             self.checker = checker
+            self.checker_period = checker_period
             self.checker_rgb = checker.convert("RGB")
+            self.checker_pattern = checker_crop(
+                self.checker_rgb,
+                (
+                    0,
+                    0,
+                    checker.width + 258 + checker_period,
+                    checker.height + 258 + checker_period,
+                ),
+                checker_period,
+            )
             self.checker_photo = ImageTk.PhotoImage(self.checker_rgb)
             background = self.canvas.cget("background")
             self.backdrop_items = [
