@@ -317,8 +317,13 @@ class PaintApp:
             return
 
         # Moving focus fires the field's FocusOut callback synchronously,
-        # which validates and applies the edited value.
-        self.root.focus_set()
+        # which validates and applies the edited value.  Put focus back on
+        # the canvas, where plain-letter tool shortcuts are bound; focusing
+        # only the root leaves those shortcuts inactive after editing a field.
+        if clicked_window == self.root:
+            self.canvas.focus_set()
+        else:
+            clicked_window.focus_set()
 
     def _commit_pending_bucket_on_click(self, event):
         """Commit a bucket preview when clicking outside its settings."""
