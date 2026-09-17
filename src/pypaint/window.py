@@ -212,6 +212,7 @@ class PaintApp:
         self._checker_pil = None  # cached full-viewport tiled PIL image
         self._checker_pil_dims = None  # (cw, ch) it was built for
         self._canvas_image_id = None
+        self._canvas_viewport_size = None
 
         self.last_x = None
         self.last_y = None
@@ -513,7 +514,7 @@ class PaintApp:
             elif tool == "magic wand":
                 button.grid(row=2, column=1, padx=2, pady=2, sticky="w")
             elif tool == "pencil":
-                button.grid(row=5, column=1, padx=2, pady=2, sticky="w")
+                button.grid(row=12, column=0, padx=2, pady=2, sticky="w")
             else:
                 button.grid(row=index - 4, column=0, padx=2, pady=2, sticky="w")
             self.tool_buttons[tool] = button
@@ -909,6 +910,7 @@ class PaintApp:
         self.canvas.bind("<ButtonRelease-3>", self.on_mouse_up)
         self.canvas.bind("<MouseWheel>", self.on_mousewheel)  # Plain scroll for panning
         self.canvas.bind("<Control-MouseWheel>", self.zoom_mouse)  # Ctrl+scroll for zoom
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
         self._load_keyboard_shortcuts(adjust_size)
         self.canvas.focus_set()
         self.update_tool_settings_visibility()
@@ -1018,6 +1020,14 @@ class PaintApp:
             )
             button.grid(row=0, column=index, padx=1, pady=1)
             self.layer_action_tooltips.append(DelayedToolTip(button, label))
+
+    def _on_canvas_configure(self, event):
+        """Redraw after Tk assigns or changes the canvas's real viewport size."""
+        viewport = (event.width, event.height)
+        if viewport == self._canvas_viewport_size:
+            return
+        self._canvas_viewport_size = viewport
+        self.request_redraw(navigation=True)
 
     @staticmethod
     def _union_boxes(first, second):
@@ -1769,6 +1779,8 @@ class PaintApp:
         self.documents = {}
         self.active_document = None
         self.document_counter = 0
+        document = context_for(self).document
+        document.saved_state_id = document.state_id
         self._add_document_tab()
         self.startup_document = self.active_document
 
@@ -1800,7 +1812,7 @@ class PaintApp:
         self.documents[key] = {
             "name": name or f"Untitled {self.document_counter}",
             "state": self._capture_document(),
-            "modified": True,
+            "modified": context_for(self).document.modified,
         }
         tab = tk.Frame(self.view_tabs)
         tk.Button(
@@ -1896,43 +1908,17 @@ class PaintApp:
 
     def _unchanged_startup_document(self):
         """Return the disposable startup tab, ignoring view/tool changes."""
-        if (
-            len(self.documents) != 1
-            or self.active_document != self.startup_document
-            or self.current_file is not None
-            or self.undo_stack
-            or self.move_pixels is not None
-            or self.bucket_pending is not None
-            or len(self.layers) != 1
-        ):
-            return None
-        if (self.doc_w, self.doc_h, self.bg_color) != (
-            self.document_defaults["doc_w"],
-            self.document_defaults["doc_h"],
-            self.document_defaults["bg_color"],
-        ):
-            return None
-        layer = self.layers[0]
-        if (
-            not layer.is_raster
-            or layer.name != "Background"
-            or not layer.visible
-            or layer.opacity != 100
-            or layer.blend_mode != "normal"
-            or layer.masked
-            or layer.anti_mask
-            or layer.mask_mode != Layer.MASK_LAYERS_UNDERNEATH
-            or layer.mask_visibility != Layer.MASK_VISIBLE_ONLY
-            or layer.image.size != (self.doc_w, self.doc_h)
-            or any(band.getbbox() is not None for band in layer.image.split())
-        ):
+        startup = self.documents.get(self.startup_document)
+        if startup is None or startup["state"].document.modified:
             return None
         return self.startup_document
 
-    def _begin_document(self, name=None):
+    def _begin_document(self, name=None, size=None):
         self._store_document()
         self.globe_window = None
         self._context = DocumentContext()
+        if size is not None:
+            self.doc_w, self.doc_h = size
         self.layers = [Layer(self.doc_w, self.doc_h, "Background")]
         self.selection_mask = TiledSurface("L", (self.doc_w, self.doc_h), 0)
         self._add_document_tab(name)
@@ -2005,7 +1991,9 @@ class PaintApp:
         if key == self.active_document:
             other = next((item for item in self.documents if item != key), None)
             if other is None:
-                self.new_project()
+                self._create_new_document(
+                    self.document_defaults["doc_w"], self.document_defaults["doc_h"]
+                )
             else:
                 self.switch_document(other)
         for view_id, owner in list(self.globe_documents.items()):
@@ -2230,9 +2218,108 @@ class PaintApp:
         self._history_changed()
         return "break"
 
-    def new_project(self):
-        self._begin_document()
+    def _create_new_document(self, width, height):
+        self._begin_document(size=(width, height))
         self._finish_open()
+
+    def _new_document_default_size(self):
+        default = (self.document_defaults["doc_w"], self.document_defaults["doc_h"])
+        try:
+            clipboard_image = paste_image()
+        except Exception:
+            return default
+        return clipboard_image.size if clipboard_image is not None else default
+
+    def new_project(self):
+        """Prompt for dimensions, then create a new blank document."""
+        default_width, default_height = self._new_document_default_size()
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("New Image")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+
+        body = ttk.Frame(dialog, padding=12)
+        body.pack(fill="both", expand=True)
+        width_var = tk.StringVar(value=str(default_width))
+        height_var = tk.StringVar(value=str(default_height))
+        maintain_aspect_var = tk.BooleanVar(value=True)
+
+        ttk.Label(body, text="Width:").grid(row=0, column=0, sticky="w", pady=3)
+        width_entry = ttk.Entry(body, textvariable=width_var, width=15)
+        width_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=3)
+        ttk.Label(body, text="Height:").grid(row=1, column=0, sticky="w", pady=3)
+        ttk.Entry(body, textvariable=height_var, width=15).grid(
+            row=1, column=1, sticky="ew", padx=(8, 0), pady=3
+        )
+        ttk.Checkbutton(
+            body, text="Maintain aspect ratio", variable=maintain_aspect_var
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 7))
+
+        updating_dimensions = False
+
+        def keep_aspect(changed):
+            nonlocal updating_dimensions
+            if updating_dimensions or not maintain_aspect_var.get():
+                return
+            try:
+                updating_dimensions = True
+                if changed == "width":
+                    width = int(width_var.get())
+                    if width > 0:
+                        height_var.set(
+                            str(max(1, round(width * default_height / default_width)))
+                        )
+                else:
+                    height = int(height_var.get())
+                    if height > 0:
+                        width_var.set(
+                            str(max(1, round(height * default_width / default_height)))
+                        )
+            except ValueError:
+                pass
+            finally:
+                updating_dimensions = False
+
+        width_var.trace_add("write", lambda *_: keep_aspect("width"))
+        height_var.trace_add("write", lambda *_: keep_aspect("height"))
+
+        def create(event=None):
+            try:
+                width = int(width_var.get())
+                height = int(height_var.get())
+            except ValueError:
+                messagebox.showerror(
+                    "New Image", "Width and height must be whole numbers.", parent=dialog
+                )
+                return
+            if width < 1 or height < 1:
+                messagebox.showerror(
+                    "New Image", "Width and height must be at least 1 pixel.", parent=dialog
+                )
+                return
+            if width > 32768 or height > 32768:
+                messagebox.showerror(
+                    "New Image",
+                    "Width and height cannot exceed 32,768 pixels.",
+                    parent=dialog,
+                )
+                return
+            self._create_new_document(width, height)
+            dialog.destroy()
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=3, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(
+            side="right", padx=(6, 0)
+        )
+        ttk.Button(buttons, text="Create", command=create).pack(side="right")
+        dialog.bind("<Return>", create)
+        dialog.bind("<Escape>", lambda event: dialog.destroy())
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.grab_set()
+        width_entry.focus_set()
+        width_entry.selection_range(0, "end")
 
     def open_canvas_size(self):
         """Show a modal editor for the active document dimensions."""
@@ -2343,7 +2430,7 @@ class PaintApp:
         width_entry.focus_set()
         width_entry.selection_range(0, "end")
 
-    def resize_canvas(self, width, height, anchor="center"):
+    def resize_canvas(self, width, height, anchor="center", *, on_complete=None):
         """Resize the document without scaling its existing layer content."""
         self.wand_pending = None
         self._finish_bucket_preview()
@@ -2394,6 +2481,8 @@ class PaintApp:
                     self._history_changed()
                     self.selection_mask = mask.copy()
                     self._update_selection_geometry()
+                    if on_complete is not None:
+                        on_complete()
 
             self._submit_job(
                 job,
@@ -2427,6 +2516,8 @@ class PaintApp:
         self.refresh_layers()
         self.request_redraw()
         self.notify_globe_document_changed()
+        if on_complete is not None:
+            on_complete()
 
     def open_resize(self):
         """Show the image-resampling dialog."""
@@ -6061,7 +6152,13 @@ class PaintApp:
                     "Existing artwork will remain anchored at the top-left.",
                 )
                 if should_expand:
-                    self.resize_canvas(expanded_width, expanded_height, "top-left")
+                    self.resize_canvas(
+                        expanded_width,
+                        expanded_height,
+                        "top-left",
+                        on_complete=lambda: self._paste_pixels(pixels),
+                    )
+                    return "break"
             else:
                 messagebox.showwarning(
                     "Canvas Size Limit",
@@ -6070,10 +6167,15 @@ class PaintApp:
                     "without expanding the canvas.",
                 )
 
+        return self._paste_pixels(pixels)
+
+    def _paste_pixels(self, pixels):
+        """Start a floating paste after any requested canvas expansion completes."""
         self._finish_clipboard_edit()
         # Tool changes finish the current float; switch before starting paste.
         self.set_tool("move")
         self.snapshot()
+        layer = self.layers[self.active_layer]
         box = self._selection_pixel_box()
         left, top = box[:2] if box else (0, 0)
         right = left + pixels.width

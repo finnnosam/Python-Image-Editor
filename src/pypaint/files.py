@@ -154,5 +154,8 @@ def read_document(filename, token):
         layer = Layer(*surface.size, Path(filename).stem)
         layer.image = surface
         document.layers = [layer]
+    # Opening establishes the on-disk pixels as the saved baseline, including
+    # raster formats that do not retain an editable project filename.
+    document.saved_state_id = document.state_id
     document.current_file = str(filename) if suffix in (".pypaint", ".pdn") else None
     return document
