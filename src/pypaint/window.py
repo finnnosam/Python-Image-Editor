@@ -1086,20 +1086,21 @@ class PaintApp:
             self._draw_overlays()
 
     def request_mipmap_level(self, level):
-        """Build a missing zoom level after wheel input has settled.
+        """Build a missing zoom level cooperatively during navigation.
 
-        Constructing a large level in the wheel callback makes zooming hitch.
-        Until this callback runs, compositing uses the nearest cached level.
+        Construction stays outside the wheel callback, but an already queued
+        build is allowed to start while more wheel events arrive. Requests for
+        deeper levels are folded into that pending build instead of restarting
+        its delay indefinitely.
         """
         if self.mipmap_future is not None:
             self.pending_mipmap_level = max(level, self.pending_mipmap_level or 0)
             return
-        if self.mipmap_after_id is not None and self.pending_mipmap_level == level:
-            return
         if self.mipmap_after_id is not None:
-            self.root.after_cancel(self.mipmap_after_id)
+            self.pending_mipmap_level = max(level, self.pending_mipmap_level or 0)
+            return
         self.pending_mipmap_level = level
-        self.mipmap_after_id = self.root.after(140, self._build_pending_mipmaps)
+        self.mipmap_after_id = self.root.after(60, self._build_pending_mipmaps)
 
     def _build_pending_mipmaps(self):
         level = self.pending_mipmap_level
@@ -5928,8 +5929,9 @@ class PaintApp:
         self.offset_x = x - ix * self.zoom
         self.offset_y = y - iy * self.zoom
         # Wheel events can arrive much faster than a resampled image can be
-        # uploaded to Tk. Coalesce the burst to at most one preview per frame,
-        # then do exact compositing once input settles.
+        # uploaded to Tk. Coalesce previews to one per frame and throttle exact
+        # compositing, allowing current visible pixels to improve during a long
+        # wheel gesture instead of waiting for the gesture to stop.
         display = getattr(self, "_display_surface", None)
         if display is not None and getattr(display, "flat", None) is not None:
             if self.redraw_after_id is not None:
@@ -5940,9 +5942,8 @@ class PaintApp:
                 elapsed = time.perf_counter() - getattr(self, "last_zoom_preview", 0.0)
                 delay = max(1, math.ceil((self.target_frame_time - elapsed) * 1000))
                 self.zoom_preview_after_id = self.root.after(delay, self._render_zoom_preview)
-            if self.zoom_redraw_after_id is not None:
-                self.root.after_cancel(self.zoom_redraw_after_id)
-            self.zoom_redraw_after_id = self.root.after(75, self._finish_zoom_preview)
+            if self.zoom_redraw_after_id is None:
+                self.zoom_redraw_after_id = self.root.after(75, self._finish_zoom_preview)
         else:
             self.request_redraw(navigation=True)
 

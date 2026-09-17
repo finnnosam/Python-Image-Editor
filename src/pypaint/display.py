@@ -277,12 +277,29 @@ class DisplaySurface:
         left, top = rounded(-offset[0]), rounded(-offset[1])
         checker_box = (left, top, left + viewport[0], top + viewport[1])
         if self.alpha == (255, 255):
-            preview = self.rgb.transform(
+            preview_rgb = self.rgb.transform(
                 viewport,
                 Image.Transform.AFFINE,
                 transform,
                 Image.Resampling.NEAREST,
                 fillcolor=(0, 0, 0),
+            )
+            # Zooming out can expose document pixels beyond the retained
+            # source buffer. Treat those pixels as temporarily unavailable,
+            # not black, until the progressive exact redraw fills them.
+            retained = Image.new("L", self.rgb.size, 255).transform(
+                viewport,
+                Image.Transform.AFFINE,
+                transform,
+                Image.Resampling.NEAREST,
+                fillcolor=0,
+            )
+            preview = flatten_over_checker(
+                preview_rgb,
+                retained,
+                self.checker_pattern,
+                checker_box,
+                self.checker_period,
             )
         elif self.alpha == (0, 0):
             preview = checker_crop(self.checker_pattern, checker_box, self.checker_period)
